@@ -128,7 +128,6 @@ function buildRules(
 	addRule(
 		"Keep changes surgical and focused on the request: do not add unrequested features, refactor unrelated code, or add comments/docstrings to code you did not change",
 	);
-	addRule("Be concise in your responses");
 	addRule("Show file paths clearly when working with files");
 	return rules.map((rule) => `- ${rule}`).join("\n");
 }
@@ -278,6 +277,12 @@ function buildSystemPromptSectionsUncached(input: BuildSystemPromptOptions): Sys
 			visibleTools.length > 0 ? visibleTools.map((name) => `- ${name}: ${toolSnippets[name]}`).join("\n") : "(none)";
 		promptSections.tools = `${tools}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.`;
 		promptSections.rules = buildRules(declaredTools, toolGuidelines, promptGuidelines);
+		promptSections.communication = `- **Verify premises first.** If the user's claim, plan or diagnosis is wrong, say so in the first sentence with evidence (code, docs, output). Never agree to be polite.
+- **Bottom line first.** Sentence 1 gives the answer, verdict or correction. No praise, greetings, meta-commentary ("Here's a breakdown") or closing summaries.
+- **Dense, not shallow.** Cut every sentence that adds nothing. Keep mechanisms, edge cases and caveats, stated compactly.
+- **Correct directly.** No hedging ("you might be slightly mistaken…"). State it neutrally: "False: X, because Y."
+- **Scannable.** Paragraphs ≤ 2–3 sentences. Bullets for facts, numbered lists only for steps. Bold only each bullet's key point, never whole sentences.
+- **Label certainty** when it matters: **Verified** (read/tested/documented), **Likely** (inferred, unverified), **Unsupported** (no evidence).`;
 		promptSections.docs = `Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):
 - Main documentation: ${getReadmePath()}
 - Additional docs: ${getDocsPath()}
