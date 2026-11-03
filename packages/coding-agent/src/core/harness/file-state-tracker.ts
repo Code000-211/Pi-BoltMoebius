@@ -77,6 +77,16 @@ function countFingerprints(diagnostics: HarnessDiagnostic[]): Map<string, number
 	return counts;
 }
 
+/** An existing file changed on disk since the agent last read or wrote it. */
+export class StaleFileError extends Error {
+	constructor() {
+		super(
+			"File has been modified since it was last read (either by the user or an external tool). Read the file again before editing it.",
+		);
+		this.name = "StaleFileError";
+	}
+}
+
 const LOCAL_INCLUDE_REGEX = /^\s*#\s*include\s*"([^"]+)"/gm;
 
 export class FileStateTracker {
@@ -93,7 +103,9 @@ export class FileStateTracker {
 
 	/**
 	 * Verify that an existing file was previously read in this session and has not been modified
-	 * externally since the last read/edit (checks both mtimeMs and exact content when provided).
+	 * externally since the last read/edit. A changed modification time alone is not a change when the
+	 * content is known to be the same (`touch`, a formatter that changed nothing): the tracked time is
+	 * moved instead. Throws `StaleFileError` when the file changed.
 	 */
 	assertCanModifyExistingFile(
 		absolutePath: string,
@@ -105,19 +117,17 @@ export class FileStateTracker {
 		if (!state) {
 			throw new Error("File has not been read yet. Read it first before writing to it.");
 		}
+		const sameContent = currentContent !== undefined && state.contentComplete && currentContent === state.content;
 		// Allow a 10ms tolerance for filesystem timestamp quantization across platforms
 		if (currentMtimeMs !== undefined && currentMtimeMs > state.lastReadMtimeMs + 10) {
-			throw new Error(
-				"File has been modified since it was last read (either by the user or an external tool). Read the file again before editing it.",
-			);
+			if (!sameContent) throw new StaleFileError();
+			state.lastReadMtimeMs = currentMtimeMs;
 		}
 		// Also guard against sub-millisecond external modifications where mtimeMs did not advance
 		// (Claude Code v2.1.295 parity: compare exact content when available). A partial read of a
 		// large file only recorded a prefix, so only the mtime check applies there.
-		if (currentContent !== undefined && state.contentComplete && currentContent !== state.content) {
-			throw new Error(
-				"File has been modified since it was last read (either by the user or an external tool). Read the file again before editing it.",
-			);
+		if (currentContent !== undefined && state.contentComplete && !sameContent) {
+			throw new StaleFileError();
 		}
 	}
 

@@ -1,5 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { mkdir as fsMkdir, stat as fsStat, writeFile as fsWriteFile } from "fs/promises";
+import { mkdir as fsMkdir, readFile as fsReadFile, stat as fsStat, writeFile as fsWriteFile } from "fs/promises";
 import { dirname } from "path";
 import { type Static, Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
@@ -89,7 +89,14 @@ export function createWriteToolDefinition(
 					const existingStat = await fsStat(absolutePath).catch(() => undefined);
 					throwIfAborted();
 					if (existingStat) {
-						harness.assertCanModifyExistingFile(absolutePath, existingStat.mtimeMs);
+						// A newer modification time with the same content (`touch`) is no change: compare the content then.
+						const state = harness.stateTracker.getTrackedState(absolutePath);
+						const current =
+							state?.contentComplete && existingStat.mtimeMs > state.lastReadMtimeMs + 10
+								? await fsReadFile(absolutePath, "utf-8").catch(() => undefined)
+								: undefined;
+						throwIfAborted();
+						harness.assertCanModifyExistingFile(absolutePath, existingStat.mtimeMs, current);
 					}
 				}
 

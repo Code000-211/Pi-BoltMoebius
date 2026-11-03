@@ -12,7 +12,7 @@ import {
 	sanitizeCompileFlags,
 } from "../src/core/harness/index.ts";
 import { buildEnvDiffScript, createBashTool } from "../src/core/tools/bash.ts";
-import { createEditTool } from "../src/core/tools/edit.ts";
+import { createEditTool, createEditToolDefinition } from "../src/core/tools/edit.ts";
 import { createFindTool } from "../src/core/tools/find.ts";
 import { createLsTool } from "../src/core/tools/ls.ts";
 import { getFileFrecencyScore, nativeFind, nativeFindDetailed, nativeGrep } from "../src/core/tools/native-search.ts";
@@ -102,6 +102,7 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		await readTool.execute("read-1", { path: "stale.cpp" });
 
 		// Simulate external modification advancing mtime by 2 seconds
+		writeFileSync(filePath, "int x = 5;\n", "utf-8");
 		const futureTime = new Date(Date.now() + 2000);
 		utimesSync(filePath, futureTime, futureTime);
 
@@ -111,6 +112,71 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 				edits: [{ oldText: "int x = 1;", newText: "int x = 2;" }],
 			}),
 		).rejects.toThrow(/File has been modified since it was last read/);
+	});
+
+	it("allows edit and write after a newer modification time with the same content (touch)", async () => {
+		const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
+		const readTool = createReadTool(testDir, { harness });
+		const editTool = createEditTool(testDir, { harness, enforceReadBeforeEdit: true, enableDiagnostics: false });
+		const writeTool = createWriteTool(testDir, { harness, enforceReadBeforeEdit: true, enableDiagnostics: false });
+		const filePath = join(testDir, "touched.cpp");
+		writeFileSync(filePath, "int x = 1;\n", "utf-8");
+		await readTool.execute("read-touch", { path: "touched.cpp" });
+
+		utimesSync(filePath, new Date(Date.now() + 2000), new Date(Date.now() + 2000));
+		const edited = await editTool.execute("edit-touch", {
+			path: "touched.cpp",
+			edits: [{ oldText: "int x = 1;", newText: "int x = 2;" }],
+		});
+		expect(getText(edited)).not.toContain("changed on disk");
+
+		utimesSync(filePath, new Date(Date.now() + 4000), new Date(Date.now() + 4000));
+		await writeTool.execute("write-touch", { path: "touched.cpp", content: "int x = 3;\n" });
+		expect(readFileSync(filePath, "utf-8")).toBe("int x = 3;\n");
+
+		// A real change still blocks write, which replaces the whole file.
+		writeFileSync(filePath, "int x = 4;\n", "utf-8");
+		utimesSync(filePath, new Date(Date.now() + 6000), new Date(Date.now() + 6000));
+		await expect(writeTool.execute("write-stale", { path: "touched.cpp", content: "int y;\n" })).rejects.toThrow(
+			/File has been modified since it was last read/,
+		);
+	});
+
+	it("applies an edit to a file changed on disk when every oldText still matches exactly once", async () => {
+		const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
+		const readTool = createReadTool(testDir, { harness });
+		const editTool = createEditTool(testDir, { harness, enforceReadBeforeEdit: true, enableDiagnostics: false });
+		const filePath = join(testDir, "formatted.cpp");
+		writeFileSync(filePath, "int a=1;\nint b = 2;\n", "utf-8");
+		await readTool.execute("read-fmt", { path: "formatted.cpp" });
+
+		// A formatter rewrites another line.
+		writeFileSync(filePath, "int a = 1;\nint b = 2;\n", "utf-8");
+		utimesSync(filePath, new Date(Date.now() + 2000), new Date(Date.now() + 2000));
+		const edited = await editTool.execute("edit-fmt", {
+			path: "formatted.cpp",
+			edits: [{ oldText: "int b = 2;", newText: "int b = 3;" }],
+		});
+		expect(getText(edited)).toContain("The file had changed on disk since it was last read");
+		expect(readFileSync(filePath, "utf-8")).toBe("int a = 1;\nint b = 3;\n");
+
+		// The next edit sees the file as current; an oldText from before the change is refused.
+		writeFileSync(filePath, "int a = 1;\nint b = 3;\nint b = 3;\n", "utf-8");
+		utimesSync(filePath, new Date(Date.now() + 4000), new Date(Date.now() + 4000));
+		await expect(
+			editTool.execute("edit-twice", { path: "formatted.cpp", edits: [{ oldText: "int b = 3;", newText: "x" }] }),
+		).rejects.toThrow(/File has been modified since it was last read/);
+		await expect(
+			editTool.execute("edit-old", { path: "formatted.cpp", edits: [{ oldText: "int a=1;", newText: "x" }] }),
+		).rejects.toThrow(/File has been modified since it was last read/);
+	});
+
+	it("tells the model to read before editing, the same for every edit tool", () => {
+		const guidelines = (enforce: boolean) =>
+			createEditToolDefinition(testDir, { enforceReadBeforeEdit: enforce }).promptGuidelines ?? [];
+		expect(guidelines(true).some((line) => line.startsWith("Read a file before you first edit it"))).toBe(true);
+		// An extension re-registering the tool must not change the system prompt.
+		expect(guidelines(false)).toEqual(guidelines(true));
 	});
 
 	it("allows write on a brand-new file without prior read, but blocks overwriting an unread existing file", async () => {
@@ -752,7 +818,7 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		await expect(
 			editTool.execute("e-content-stale", {
 				path: "packages/kernels/softmax.hip",
-				edits: [{ oldText: "__global__ void softmax()", newText: "__global__ void softmax_v2()" }],
+				edits: [{ oldText: "__global__ void softmax() {}", newText: "__global__ void softmax_v2() {}" }],
 			}),
 		).rejects.toThrow(/File has been modified since it was last read/);
 	});

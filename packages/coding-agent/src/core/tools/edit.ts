@@ -4,7 +4,7 @@ import { access as fsAccess, readFile as fsReadFile, stat as fsStat, writeFile a
 import { type Static, Type } from "typebox";
 import { splitBom } from "../../utils/text.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
-import { type ClaudeHarnessManager, defaultClaudeHarnessManager } from "../harness/index.ts";
+import { type ClaudeHarnessManager, defaultClaudeHarnessManager, StaleFileError } from "../harness/index.ts";
 import {
 	applyEditsToNormalizedContent,
 	detectLineEnding,
@@ -48,8 +48,19 @@ export const editToolSystemPromptContribution = {
 		"When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
 		"Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
 		"Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
+		// The same for every edit tool (an extension's too, which re-registers it): the session's refuses files not read.
+		"Read a file before you first edit it in a session. When it changed on disk since, an edit still applies if every oldText matches it exactly once; otherwise read it again.",
 	],
 } as const;
+
+/** Whether every oldText occurs exactly once, as it is, in `content`: the edits do not depend on what the agent last saw of it. */
+function editsMatchExactlyOnce(content: string, edits: SingleEditInput[]): boolean {
+	return edits.every(({ oldText }) => {
+		const text = normalizeToLF(oldText);
+		const first = content.indexOf(text);
+		return text.length > 0 && first !== -1 && content.indexOf(text, first + 1) === -1;
+	});
+}
 
 export type EditToolInput = Static<typeof editSchema>;
 type LegacyEditToolInput = EditToolInput & {
@@ -201,20 +212,29 @@ export function createEditToolDefinition(
 				const rawContent = buffer.toString("utf-8");
 				throwIfAborted();
 
+				// Strip BOM before matching. The model will not include an invisible BOM in oldText.
+				const { bom, text: content } = splitBom(rawContent);
+				const originalEnding = detectLineEnding(content);
+				const normalizedContent = normalizeToLF(content);
+
+				let changedOnDisk = false;
 				if (enforceReadBeforeEdit) {
 					if (!harness.stateTracker.hasBeenRead(absolutePath)) {
 						harness.assertCanModifyExistingFile(absolutePath, undefined, rawContent);
 					}
 					const beforeStat =
 						ops === defaultEditOperations ? await fsStat(absolutePath).catch(() => undefined) : undefined;
-					harness.assertCanModifyExistingFile(absolutePath, beforeStat?.mtimeMs, rawContent);
+					try {
+						harness.assertCanModifyExistingFile(absolutePath, beforeStat?.mtimeMs, rawContent);
+					} catch (error) {
+						// Changed on disk since it was read (a formatter, the user): an edit whose every oldText is still
+						// there exactly once changes only those places, so it applies without reading the file again.
+						if (!(error instanceof StaleFileError) || !editsMatchExactlyOnce(normalizedContent, edits))
+							throw error;
+						changedOnDisk = true;
+					}
 					throwIfAborted();
 				}
-
-				// Strip BOM before matching. The model will not include an invisible BOM in oldText.
-				const { bom, text: content } = splitBom(rawContent);
-				const originalEnding = detectLineEnding(content);
-				const normalizedContent = normalizeToLF(content);
 				const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
 				throwIfAborted();
 
@@ -246,7 +266,7 @@ export function createEditToolDefinition(
 					content: [
 						{
 							type: "text",
-							text: `Successfully replaced ${edits.length} block(s) in ${path}.${suffix}`,
+							text: `Successfully replaced ${edits.length} block(s) in ${path}.${changedOnDisk ? " The file had changed on disk since it was last read; the edit was applied to its current content." : ""}${suffix}`,
 						},
 					],
 					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
