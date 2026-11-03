@@ -6,7 +6,8 @@ adds the tool `project_search`, adds matching doc sections to a typed prompt (au
 - **No model at search time.** BM25 over sections, plus a graph of sections and the names they mention, walked with
   personalized PageRank (the retrieval of HippoRAG and E²GraphRAG, with rule-based entities instead of an LLM or NER).
 - **Docs are split at their headings, code at its definitions**: one section per function, class or struct, named by
-  it. A query that names a function or type gets its definition first.
+  it, in C, C++, HIP, CUDA, Rust, Python, JavaScript, TypeScript, Go and shell scripts. A query that names a function
+  or type gets its definition first.
 - **The index is a file, mapped.** The first process on a folder builds and saves it; every later one is ready in
   milliseconds and shares the same pages. Changed files are searched from a small overlay within a second of the
   change; the saved index is rebuilt once the files have been quiet for 30 seconds.
@@ -21,6 +22,10 @@ descriptions):
 | Docs | 73% | 83% | 88% |
 | Code, function by name | 87% | 97% | 98% |
 | Code, function by description | 15% | 32% | 55% |
+| TypeScript, function or type by name (Pi-Bolt's sources) | 98% | 100% | 100% |
+
+TypeScript, JavaScript, Go and shell files were split like plain text until the change that added them: the same 60
+TypeScript names had 53% / 83% / 98% then (search p50 33 → 38 µs, build 93 → 107 ms for 568 files).
 
 | | |
 |---|---|
@@ -80,7 +85,9 @@ less than 100 ms is kept in memory only. Files unused for 30 days are removed.
 ## Measuring a change
 
 The test sets point at frozen snapshots of radiance taken on 2026-11-03: `corpus/` with its tracked Markdown and text
-files, `code/` with its tracked source files. Put both in one folder, then:
+files, `code/` with its tracked source files. `ts-names.tsv` points at `ts/`, Pi-Bolt's TypeScript at commit `5641c898`
+of this fork: `git archive 5641c898 packages/{coding-agent,ai,agent,tui}/src | tar -x -C ts`, without
+`models.generated.ts`. Put them in one folder, then:
 
 ```sh
 cargo build --release -p docsearch-core

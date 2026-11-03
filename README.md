@@ -51,7 +51,8 @@ names and 60 words, each searched 5 times, medians; two runs agreed within 0.4 m
 [docsearch](packages/docsearch): a search over the project's code and documentation, in Rust, compiled into Pi-Bolt with
 `pi-bolt compile`. The agent gets the tool `project_search`, matching doc sections are added to a typed prompt, and `/docs`
 searches by hand. No model runs at search time: BM25 over sections and a graph of sections and the names they mention. Code
-is split at its definitions, so a function's name finds its definition first.
+is split at its definitions (C/C++/HIP, Rust, Python, TypeScript/JavaScript, Go, shell), so a function's name finds its
+definition first.
 
 | Measured | `grep` | `project_search` |
 |---|---:|---:|
@@ -73,6 +74,9 @@ answers. grep was given each question's rarest word, which favours it: an agent 
 <sub>Tasks that did not use it moved by up to 30% either way between runs, the noise at 5 runs; every run gave the right
 answer.</sub>
 
+- TypeScript, JavaScript, Go and shell files are split at their definitions too (they were split like plain text):
+  measured on 60 function and type names in Pi-Bolt's own sources, the definition first 53% → 98%, among the first 3
+  83% → 100%.
 - The index is a mapped file: the first process builds it (0.9 s for 1,400 files), every later one is ready in 12 ms.
 - About 32 MB per process, plus 110 MB of index shared by every process on the project (about 460 MB each without).
 - A changed file is searchable within a second (51 ms in the test) without rewriting the index; the index is rebuilt once

@@ -75,7 +75,10 @@ interface Config {
 }
 
 const DOC_EXTENSIONS = ["md", "mdx", "markdown", "txt", "rst", "adoc", "org"];
-const CODE_EXTENSIONS = ["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hip", "cu", "cuh", "rs", "py", "sh", "ts", "js", "go"];
+const CODE_EXTENSIONS = [
+	...["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hip", "cu", "cuh", "rs", "py", "go", "sh", "bash"],
+	...["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
+];
 const isCode = (p: string) => CODE_EXTENSIONS.includes(p.slice(p.lastIndexOf(".") + 1).toLowerCase());
 
 const DEFAULTS: Config = {

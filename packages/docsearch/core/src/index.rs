@@ -205,10 +205,13 @@ pub fn scan(cfg: &Config) -> Signature {
     out
 }
 
-/// Source files, split at their definitions rather than at headings.
+/// The language of a source file, split at its definitions rather than at headings.
+fn code_lang(path: &Path) -> Option<chunk::Lang> {
+    chunk::Lang::of(&path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase())
+}
+
 fn is_code(path: &Path) -> bool {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    matches!(ext.as_str(), "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hip" | "cu" | "cuh" | "rs" | "py")
+    code_lang(path).is_some()
 }
 
 struct Parsed {
@@ -235,8 +238,10 @@ fn parse_file(path: &Path, extra: Option<&ExtraEntities>) -> Vec<Parsed> {
     let mut name_terms = Vec::new();
     text::terms(name.rsplit_once('.').map_or(name, |(stem, _)| stem), &mut name_terms);
 
-    let python = path.extension().is_some_and(|e| e == "py");
-    let chunks = if is_code(path) { chunk::split_code(&content, python) } else { chunk::split(&content, markdown) };
+    let chunks = match code_lang(path) {
+        Some(lang) => chunk::split_code(&content, lang),
+        None => chunk::split(&content, markdown),
+    };
     let n_chunks = chunks.len();
     chunks
         .into_iter()
