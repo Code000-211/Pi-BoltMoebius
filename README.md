@@ -76,7 +76,10 @@ answer.</sub>
 - The index is a mapped file: the first process builds it (0.9 s for 1,400 files), every later one is ready in 12 ms.
 - About 32 MB per process, plus 110 MB of index shared by every process on the project (about 460 MB each without).
 - A changed file is searchable within a second (51 ms in the test) without rewriting the index; the index is rebuilt once
-  nothing has changed for 30 s. `grep` stays the tool for exact text across all files, such as every call site.
+  nothing has changed for 30 s.
+- While the first build runs, a search waits for it on a worker thread (`await whenReady`), so Pi's screen and Escape keep
+  working; before, the search blocked the event loop for up to 5 s (measured: a 985 ms build, 911 timer ticks meanwhile
+  instead of none). `grep` stays the tool for exact text across all files, such as every call site.
 
 Install: `packages/docsearch/install.sh`, then `pi-bolt compile` ([details](packages/docsearch)).
 

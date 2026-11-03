@@ -1,5 +1,6 @@
 //! Node-API binding: `new DocIndex({ roots })`, then `search(query, { k })`. Calls are synchronous
-//! and take microseconds; building and refreshing happen on a thread.
+//! and take microseconds; building and refreshing happen on a thread. `await whenReady(ms)` waits
+//! for the first build without blocking the event loop.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use docsearch_core::{Config, Engine, SearchOpts};
+use napi::bindgen_prelude::AsyncTask;
+use napi::{Env, Task};
 use napi_derive::napi;
 
 const DEFAULT_EXTENSIONS: [&str; 7] = ["md", "mdx", "markdown", "txt", "rst", "adoc", "org"];
@@ -29,7 +32,8 @@ pub struct QueryOptions {
     pub path_prefix: Option<String>,
     /// At most this many sections per file (default 3).
     pub max_per_file: Option<u32>,
-    /// How long to wait for the first build, in ms (default 5000).
+    /// How long to wait for the first build, in ms, blocking the caller (default 0: `whenReady` waits
+    /// without blocking).
     pub wait_ms: Option<u32>,
 }
 
@@ -97,6 +101,25 @@ struct Cache {
 
 const CACHE_ENTRIES: usize = 256;
 
+/// Waits for the first build on a worker thread of Node's pool.
+pub struct WaitReady {
+    engine: Arc<Engine>,
+    wait: Duration,
+}
+
+impl Task for WaitReady {
+    type Output = bool;
+    type JsValue = bool;
+
+    fn compute(&mut self) -> napi::Result<bool> {
+        Ok(self.engine.index(self.wait).is_some())
+    }
+
+    fn resolve(&mut self, _env: Env, ready: bool) -> napi::Result<bool> {
+        Ok(ready)
+    }
+}
+
 #[napi]
 pub struct DocIndex {
     engine: Arc<Engine>,
@@ -126,7 +149,7 @@ impl DocIndex {
     pub fn search(&self, query: String, opts: Option<QueryOptions>) -> SearchResult {
         let t0 = Instant::now();
         let o = opts.unwrap_or(QueryOptions { k: None, max_chars: None, path_prefix: None, max_per_file: None, wait_ms: None });
-        let Some(ix) = self.engine.index(Duration::from_millis(o.wait_ms.unwrap_or(5000) as u64)) else {
+        let Some(ix) = self.engine.index(Duration::from_millis(o.wait_ms.unwrap_or(0) as u64)) else {
             return SearchResult { ready: false, hits: Vec::new(), entities: Vec::new(), query_terms: 0, micros: 0 };
         };
         self.engine.maybe_refresh();
@@ -187,6 +210,15 @@ impl DocIndex {
             cache.results.insert(key, result.clone());
         }
         result
+    }
+
+    /// Resolves to true once the first build is there, or to false after `waitMs` (default 5000).
+    #[napi(ts_return_type = "Promise<boolean>")]
+    pub fn when_ready(&self, wait_ms: Option<u32>) -> AsyncTask<WaitReady> {
+        AsyncTask::new(WaitReady {
+            engine: Arc::clone(&self.engine),
+            wait: Duration::from_millis(wait_ms.unwrap_or(5000) as u64),
+        })
     }
 
     #[napi]
