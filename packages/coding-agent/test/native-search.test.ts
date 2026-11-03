@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { createFindTool } from "../src/core/tools/find.ts";
 import { createGrepTool } from "../src/core/tools/grep.ts";
 import {
+	clearNativeSearchCache,
 	compileGlob,
 	expandBraces,
 	globMatch,
@@ -217,6 +218,18 @@ describe("grep", () => {
 			"docs/a/b.md",
 			"keep.log",
 		]);
+	});
+
+	// Both from the one cached walk: the ignored files it keeps aside are taken only by a glob that includes them.
+	test("a glob and no glob on the same cached tree", async () => {
+		clearNativeSearchCache();
+		const files = async (glob?: string) =>
+			[...new Set(where(await grep("needle", { glob })).map((line) => line.split(":")[0]))].sort();
+		expect(await files("*.ts")).toContain("nested/skip.ts");
+		const all = await files();
+		expect(all).not.toContain("nested/skip.ts");
+		expect(all).toContain("src/a.ts");
+		expect(await files("*.ts")).toContain("nested/skip.ts");
 	});
 
 	test("a literal in either case, and an expression run only on the lines that have its literal", async () => {

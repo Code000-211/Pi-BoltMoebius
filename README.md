@@ -31,6 +31,9 @@ literal patterns with a native SIMD search (AVX2 on x86-64, NEON on ARM64).
 names and 60 words, each searched 5 times, medians; two runs agreed within 0.4 ms.</sub>
 
 - File tree reused for 2 s without checks, then revalidated against the modification times of up to 256 folders.
+- `grep` with a glob uses the cached tree too (it walked the folders again on every call): the walk keeps the files ignore
+  files leave out aside, for globs, which take them as ripgrep's `--glob` does. Measured on the same project, p50 of 24
+  searches: `*.cpp` 3.8 → 2.2 ms, `*.{h,hpp}` 2.7 → 1.4 ms, `src/**/*.hip` 1.4 → 0.08 ms.
 - Contents cached up to 64 MB in all and 512 KB per file; within 1.5 s of a check, a file is not stat'ed again.
 - A `find` glob that matches nothing returns the closest paths by fuzzy match instead.
 - Without a C compiler to build the native search, the caches still work and matching falls back to TypeScript.

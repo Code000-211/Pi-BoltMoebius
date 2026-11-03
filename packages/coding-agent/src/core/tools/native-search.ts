@@ -522,6 +522,8 @@ export interface WalkOptions {
 	 * held while the walk goes on (a walk through a whole disk finds millions of entries).
 	 */
 	keep?: (rel: string, kind: WalkEntry["kind"]) => boolean;
+	/** Given, the files an ignore file leaves out (not those in a folder left out) are added to it instead of passed over. */
+	ignoredFiles?: WalkEntry[];
 	signal?: AbortSignal;
 }
 
@@ -589,10 +591,14 @@ export async function walk(options: WalkOptions): Promise<WalkEntry[]> {
 						: undefined;
 			if (!kind) continue;
 			const rel = task.rel ? `${task.rel}/${dirent.name}` : dirent.name;
-			if (taskRules.length > 0 && isIgnored(taskRules, topRel(rel), kind === "dir")) {
-				if (kind === "dir" || !options.override?.(rel)) continue;
-			}
 			const abs = path.join(task.abs, dirent.name);
+			if (taskRules.length > 0 && isIgnored(taskRules, topRel(rel), kind === "dir")) {
+				if (kind === "dir") continue;
+				if (!options.override?.(rel)) {
+					options.ignoredFiles?.push({ rel, abs, kind });
+					continue;
+				}
+			}
 			if (!options.keep || options.keep(rel, kind)) entries.push({ rel, abs, kind });
 			if (kind === "dir") subdirs.push({ abs, rel, rules: taskRules, git: taskGit });
 		}
@@ -616,6 +622,8 @@ const byPath = (a: WalkEntry, b: WalkEntry) => (a.rel < b.rel ? -1 : a.rel > b.r
 
 interface CachedTreeEntry {
 	entries: WalkEntry[];
+	/** The files ignore files leave out, outside folders left out, sorted: a glob of grep takes them (ripgrep's --glob). */
+	ignoredFiles: WalkEntry[];
 	displayPaths: string[];
 	packedPathsBuffer?: Buffer;
 	knownAbsKeys: Set<string>;
@@ -713,8 +721,10 @@ async function getCachedTree(root: string, requireGit: boolean, signal?: AbortSi
 		}
 	}
 
-	const allEntries = await walk({ root: resolvedRoot, requireGit, signal });
+	const ignoredFiles: WalkEntry[] = [];
+	const allEntries = await walk({ root: resolvedRoot, requireGit, signal, ignoredFiles });
 	allEntries.sort(byPath);
+	ignoredFiles.sort(byPath);
 
 	const displayPaths = new Array<string>(allEntries.length);
 	const knownAbsKeys = new Set<string>();
@@ -737,8 +747,11 @@ async function getCachedTree(root: string, requireGit: boolean, signal?: AbortSi
 		}
 	}
 
+	for (const entry of ignoredFiles) knownAbsKeys.add(normalizeCacheKey(entry.abs));
+
 	const treeEntry: CachedTreeEntry = {
 		entries: allEntries,
+		ignoredFiles,
 		displayPaths,
 		knownAbsKeys,
 		dirMtimes,
@@ -1414,21 +1427,19 @@ export async function nativeGrep(
 	let files: string[];
 	if (options.isDirectory) {
 		const { take, include } = globFilter(options.glob);
-		if (!include) {
-			const cachedTree = await getCachedTree(options.root, true, options.signal);
-			const cachedEntries = cachedTree.entries;
-			files = [];
-			for (let i = 0; i < cachedEntries.length; i++) {
-				const entry = cachedEntries[i];
-				if (entry.kind === "file" && take(entry.rel)) {
-					files.push(entry.abs);
-				}
+		const cachedTree = await getCachedTree(options.root, true, options.signal);
+		const entries = cachedTree.entries;
+		// A glob that includes files also takes those an ignore file leaves out (ripgrep's --glob): both lists are sorted,
+		// so they are merged in path order.
+		const ignored = include ? cachedTree.ignoredFiles : [];
+		files = [];
+		let j = 0;
+		for (let i = 0; i <= entries.length; i++) {
+			const entry = entries[i];
+			for (; j < ignored.length && (!entry || ignored[j].rel < entry.rel); j++) {
+				if (ignored[j].kind === "file" && include?.(ignored[j].rel)) files.push(ignored[j].abs);
 			}
-		} else {
-			const keep = (rel: string, kind: WalkEntry["kind"]) => kind === "file" && take(rel);
-			files = (await walk({ root: options.root, requireGit: true, override: include, keep, signal: options.signal }))
-				.sort(byPath)
-				.map((entry) => entry.abs);
+			if (entry && entry.kind === "file" && take(entry.rel)) files.push(entry.abs);
 		}
 	} else {
 		files = [options.root];
