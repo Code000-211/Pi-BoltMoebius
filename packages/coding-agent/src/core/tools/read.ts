@@ -14,6 +14,7 @@ import { markProcessedImageBlock, processImage } from "../../utils/image-process
 import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
 import { detachSharedString } from "../../utils/text.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
+import { type ClaudeHarnessManager, defaultClaudeHarnessManager } from "../harness/index.ts";
 import { resolveReadPathAsync } from "./path-utils.ts";
 import { readRenderers } from "./renderers/read.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -82,6 +83,8 @@ export interface ReadToolOptions {
 	resizeOptions?: ModelImageResizeOptions;
 	/** Custom operations for file reading. Default: local filesystem */
 	operations?: ReadOperations;
+	/** Shared Claude harness manager for read-before-edit tracking & LSP/libclang pre-warming. */
+	harness?: ClaudeHarnessManager;
 }
 
 /** The image block and its note, or the text for text files and images that could not be processed. */
@@ -269,6 +272,7 @@ export function createReadToolDefinition(
 	const autoResizeImages = options?.autoResizeImages ?? true;
 	const fallbackResizeOptions = options?.resizeOptions;
 	const ops = options?.operations ?? defaultReadOperations;
+	const harness = options?.harness ?? defaultClaudeHarnessManager;
 	return {
 		name: "read",
 		label: "read",
@@ -343,7 +347,11 @@ export function createReadToolDefinition(
 								let totalFileLines: number;
 								let truncation: TruncationResult;
 								let firstLineBytes: () => number;
-								const size = ops === defaultReadOperations ? (await fsStat(absolutePath)).size : 0;
+								const fileStat = ops === defaultReadOperations ? await fsStat(absolutePath) : undefined;
+								const size = fileStat?.size ?? 0;
+								const mtimeMs = fileStat?.mtimeMs ?? Date.now();
+								let warmupContent = "";
+								let warmupBuffer: Buffer | undefined;
 								if (size >= CHUNKED_READ_MIN_BYTES) {
 									const file = await fsOpen(absolutePath, "r");
 									let selection: ChunkedSelection | undefined;
@@ -365,11 +373,14 @@ export function createReadToolDefinition(
 										throw new Error(`Offset ${offset} is beyond end of file (${totalFileLines} lines total)`);
 									}
 									truncation = truncateSelection(selection);
+									warmupContent = selection.prefix;
 									const selectedFirstLineBytes = selection.firstLineBytes;
 									firstLineBytes = () => selectedFirstLineBytes;
 								} else {
 									const buffer = await ops.readFile(absolutePath);
+									warmupBuffer = buffer;
 									const textContent = buffer.toString("utf-8");
+									warmupContent = textContent;
 									// Find the selected lines by scanning for newlines instead of splitting the file: splitting
 									// allocates a string per line of the whole file to return at most a few thousand of them.
 									const located = locateLines(textContent, startLine, requestedEndLine);
@@ -390,6 +401,13 @@ export function createReadToolDefinition(
 										return Buffer.byteLength(firstLine, "utf-8");
 									};
 								}
+								const lateReminder = harness.onFileRead(
+									absolutePath,
+									warmupContent,
+									mtimeMs,
+									ctx?.cwd || cwd,
+									warmupBuffer,
+								);
 								const userLimitedLines =
 									limit !== undefined ? Math.min(requestedEndLine, totalFileLines) - startLine : undefined;
 								let outputText: string;
@@ -417,6 +435,9 @@ export function createReadToolDefinition(
 								} else {
 									// No truncation and no remaining user-limited content.
 									outputText = truncation.content;
+								}
+								if (lateReminder) {
+									outputText += lateReminder;
 								}
 								// The output can be a substring of the whole file's text, which it would keep in memory for as
 								// long as the session holds the result. A file read again unchanged gives the same string.

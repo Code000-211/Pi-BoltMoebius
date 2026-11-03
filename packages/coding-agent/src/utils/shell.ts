@@ -103,6 +103,9 @@ function findExecutableOnPath(executable: string, accept?: (file: string) => boo
 	return null;
 }
 
+const defaultShellConfigCache = new Map<string, { config: ShellConfig; verifiedAt: number }>();
+const SHELL_CONFIG_CACHE_TTL_MS = 2_000;
+
 /**
  * Resolve shell configuration based on platform and an optional explicit shell path.
  * Resolution order:
@@ -128,6 +131,13 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 	}
 
 	if (process.platform === "win32") {
+		const cacheKey = `${process.env.ProgramFiles ?? ""}\0${process.env["ProgramFiles(x86)"] ?? ""}\0${process.env.LOCALAPPDATA ?? ""}\0${process.env.USERPROFILE ?? ""}\0${process.env.SystemRoot ?? ""}\0${process.env.PATH ?? ""}`;
+		const cached = defaultShellConfigCache.get(cacheKey);
+		const now = performance.now();
+		if (cached && now - cached.verifiedAt < SHELL_CONFIG_CACHE_TTL_MS && shellPathExists(cached.config.shell)) {
+			return cached.config;
+		}
+
 		// 2. Try Git Bash in known locations
 		const paths: string[] = [];
 		const programFiles = process.env.ProgramFiles;
@@ -143,18 +153,24 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 
 		for (const path of paths) {
 			if (shellPathExists(path)) {
-				return getBashShellConfig(path);
+				const config = getBashShellConfig(path);
+				defaultShellConfigCache.set(cacheKey, { config, verifiedAt: now });
+				return config;
 			}
 		}
 
 		// 3. Fallback: search bash.exe on PATH (Cygwin, MSYS2, then WSL's launchers last)
 		const bashOnPath = findExecutableOnPath("bash.exe", (file) => !isLegacyWslBashPath(file));
 		if (bashOnPath) {
-			return getBashShellConfig(bashOnPath);
+			const config = getBashShellConfig(bashOnPath);
+			defaultShellConfigCache.set(cacheKey, { config, verifiedAt: now });
+			return config;
 		}
 		const wslBash = findExecutableOnPath("bash.exe");
 		if (wslBash) {
-			return getBashShellConfig(wslBash);
+			const config = getBashShellConfig(wslBash);
+			defaultShellConfigCache.set(cacheKey, { config, verifiedAt: now });
+			return config;
 		}
 
 		throw new Error(
@@ -209,13 +225,25 @@ export function getPowerShellConfig(): ShellConfig {
 	return { shell, args: [...POWERSHELL_ARGS] };
 }
 
+let cachedBinDirPathKey = "";
+let cachedBinDirUpdatedPath = "";
+
 export function getShellEnv(): NodeJS.ProcessEnv {
 	const binDir = getBinDir();
-	const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+	const pathKey =
+		"PATH" in process.env ? "PATH" : (Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH");
 	const currentPath = process.env[pathKey] ?? "";
-	const pathEntries = currentPath.split(delimiter).filter(Boolean);
-	const hasBinDir = pathEntries.includes(binDir);
-	const updatedPath = hasBinDir ? currentPath : [binDir, currentPath].filter(Boolean).join(delimiter);
+	const cacheKey = `${binDir}\0${currentPath}`;
+	let updatedPath: string;
+	if (cacheKey === cachedBinDirPathKey) {
+		updatedPath = cachedBinDirUpdatedPath;
+	} else {
+		const pathEntries = currentPath.split(delimiter).filter(Boolean);
+		const hasBinDir = pathEntries.includes(binDir);
+		updatedPath = hasBinDir ? currentPath : [binDir, currentPath].filter(Boolean).join(delimiter);
+		cachedBinDirPathKey = cacheKey;
+		cachedBinDirUpdatedPath = updatedPath;
+	}
 
 	return {
 		...process.env,
@@ -300,6 +328,8 @@ function getWindowsJobs(): WindowsJobs | null {
 	return windowsJobs;
 }
 
+const msysBashCache = new Map<string, string | undefined>();
+
 /**
  * Windows: the bash of a Cygwin-family shell (Git Bash, MSYS2, Cygwin) that sees that shell's processes in /proc: Git Bash's
  * bin\bash.exe is a launcher of usr\bin\bash.exe. Undefined for any other shell (PowerShell, cmd, WSL).
@@ -308,11 +338,17 @@ export function getMsysBash(shell: string): string | undefined {
 	if (process.platform !== "win32" || isLegacyWslBashPath(shell) || basename(shell).toLowerCase() !== "bash.exe") {
 		return undefined;
 	}
+	if (msysBashCache.has(shell)) {
+		return msysBashCache.get(shell);
+	}
 	for (const bash of [join(dirname(dirname(shell)), "usr", "bin", "bash.exe"), shell]) {
 		const dir = dirname(bash);
-		if (existsSync(bash) && (existsSync(join(dir, "msys-2.0.dll")) || existsSync(join(dir, "cygwin1.dll"))))
+		if (existsSync(bash) && (existsSync(join(dir, "msys-2.0.dll")) || existsSync(join(dir, "cygwin1.dll")))) {
+			msysBashCache.set(shell, bash);
 			return bash;
+		}
 	}
+	msysBashCache.set(shell, undefined);
 	return undefined;
 }
 
@@ -330,7 +366,8 @@ export interface DirectGitBash {
 	bash: string;
 	environment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv;
 }
-const directGitBashOf = new Map<string, { direct: DirectGitBash; git: string } | undefined>();
+const directGitBashOf = new Map<string, { direct: DirectGitBash; git: string; verifiedAt: number } | undefined>();
+const DIRECT_BASH_VERIFY_TTL_MS = 10_000;
 
 /**
  * A variable of a Windows environment object, taken out with all its spellings (PATH and Path both, as an environment merged
@@ -338,6 +375,14 @@ const directGitBashOf = new Map<string, { direct: DirectGitBash; git: string } |
  * any), and the spelling to put it back under.
  */
 function takeWindowsVariable(env: NodeJS.ProcessEnv, name: string): { key: string; value: string | undefined } {
+	if (name in env) {
+		const value = env[name];
+		delete env[name];
+		for (const k of Object.keys(env)) {
+			if (k.length === name.length && k.toUpperCase() === name) delete env[k];
+		}
+		return { key: name, value };
+	}
 	const keys = Object.keys(env).filter((key) => key.toUpperCase() === name);
 	const key = keys.includes(name) ? name : (keys[0] ?? name);
 	const value = env[key];
@@ -353,7 +398,15 @@ export function getDirectGitBash(shell: string): DirectGitBash | undefined {
 	if (getWindowsJobs()) return undefined;
 	if (directGitBashOf.has(shell)) {
 		const known = directGitBashOf.get(shell);
-		if (!known || (existsSync(known.direct.bash) && existsSync(known.git))) return known?.direct;
+		if (!known) return undefined;
+		const now = performance.now();
+		if (now - known.verifiedAt < DIRECT_BASH_VERIFY_TTL_MS) {
+			return known.direct;
+		}
+		if (existsSync(known.direct.bash) && existsSync(known.git)) {
+			known.verifiedAt = now;
+			return known.direct;
+		}
 	}
 	let direct: DirectGitBash | undefined;
 	let git = "";
@@ -371,28 +424,44 @@ export function getDirectGitBash(shell: string): DirectGitBash | undefined {
 		subsystems.length === 1
 	) {
 		const subsystem = subsystems[0];
-		git = join(root, subsystem, "bin", "git.exe");
+		const subsystemUpper = subsystem.toUpperCase();
+		const subsystemBin = join(root, subsystem, "bin");
+		const usrBin = join(root, "usr", "bin");
+		const existsDriveCache = new Map<string, boolean>();
+		git = join(subsystemBin, "git.exe");
 		direct = {
 			bash,
 			environment(env) {
 				const out: NodeJS.ProcessEnv = { ...env };
 				const take = (name: string) => takeWindowsVariable(out, name);
 				const homeVar = take("HOME");
-				const homeDrive = out[Object.keys(out).find((k) => k.toUpperCase() === "HOMEDRIVE") ?? "HOMEDRIVE"];
-				const homePath = out[Object.keys(out).find((k) => k.toUpperCase() === "HOMEPATH") ?? "HOMEPATH"];
-				const profile = out[Object.keys(out).find((k) => k.toUpperCase() === "USERPROFILE") ?? "USERPROFILE"];
+				const homeDrive =
+					out.HOMEDRIVE ?? out[Object.keys(out).find((k) => k.toUpperCase() === "HOMEDRIVE") ?? "HOMEDRIVE"];
+				const homePath =
+					out.HOMEPATH ?? out[Object.keys(out).find((k) => k.toUpperCase() === "HOMEPATH") ?? "HOMEPATH"];
+				const profile =
+					out.USERPROFILE ?? out[Object.keys(out).find((k) => k.toUpperCase() === "USERPROFILE") ?? "USERPROFILE"];
 				const fromDrive = homeDrive && homePath ? `${homeDrive}${homePath}` : undefined;
-				const home =
-					homeVar.value || (fromDrive && isAbsolute(fromDrive) && existsSync(fromDrive) ? fromDrive : profile);
+				let driveExists = false;
+				if (!homeVar.value && fromDrive && isAbsolute(fromDrive)) {
+					const cachedDrive = existsDriveCache.get(fromDrive);
+					if (cachedDrive !== undefined) {
+						driveExists = cachedDrive;
+					} else {
+						driveExists = existsSync(fromDrive);
+						existsDriveCache.set(fromDrive, driveExists);
+					}
+				}
+				const home = homeVar.value || (driveExists ? fromDrive : profile);
 				if (homeVar.value !== undefined) out[homeVar.key] = homeVar.value;
 				const path = take("PATH");
 				const prefix = [
-					join(root, subsystem, "bin"),
-					join(root, "usr", "bin"),
+					subsystemBin,
+					usrBin,
 					...(home && isAbsolute(home) && /^(?:[a-z]:|\\\\)/i.test(home) ? [join(home, "bin")] : []),
 				];
 				out[path.key] = [...prefix, path.value].filter(Boolean).join(delimiter);
-				out[take("MSYSTEM").key] = subsystem.toUpperCase();
+				out[take("MSYSTEM").key] = subsystemUpper;
 				out[take("EXEPATH").key] = launcherDir;
 				const plink = take("PLINK_PROTOCOL");
 				out[plink.key] = plink.value || "ssh";
@@ -400,7 +469,7 @@ export function getDirectGitBash(shell: string): DirectGitBash | undefined {
 			},
 		};
 	}
-	directGitBashOf.set(shell, direct && { direct, git });
+	directGitBashOf.set(shell, direct && { direct, git, verifiedAt: performance.now() });
 	return direct;
 }
 

@@ -140,6 +140,20 @@ stage_assets() {
 	cp "$AGENT"/src/core/export-html/vendor/*.js "$dir/export-html/vendor/" 2>/dev/null || true
 	cp "$root/node_modules/@silvia-odwyer/photon-node/photon_rs_bg.wasm" "$dir/"
 	cp -R "$root/packages/tui/native/$PIBOLT_OS/prebuilds/$PIBOLT_PLATFORM" "$dir/native/$PIBOLT_OS/prebuilds/"
+	if [ -f "$AGENT/native/libclang/build.mjs" ] && command -v node >/dev/null 2>&1; then
+		node "$AGENT/native/libclang/build.mjs" || true
+	fi
+	if [ -d "$AGENT/native/libclang/prebuilds/$PIBOLT_PLATFORM" ]; then
+		mkdir -p "$dir/native/libclang/prebuilds"
+		cp -R "$AGENT/native/libclang/prebuilds/$PIBOLT_PLATFORM" "$dir/native/libclang/prebuilds/"
+	fi
+	if [ -f "$AGENT/native/fff/build.mjs" ] && command -v node >/dev/null 2>&1; then
+		node "$AGENT/native/fff/build.mjs" || true
+	fi
+	if [ -d "$AGENT/native/fff/prebuilds/$PIBOLT_PLATFORM" ]; then
+		mkdir -p "$dir/native/fff/prebuilds"
+		cp -R "$AGENT/native/fff/prebuilds/$PIBOLT_PLATFORM" "$dir/native/fff/prebuilds/"
+	fi
 }
 
 rm -rf "$OUT" && mkdir -p "$OUT"

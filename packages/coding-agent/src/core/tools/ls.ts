@@ -109,14 +109,22 @@ export function createLsToolDefinition(
 						const dirPath = resolveToCwd(path || ".", ctx?.cwd || cwd);
 						const effectiveLimit = limit ?? DEFAULT_LIMIT;
 
-						// Check if path exists.
-						if (!(await ops.exists(dirPath))) {
-							reject(new Error(`Path not found: ${dirPath}`));
-							return;
+						// Check if path exists and is a directory (single stat syscall for local fs).
+						let stat: { isDirectory: () => boolean };
+						if (ops === defaultLsOperations) {
+							try {
+								stat = await fsStat(dirPath);
+							} catch {
+								reject(new Error(`Path not found: ${dirPath}`));
+								return;
+							}
+						} else {
+							if (!(await ops.exists(dirPath))) {
+								reject(new Error(`Path not found: ${dirPath}`));
+								return;
+							}
+							stat = await ops.stat(dirPath);
 						}
-
-						// Check if path is a directory.
-						const stat = await ops.stat(dirPath);
 						if (!stat.isDirectory()) {
 							reject(new Error(`Not a directory: ${dirPath}`));
 							return;

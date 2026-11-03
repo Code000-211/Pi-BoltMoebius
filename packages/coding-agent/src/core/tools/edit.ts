@@ -1,9 +1,10 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { constants } from "fs";
-import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } from "fs/promises";
+import { access as fsAccess, readFile as fsReadFile, stat as fsStat, writeFile as fsWriteFile } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { splitBom } from "../../utils/text.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
+import { type ClaudeHarnessManager, defaultClaudeHarnessManager } from "../harness/index.ts";
 import {
 	applyEditsToNormalizedContent,
 	detectLineEnding,
@@ -98,6 +99,14 @@ const defaultEditOperations: EditOperations = {
 export interface EditToolOptions {
 	/** Custom operations for file editing. Default: local filesystem */
 	operations?: EditOperations;
+	/** Shared Claude harness manager for read-before-edit tracking & LSP/libclang diagnostics. */
+	harness?: ClaudeHarnessManager;
+	/** Enforce that the file was read first and not modified externally since read. */
+	enforceReadBeforeEdit?: boolean;
+	/** Include a compact line-numbered context snippet around the edited lines in the tool result. */
+	includePostEditSnippet?: boolean;
+	/** Run C++/HIP (libclang) and Rust (rust-analyzer) diagnostics and append <new-diagnostics>. Default: true */
+	enableDiagnostics?: boolean;
 }
 
 function prepareEditArguments(input: unknown): EditToolInput {
@@ -145,6 +154,10 @@ export function createEditToolDefinition(
 	options?: EditToolOptions,
 ): ToolDefinition<typeof editSchema, EditToolDetails | undefined, EditRenderState> {
 	const ops = options?.operations ?? defaultEditOperations;
+	const harness = options?.harness ?? defaultClaudeHarnessManager;
+	const enforceReadBeforeEdit = options?.enforceReadBeforeEdit ?? false;
+	const includePostEditSnippet = options?.includePostEditSnippet ?? false;
+	const enableDiagnostics = options?.enableDiagnostics ?? true;
 	return {
 		name: "edit",
 		label: "edit",
@@ -158,7 +171,8 @@ export function createEditToolDefinition(
 		prepareArguments: prepareEditArguments,
 		async execute(_toolCallId, input: EditToolInput, signal?: AbortSignal, _onUpdate?, ctx?: ExtensionContext) {
 			const { path, edits } = validateEditInput(input);
-			const absolutePath = resolveToCwd(path, ctx?.cwd || cwd);
+			const workspaceCwd = ctx?.cwd || cwd;
+			const absolutePath = resolveToCwd(path, workspaceCwd);
 
 			return withFileMutationQueue(absolutePath, async () => {
 				// Do not reject from an abort event listener here: that would release the
@@ -182,6 +196,16 @@ export function createEditToolDefinition(
 				}
 				throwIfAborted();
 
+				if (enforceReadBeforeEdit) {
+					if (!harness.stateTracker.hasBeenRead(absolutePath)) {
+						harness.assertCanModifyExistingFile(absolutePath, undefined);
+					}
+					const beforeStat =
+						ops === defaultEditOperations ? await fsStat(absolutePath).catch(() => undefined) : undefined;
+					harness.assertCanModifyExistingFile(absolutePath, beforeStat?.mtimeMs);
+					throwIfAborted();
+				}
+
 				// Read the file.
 				const buffer = await ops.readFile(absolutePath);
 				const rawContent = buffer.toString("utf-8");
@@ -198,13 +222,28 @@ export function createEditToolDefinition(
 				await ops.writeFile(absolutePath, finalContent);
 				throwIfAborted();
 
+				const afterStatPromise =
+					enforceReadBeforeEdit && ops === defaultEditOperations
+						? fsStat(absolutePath).catch(() => undefined)
+						: Promise.resolve(undefined);
 				const diffResult = generateDiffString(baseContent, newContent);
 				const patch = generateUnifiedPatch(path, baseContent, newContent);
+				const afterStat = await afterStatPromise;
+				const { suffix } = await harness.onFileModified({
+					absolutePath,
+					displayPath: path,
+					newContent,
+					newMtimeMs: afterStat?.mtimeMs ?? Date.now(),
+					workspaceCwd,
+					firstChangedLine: diffResult.firstChangedLine,
+					includePostEditSnippet,
+					enableDiagnostics,
+				});
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
+							text: `Successfully replaced ${edits.length} block(s) in ${path}.${suffix}`,
 						},
 					],
 					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },

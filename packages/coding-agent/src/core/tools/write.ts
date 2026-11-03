@@ -1,8 +1,9 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { mkdir as fsMkdir, writeFile as fsWriteFile } from "fs/promises";
+import { mkdir as fsMkdir, stat as fsStat, writeFile as fsWriteFile } from "fs/promises";
 import { dirname } from "path";
 import { type Static, Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
+import { type ClaudeHarnessManager, defaultClaudeHarnessManager } from "../harness/index.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { writeRenderers } from "./renderers/write.ts";
@@ -39,6 +40,12 @@ const defaultWriteOperations: WriteOperations = {
 export interface WriteToolOptions {
 	/** Custom operations for file writing. Default: local filesystem */
 	operations?: WriteOperations;
+	/** Shared Claude harness manager for read-before-edit tracking & LSP/libclang diagnostics. */
+	harness?: ClaudeHarnessManager;
+	/** Enforce that an existing file was read first and not modified externally before overwriting. */
+	enforceReadBeforeEdit?: boolean;
+	/** Run C++/HIP (libclang) and Rust (rust-analyzer) diagnostics and append <new-diagnostics>. Default: true */
+	enableDiagnostics?: boolean;
 }
 
 export function createWriteToolDefinition(
@@ -46,6 +53,9 @@ export function createWriteToolDefinition(
 	options?: WriteToolOptions,
 ): ToolDefinition<typeof writeSchema, undefined> {
 	const ops = options?.operations ?? defaultWriteOperations;
+	const harness = options?.harness ?? defaultClaudeHarnessManager;
+	const enforceReadBeforeEdit = options?.enforceReadBeforeEdit ?? false;
+	const enableDiagnostics = options?.enableDiagnostics ?? true;
 	return {
 		name: "write",
 		label: "write",
@@ -62,7 +72,8 @@ export function createWriteToolDefinition(
 			_onUpdate?,
 			ctx?: ExtensionContext,
 		) {
-			const absolutePath = resolveToCwd(path, ctx?.cwd || cwd);
+			const workspaceCwd = ctx?.cwd || cwd;
+			const absolutePath = resolveToCwd(path, workspaceCwd);
 			const dir = dirname(absolutePath);
 			return withFileMutationQueue(absolutePath, async () => {
 				// Do not reject from an abort event listener here: that would release the
@@ -74,6 +85,14 @@ export function createWriteToolDefinition(
 				};
 
 				throwIfAborted();
+				if (enforceReadBeforeEdit && ops === defaultWriteOperations) {
+					const existingStat = await fsStat(absolutePath).catch(() => undefined);
+					throwIfAborted();
+					if (existingStat) {
+						harness.assertCanModifyExistingFile(absolutePath, existingStat.mtimeMs);
+					}
+				}
+
 				// Create parent directories if needed.
 				await ops.mkdir(dir);
 				throwIfAborted();
@@ -82,8 +101,22 @@ export function createWriteToolDefinition(
 				await ops.writeFile(absolutePath, content);
 				throwIfAborted();
 
+				const afterStat =
+					enforceReadBeforeEdit && ops === defaultWriteOperations
+						? await fsStat(absolutePath).catch(() => undefined)
+						: undefined;
+				const { suffix } = await harness.onFileModified({
+					absolutePath,
+					displayPath: path,
+					newContent: content,
+					newMtimeMs: afterStat?.mtimeMs ?? Date.now(),
+					workspaceCwd,
+					includePostEditSnippet: false,
+					enableDiagnostics,
+				});
+
 				return {
-					content: [{ type: "text", text: `Successfully wrote to ${path}` }],
+					content: [{ type: "text", text: `Successfully wrote to ${path}${suffix}` }],
 					details: undefined,
 				};
 			});

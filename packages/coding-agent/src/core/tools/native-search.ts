@@ -24,6 +24,7 @@ import {
 import { type FileHandle, open, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { fuzzyFilterPaths, loadFffNativeAddon } from "../harness/fff-search-engine.ts";
 
 // --- globs --------------------------------------------------------------------------------------------------------------
 
@@ -611,6 +612,142 @@ export async function walk(options: WalkOptions): Promise<WalkEntry[]> {
 
 const byPath = (a: WalkEntry, b: WalkEntry) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0);
 
+// --- fff-style persistent in-memory tree & content cache + frecency -----------------------------------------------------
+
+interface CachedTreeEntry {
+	entries: WalkEntry[];
+	displayPaths: string[];
+	packedPathsBuffer?: Buffer;
+	knownAbsKeys: Set<string>;
+	dirMtimes: Map<string, number>;
+	timestamp: number;
+}
+
+const treeCache = new Map<string, CachedTreeEntry>();
+const TREE_CACHE_VERIFY_MS = 2000;
+
+interface CachedFileBuffer {
+	mtimeMs: number;
+	size: number;
+	verifiedAt: number;
+	buffer: Buffer | null; // null means binary file (has NUL byte)
+}
+
+const contentCache = new Map<string, CachedFileBuffer>();
+let contentCacheBytes = 0;
+const MAX_CONTENT_CACHE_BYTES = 64 * 1024 * 1024; // 64 MB hot buffer pool
+const MAX_CACHED_FILE_BYTES = 512 * 1024; // Cache individual source files up to 512 KB
+const CONTENT_CACHE_STAT_FREE_MS = 1500;
+
+const frecencyScores = new Map<string, number>();
+
+const normalizeCacheKey = (p: string) => {
+	const res = path.resolve(p);
+	return process.platform === "win32" ? res.toLowerCase() : res;
+};
+
+/** Record a file access/modification from read/edit/write to boost its frecency and update the in-memory index. */
+export function notifySearchFileTouched(filePath: string, content?: string | Buffer, mtimeMs?: number): void {
+	const key = normalizeCacheKey(filePath);
+	frecencyScores.set(key, (frecencyScores.get(key) ?? 0) + 10);
+
+	if (content !== undefined && mtimeMs !== undefined) {
+		const buf = typeof content === "string" ? Buffer.from(content, "utf8") : content;
+		if (buf.length <= MAX_CACHED_FILE_BYTES) {
+			const prev = contentCache.get(key);
+			if (prev?.buffer) contentCacheBytes -= prev.buffer.length;
+			const isBin = buf.indexOf(0) !== -1;
+			contentCache.set(key, {
+				mtimeMs,
+				size: buf.length,
+				verifiedAt: performance.now(),
+				buffer: isBin ? null : buf,
+			});
+			if (!isBin) contentCacheBytes += buf.length;
+		}
+	}
+
+	// Only invalidate tree cache if this file is NOT already known in the cached tree
+	for (const [cacheKey, cachedTree] of treeCache.entries()) {
+		if (!cachedTree.knownAbsKeys.has(key)) {
+			treeCache.delete(cacheKey);
+		}
+	}
+}
+
+export function getFileFrecencyScore(filePath: string): number {
+	return frecencyScores.get(normalizeCacheKey(filePath)) ?? 0;
+}
+
+export function clearNativeSearchCache(): void {
+	treeCache.clear();
+	contentCache.clear();
+	contentCacheBytes = 0;
+}
+
+async function getCachedTree(root: string, requireGit: boolean, signal?: AbortSignal): Promise<CachedTreeEntry> {
+	const resolvedRoot = path.resolve(root);
+	const cacheKey = `${normalizeCacheKey(resolvedRoot)}|${requireGit ? 1 : 0}`;
+	const now = performance.now();
+	const cached = treeCache.get(cacheKey);
+
+	if (cached) {
+		if (now - cached.timestamp < TREE_CACHE_VERIFY_MS) {
+			return cached;
+		}
+		let valid = true;
+		for (const [dirPath, oldMtime] of cached.dirMtimes) {
+			try {
+				if (statSync(dirPath).mtimeMs !== oldMtime) {
+					valid = false;
+					break;
+				}
+			} catch {
+				valid = false;
+				break;
+			}
+		}
+		if (valid) {
+			cached.timestamp = now;
+			return cached;
+		}
+	}
+
+	const allEntries = await walk({ root: resolvedRoot, requireGit, signal });
+	allEntries.sort(byPath);
+
+	const displayPaths = new Array<string>(allEntries.length);
+	const knownAbsKeys = new Set<string>();
+	const dirMtimes = new Map<string, number>();
+	try {
+		dirMtimes.set(resolvedRoot, statSync(resolvedRoot).mtimeMs);
+	} catch {
+		// Ignore
+	}
+	for (let i = 0; i < allEntries.length; i++) {
+		const entry = allEntries[i];
+		displayPaths[i] = entry.kind === "dir" ? `${entry.rel}/` : entry.rel;
+		knownAbsKeys.add(normalizeCacheKey(entry.abs));
+		if (entry.kind === "dir" && dirMtimes.size < 256) {
+			try {
+				dirMtimes.set(entry.abs, statSync(entry.abs).mtimeMs);
+			} catch {
+				// Ignore
+			}
+		}
+	}
+
+	const treeEntry: CachedTreeEntry = {
+		entries: allEntries,
+		displayPaths,
+		knownAbsKeys,
+		dirMtimes,
+		timestamp: performance.now(),
+	};
+	treeCache.set(cacheKey, treeEntry);
+	return treeEntry;
+}
+
 // --- find ---------------------------------------------------------------------------------------------------------------
 
 export interface NativeFindOptions {
@@ -619,9 +756,11 @@ export interface NativeFindOptions {
 	pattern: string;
 	limit: number;
 	signal?: AbortSignal;
+	/** Enable fff-style fuzzy fallback when exact glob matches 0 files. */
+	fuzzyFallback?: boolean;
 }
 
-/** The entries that match, in path order, folders with a trailing `/`, at most `limit`. */
+/** The entries that match, in path order (or fff fuzzy-ranked on fallback), folders with a trailing `/`, at most `limit`. */
 export async function nativeFind(options: NativeFindOptions): Promise<string[]> {
 	let pattern = options.pattern;
 	const fullPath = pattern.includes("/");
@@ -632,10 +771,29 @@ export async function nativeFind(options: NativeFindOptions): Promise<string[]> 
 		const subject = fullPath ? rel : rel.slice(rel.lastIndexOf("/") + 1);
 		return patterns.some((matches) => matches(subject));
 	};
-	return (await walk({ root: options.root, requireGit: false, keep, signal: options.signal }))
-		.sort(byPath)
-		.slice(0, Math.max(0, options.limit))
-		.map((entry) => (entry.kind === "dir" ? `${entry.rel}/` : entry.rel));
+
+	const cachedTree = await getCachedTree(options.root, false, options.signal);
+	const allEntries = cachedTree.entries;
+	const matched: string[] = [];
+	const maxResults = Math.max(0, options.limit);
+	if (maxResults === 0) return [];
+
+	for (let i = 0; i < allEntries.length; i++) {
+		const entry = allEntries[i];
+		if (keep(entry.rel)) {
+			matched.push(cachedTree.displayPaths[i]);
+			if (matched.length >= maxResults) break;
+		}
+	}
+
+	if (matched.length === 0 && options.fuzzyFallback) {
+		if (!cachedTree.packedPathsBuffer && cachedTree.displayPaths.length > 0) {
+			cachedTree.packedPathsBuffer = Buffer.from(`${cachedTree.displayPaths.join("\0")}\0`, "utf8");
+		}
+		return fuzzyFilterPaths(cachedTree.displayPaths, options.pattern, maxResults, cachedTree.packedPathsBuffer);
+	}
+
+	return matched;
 }
 
 // --- grep ---------------------------------------------------------------------------------------------------------------
@@ -868,6 +1026,26 @@ function searchLines(
 
 /** A literal: its bytes, or with `ignoreCase` (ASCII) its letters in either case. */
 function literalMatcher(pattern: string, ignoreCase: boolean): Matcher {
+	const addon = loadFffNativeAddon();
+	if (addon && pattern.length > 0 && isAscii(pattern)) {
+		const needle = ignoreCase ? undefined : Buffer.from(pattern, "utf8");
+		return {
+			prefilter: needle,
+			search: (buffer, filePath, budget, keepChars, out, firstLine) => {
+				const hits = addon.grepBufferLiteral(buffer, pattern, ignoreCase, budget, keepChars);
+				const lineOffset = firstLine - 1;
+				for (let i = 0; i < hits.length; i++) {
+					out.push({
+						filePath,
+						lineNumber: hits[i].lineNumber + lineOffset,
+						lineText: hits[i].lineText,
+					});
+				}
+				return undefined;
+			},
+		};
+	}
+
 	if (ignoreCase) {
 		const needle = Buffer.from(pattern.toLowerCase(), "utf8");
 		return {
@@ -1223,10 +1401,22 @@ export async function nativeGrep(
 	let files: string[];
 	if (options.isDirectory) {
 		const { take, include } = globFilter(options.glob);
-		const keep = (rel: string, kind: WalkEntry["kind"]) => kind === "file" && take(rel);
-		files = (await walk({ root: options.root, requireGit: true, override: include, keep, signal: options.signal }))
-			.sort(byPath)
-			.map((entry) => entry.abs);
+		if (!include) {
+			const cachedTree = await getCachedTree(options.root, true, options.signal);
+			const cachedEntries = cachedTree.entries;
+			files = [];
+			for (let i = 0; i < cachedEntries.length; i++) {
+				const entry = cachedEntries[i];
+				if (entry.kind === "file" && take(entry.rel)) {
+					files.push(entry.abs);
+				}
+			}
+		} else {
+			const keep = (rel: string, kind: WalkEntry["kind"]) => kind === "file" && take(rel);
+			files = (await walk({ root: options.root, requireGit: true, override: include, keep, signal: options.signal }))
+				.sort(byPath)
+				.map((entry) => entry.abs);
+		}
 	} else {
 		files = [options.root];
 	}
@@ -1245,16 +1435,59 @@ export async function nativeGrep(
 	for (let index = 0; index < files.length; index++) {
 		if (turns.due()) await turns.check();
 		if (sized <= index + STAT_AHEAD / 2) {
+			const now = performance.now();
 			for (const end = Math.min(files.length, index + STAT_AHEAD); sized < end; sized++) {
-				sizes[sized] = stat(files[sized]).catch(skip);
+				const fKey = normalizeCacheKey(files[sized]);
+				const cBuf = contentCache.get(fKey);
+				if (cBuf && now - cBuf.verifiedAt < CONTENT_CACHE_STAT_FREE_MS && cBuf.size <= wholeFileBytes) {
+					sizes[sized] = undefined;
+				} else {
+					sizes[sized] = stat(files[sized]).catch(skip);
+				}
 			}
 		}
 		if (requested <= index + READ_AHEAD / 2) {
+			const now = performance.now();
 			for (const end = Math.min(files.length, index + READ_AHEAD); requested < end; requested++) {
 				const file = files[requested];
+				const cacheKey = normalizeCacheKey(file);
+				const cachedBuf = contentCache.get(cacheKey);
+				if (
+					cachedBuf &&
+					sizes[requested] === undefined &&
+					now - cachedBuf.verifiedAt < CONTENT_CACHE_STAT_FREE_MS &&
+					cachedBuf.size <= wholeFileBytes
+				) {
+					reads[requested] = Promise.resolve(cachedBuf.buffer ?? undefined);
+					continue;
+				}
 				reads[requested] = (sizes[requested] ?? stat(file).catch(skip)).then(
-					(stats): Contents | Promise<Contents> =>
-						!stats?.isFile() ? undefined : stats.size > wholeFileBytes ? stats.size : readFile(file).catch(skip),
+					(stats): Contents | Promise<Contents> => {
+						if (!stats?.isFile()) return undefined;
+						if (stats.size > wholeFileBytes) return stats.size;
+						if (cachedBuf && cachedBuf.mtimeMs === stats.mtimeMs && cachedBuf.size === stats.size) {
+							cachedBuf.verifiedAt = performance.now();
+							return cachedBuf.buffer ?? undefined;
+						}
+						return readFile(file)
+							.then((buf) => {
+								if (
+									buf.length <= MAX_CACHED_FILE_BYTES &&
+									contentCacheBytes + buf.length <= MAX_CONTENT_CACHE_BYTES
+								) {
+									const isBin = buf.indexOf(0) !== -1;
+									contentCache.set(cacheKey, {
+										mtimeMs: stats.mtimeMs,
+										size: stats.size,
+										verifiedAt: performance.now(),
+										buffer: isBin ? null : buf,
+									});
+									if (!isBin) contentCacheBytes += buf.length;
+								}
+								return buf;
+							})
+							.catch(skip);
+					},
 				);
 				sizes[requested] = undefined;
 			}

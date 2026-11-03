@@ -94,4 +94,21 @@ export {
 	type TurnStartEvent,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
+export {
+	ClaudeHarnessManager,
+	type ClaudeHarnessOptions,
+	type CompileCommandEntry,
+	CompileCommandsResolver,
+	CppHipDiagnosticsEngine,
+	type CustomDiagnosticsProvider,
+	defaultClaudeHarnessManager,
+	FileStateTracker,
+	formatLateDiagnosticsReminder,
+	formatNewDiagnosticsBlock,
+	formatPostEditSnippet,
+	type HarnessDiagnostic,
+	RustDiagnosticsEngine,
+	sanitizeCompileFlags,
+	splitCompileCommand,
+} from "./harness/index.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";

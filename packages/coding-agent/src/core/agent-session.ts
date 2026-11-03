@@ -116,6 +116,7 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { ClaudeHarnessManager } from "./harness/index.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
@@ -522,6 +523,7 @@ export class AgentSession {
 
 	private _modelRuntime: ModelRuntime;
 	private _cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed">;
+	private _claudeHarness = new ClaudeHarnessManager();
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -3897,7 +3899,18 @@ export class AgentSession {
 					]),
 				)
 			: createAllToolDefinitions(this._cwd, {
-					read: { autoResizeImages },
+					read: { autoResizeImages, harness: this._claudeHarness },
+					edit: {
+						harness: this._claudeHarness,
+						enforceReadBeforeEdit: true,
+						includePostEditSnippet: true,
+						enableDiagnostics: true,
+					},
+					write: {
+						harness: this._claudeHarness,
+						enforceReadBeforeEdit: true,
+						enableDiagnostics: true,
+					},
 					bash: { commandPrefix: shellCommandPrefix, shellPath },
 				});
 

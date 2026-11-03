@@ -313,6 +313,7 @@ export function createFindToolDefinition(
 								pattern: globPattern,
 								limit: effectiveLimit,
 								signal,
+								fuzzyFallback: true,
 							});
 							settle(() =>
 								resolve(

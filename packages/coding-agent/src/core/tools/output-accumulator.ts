@@ -140,6 +140,9 @@ export class OutputAccumulator {
 			return this.readTailOutput(maxBytes);
 		}
 		if (!this.tempFilePath) {
+			if (this.tailStartsAtLineBoundary && this.totalDecodedBytes <= maxBytes) {
+				return { content: this.tailText, truncated: false };
+			}
 			return { content: new TextDecoder().decode(Buffer.concat(this.rawChunks)), truncated: false };
 		}
 		let file: Awaited<ReturnType<typeof open>>;

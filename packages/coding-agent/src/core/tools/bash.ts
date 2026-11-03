@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, existsSync } from "node:fs";
 import { access as fsAccess } from "node:fs/promises";
 import { constants as osConstants } from "node:os";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { spawn } from "child_process";
+import { type ChildProcess, spawn } from "child_process";
 import { type Static, Type } from "typebox";
-import { waitForChildProcess } from "../../utils/child-process.ts";
+import { findExecutableOnPath, waitForChildProcess } from "../../utils/child-process.ts";
 import {
 	getDirectGitBash,
 	getMsysBash,
@@ -104,6 +104,167 @@ export interface BashOperations {
 	) => Promise<{ exitCode: number | null }>;
 }
 
+const SHELL_METACHAR_REGEX = /[|&;<>()$`"'*?[#~=%!{}\r\n\\]/;
+const SHELL_KEYWORDS_AND_BUILTINS = new Set([
+	"if",
+	"then",
+	"else",
+	"elif",
+	"fi",
+	"for",
+	"while",
+	"until",
+	"do",
+	"done",
+	"case",
+	"esac",
+	"in",
+	"function",
+	"select",
+	"time",
+	"coproc",
+	"cd",
+	"echo",
+	"printf",
+	"pwd",
+	"export",
+	"unset",
+	"local",
+	"declare",
+	"typeset",
+	"readonly",
+	"source",
+	".",
+	"eval",
+	"exec",
+	"exit",
+	"return",
+	"shift",
+	"trap",
+	"wait",
+	"kill",
+	"jobs",
+	"fg",
+	"bg",
+	"disown",
+	"read",
+	"mapfile",
+	"readarray",
+	"test",
+	"[",
+	"[[",
+	"true",
+	"false",
+	":",
+	"alias",
+	"unalias",
+	"builtin",
+	"command",
+	"type",
+	"hash",
+	"ulimit",
+	"umask",
+	"shopt",
+	"set",
+	" pushd",
+	"popd",
+	"dirs",
+	"let",
+	"history",
+	"help",
+	"enable",
+	" caller",
+	"bind",
+	"complete",
+	"compgen",
+	"compopt",
+]);
+
+const directBinaryCache = new Map<string, string | null>();
+
+function tryParseDirectBinaryCommand(
+	command: string,
+	env: NodeJS.ProcessEnv,
+): { executable: string; args: string[] } | undefined {
+	const trimmed = command.trim();
+	if (!trimmed || SHELL_METACHAR_REGEX.test(trimmed)) return undefined;
+	const tokens = trimmed.split(/[ \t]+/);
+	if (tokens.length === 0) return undefined;
+	const cmdName = tokens[0];
+	if (!cmdName || cmdName.includes("=") || SHELL_KEYWORDS_AND_BUILTINS.has(cmdName)) return undefined;
+	if (process.platform === "win32") {
+		for (let i = 0; i < tokens.length; i++) {
+			if (tokens[i].startsWith("/")) return undefined;
+		}
+	}
+	const pathValue = env.PATH ?? env.Path ?? "";
+	const cacheKey = `${pathValue}\0${cmdName}`;
+	let resolved = directBinaryCache.get(cacheKey);
+	if (resolved === undefined) {
+		resolved = findExecutableOnPath(cmdName, env) ?? null;
+		directBinaryCache.set(cacheKey, resolved);
+	}
+	if (!resolved) return undefined;
+	if (process.platform === "win32" && /\.(?:cmd|bat)$/i.test(resolved)) {
+		return undefined;
+	}
+	return { executable: resolved, args: tokens.slice(1) };
+}
+
+interface WarmBashProcess {
+	child: ChildProcess;
+	shellExe: string;
+	cwd: string;
+	msys?: { bash: string; group: string };
+}
+
+let warmBashProcess: WarmBashProcess | undefined;
+
+function quoteBashSingle(value: string): string {
+	return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function buildEnvDiffScript(baseEnv: NodeJS.ProcessEnv, targetEnv: NodeJS.ProcessEnv): string {
+	let prefix = "";
+	for (const [key, val] of Object.entries(targetEnv)) {
+		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+		if (val !== undefined && baseEnv[key] !== val) {
+			prefix += `export ${key}=${quoteBashSingle(val)}\n`;
+		}
+	}
+	return prefix;
+}
+
+function spawnWarmBashCandidate(
+	shellExe: string,
+	cwd: string,
+	baseEnv: NodeJS.ProcessEnv,
+	msysBash: string | undefined,
+): WarmBashProcess | undefined {
+	try {
+		const msys = msysBash ? { bash: msysBash, group: randomUUID() } : undefined;
+		const msysSpawn = msysShellSpawn(shellExe, ["-s"]);
+		const child = spawn(shellExe, msysSpawn?.args ?? ["-s"], {
+			cwd,
+			detached: process.platform !== "win32",
+			env: msys ? { ...baseEnv, [MSYS_SHELL_GROUP_VARIABLE]: msys.group } : baseEnv,
+			stdio: ["pipe", "pipe", "pipe"],
+			windowsHide: true,
+			...(msysSpawn && { windowsVerbatimArguments: true, argv0: msysSpawn.argv0 }),
+		});
+		child.on("error", () => {
+			if (warmBashProcess?.child === child) warmBashProcess = undefined;
+		});
+		child.on("exit", () => {
+			if (warmBashProcess?.child === child) warmBashProcess = undefined;
+		});
+		child.unref();
+		return { child, shellExe, cwd, msys };
+	} catch {
+		return undefined;
+	}
+}
+
 /** Shared process execution used by the built-in shell tools. */
 export function createLocalShellOperations(shellName: string, resolveShellConfig: () => ShellConfig): BashOperations {
 	return {
@@ -123,24 +284,86 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 			// Windows, Git Bash (or MSYS2, Cygwin): a variable of this command's own that its processes inherit, by which
 			// stopping it finds them all (getMsysBash, killProcessTree).
 			const msysBash = getMsysBash(shellConfig.shell);
-			const msys = msysBash ? { bash: msysBash, group: randomUUID() } : undefined;
-			// Windows, Git for Windows: its bash itself, without the launcher in front (see getDirectGitBash).
 			const direct = commandFromStdin ? undefined : getDirectGitBash(shellConfig.shell);
 			const shellExe = direct?.bash ?? shellConfig.shell;
-			const shellEnv = direct ? direct.environment(env ?? getShellEnv()) : (env ?? getShellEnv());
-			const shellArgs = commandFromStdin ? shellConfig.args : [...shellConfig.args, command];
-			const msysSpawn = commandFromStdin ? undefined : msysShellSpawn(shellExe, shellArgs);
-			const child = spawn(shellExe, msysSpawn?.args ?? shellArgs, {
-				cwd,
-				detached: process.platform !== "win32",
-				env: msys ? { ...shellEnv, [MSYS_SHELL_GROUP_VARIABLE]: msys.group } : shellEnv,
-				stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
-				windowsHide: true,
-				...(msysSpawn && { windowsVerbatimArguments: true, argv0: msysSpawn.argv0 }),
-			});
-			if (commandFromStdin) {
-				child.stdin?.on("error", () => {});
-				child.stdin?.end(command);
+			const baseShellEnv = getShellEnv();
+			const rawEnv = env ?? baseShellEnv;
+			const shellEnv = direct ? direct.environment(rawEnv) : rawEnv;
+
+			let child: ChildProcess | undefined;
+			let msys: { bash: string; group: string } | undefined;
+
+			// Fast-Path 1: Direct Binary Execution for simple single-command invocations without shell metacharacters.
+			// Only activate when shellExe actually exists so mocked/invalid shell paths still surface ENOENT as expected.
+			const canUseFastPaths =
+				shellName === "bash" &&
+				!commandFromStdin &&
+				shellConfig.args.length === 1 &&
+				shellConfig.args[0] === "-c" &&
+				(shellExe === "sh" || shellExe === "/bin/bash" || existsSync(shellExe));
+
+			const directBin = canUseFastPaths ? tryParseDirectBinaryCommand(command, shellEnv) : undefined;
+			if (directBin) {
+				msys = msysBash ? { bash: msysBash, group: randomUUID() } : undefined;
+				child = spawn(directBin.executable, directBin.args, {
+					cwd,
+					detached: process.platform !== "win32",
+					env: msys ? { ...shellEnv, [MSYS_SHELL_GROUP_VARIABLE]: msys.group } : shellEnv,
+					stdio: ["ignore", "pipe", "pipe"],
+					windowsHide: true,
+				});
+			}
+
+			// Fast-Path 2: Pre-Spawned Warm Bash Standby Worker (0ms process creation + MSYS2 DLL initialization).
+			if (!child && canUseFastPaths) {
+				const defaultShellEnv = direct ? direct.environment(baseShellEnv) : baseShellEnv;
+				if (
+					warmBashProcess &&
+					warmBashProcess.shellExe === shellExe &&
+					warmBashProcess.cwd === cwd &&
+					warmBashProcess.child.exitCode === null &&
+					!warmBashProcess.child.killed &&
+					warmBashProcess.child.stdin?.writable
+				) {
+					const taken = warmBashProcess;
+					warmBashProcess = undefined;
+					child = taken.child;
+					msys = taken.msys;
+					child.ref();
+					const envPrefix = env ? buildEnvDiffScript(defaultShellEnv, shellEnv) : "";
+					child.stdin?.on("error", () => {});
+					child.stdin?.end(envPrefix ? `${envPrefix}${command}` : command);
+					setImmediate(() => {
+						if (!warmBashProcess) {
+							warmBashProcess = spawnWarmBashCandidate(shellExe, cwd, defaultShellEnv, msysBash);
+						}
+					});
+				} else {
+					setImmediate(() => {
+						if (!warmBashProcess) {
+							warmBashProcess = spawnWarmBashCandidate(shellExe, cwd, defaultShellEnv, msysBash);
+						}
+					});
+				}
+			}
+
+			// Standard Shell Spawn Fallback
+			if (!child) {
+				msys = msysBash ? { bash: msysBash, group: randomUUID() } : undefined;
+				const shellArgs = commandFromStdin ? shellConfig.args : [...shellConfig.args, command];
+				const msysSpawn = commandFromStdin ? undefined : msysShellSpawn(shellExe, shellArgs);
+				child = spawn(shellExe, msysSpawn?.args ?? shellArgs, {
+					cwd,
+					detached: process.platform !== "win32",
+					env: msys ? { ...shellEnv, [MSYS_SHELL_GROUP_VARIABLE]: msys.group } : shellEnv,
+					stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
+					windowsHide: true,
+					...(msysSpawn && { windowsVerbatimArguments: true, argv0: msysSpawn.argv0 }),
+				});
+				if (commandFromStdin) {
+					child.stdin?.on("error", () => {});
+					child.stdin?.end(command);
+				}
 			}
 			if (child.pid) trackDetachedChildPid(child.pid, msys);
 			let timedOut = false;
@@ -212,7 +435,7 @@ function resolveSpawnContext(
 	exposeSessionEnvironment: boolean,
 	ctx: ExtensionContext | undefined,
 ): BashSpawnContext {
-	const env = { ...getShellEnv() };
+	const env = getShellEnv();
 	delete env.PI_SESSION_ID;
 	delete env.PI_SESSION_FILE;
 	delete env.PI_PROVIDER;
