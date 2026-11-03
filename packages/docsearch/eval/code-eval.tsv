@@ -1,0 +1,40 @@
+1	How is the identity key of one cache page of prompt tokens computed so that identical tokens after a different preceding context, or with a different image in the span, never collide?	core/mem/prefix.cpp:29-56
+1	Which function finds a contiguous stretch of unused slots in the pinned host-memory bitmap, starting from a moving cursor and wrapping around once, so a batch transfers as one copy?	core/mem/hostarena.cpp:39-63
+1	Where are the tokens guessed by speculative decoding compared one by one against the target model's argmax, keeping the matching prefix plus one corrected or bonus token?	core/sample/accept.cpp:7-22
+1	Which function blocks a GPU rank's host thread until every rank has reached the same point, using a generation counter so a rank that re-enters immediately cannot race through?	core/runtime/rank_barrier.cpp:6-21
+1	Where are RGBA pixels with transparency flattened onto a white background to produce a plain RGB frame?	core/mm/imaging.cpp:195-206
+1	Which function works out the real caller's IP address behind operator-trusted reverse proxies by walking the X-Forwarded-For hops from right to left?	core/server/http.cpp:140-170
+1	In the CPU backend, which function asks the processor whether it supports AVX-512 (F/BW/DQ/VL), AVX2 with FMA and F16C, or plain AVX, to pick the code path level?	libavx/avx_dispatch.cpp:44-60
+1	In the MiniMax H3 video model plugin, where is it computed at which latent index each overlapping decoder patch begins along one side of the grid, with the leftover overlap handed out round-robin?	arch/minimaxh3/minimaxh3.cpp:173-183
+1	In the Python script that widens a checkpoint for tensor parallelism, which function returns, for every attention query slot of the enlarged layout, the original index it copies from or -1 for zero padding?	tools/pad_tp.py:57-66
+1	For long words, where does the byte-pair tokenizer combine adjacent symbol pairs in rank order using a priority queue, with version stamps to skip stale candidates?	core/text/tokenizer_bpe.cpp:133-163
+2	Where are the least recently used prefix cache entries evicted under pressure that cannot wait, moving entries whose host copy landed to the host tier and losing the rest?	core/mem/prefix.cpp:647-677
+2	Where does the KV manager roll back a sequence to fewer tokens after rejected draft tokens, dropping the paged blocks past the new length?	core/mem/kv.cpp:1104-1134
+2	Where does the scheduler preempt the last running request (preemption by recompute) and put it back at the front of the waiting queue?	core/sched/scheduler.cpp:1219-1245
+2	Where does the idle KV tier plan write-back jobs that copy cached blocks to host memory and allocate the host slots for the batch?	core/mem/kvtier.cpp:266-296
+2	Which function returns the stable prefix of partially streamed JSON text, backing out of a truncated UTF-8 sequence, an unfinished escape or an incomplete \u escape?	core/server/json_partial.cpp:152-174
+2	AVX backend top-k helper: find the next largest f32 value strictly after the previous (value, index) pair, in two vector passes	libavx/avx_support.cpp:247-277
+2	Where are the 1-2-5 histogram buckets (vLLM's build_1_2_5_buckets) built for the token-count metrics?	core/server/metrics.cpp:51-63
+2	In the kernel tuner, which function computes the maximum relative difference between the output operands of a candidate run and the reference run?	tools/rad_tune.cpp:262-291
+2	Where is a regex converted into a reversed partial regex, so a partial match at the end of the input can be detected?	vendor/llama/common/regex-partial.cpp:71-101
+2	Test helper that writes a GGUF v3 file from key-values and tensors at 32-byte aligned offsets	tests/gguf_writer.h:33-63
+3	Wo wird der Prefill in Stücke geteilt, sodass ein Chunk genau an der Checkpoint-Grenze des linearen Zustands endet?	core/sched/scheduler.cpp:970-1000
+3	Wo wird die modifizierte Besselfunktion nullter Ordnung für das Kaiser-Fenster des Audio-Resamplers berechnet?	core/mm/resample.cpp:24-32
+3	Welche Funktion zerlegt gestreamten Text für die Sprachausgabe in fertige Sätze oder Teilsätze?	core/server/text_split.cpp:136-166
+3	Wo entscheidet das Gemma-3-Plugin, welche Schichten globale Attention und welche Sliding-Window-Attention verwenden?	arch/gemma3/gemma3.cpp:44-65
+3	Wo wird der übergebene API-Schlüssel in konstanter Zeit mit dem konfigurierten verglichen, damit man ihn nicht per Zeitmessung erraten kann?	core/server/http.cpp:508-513
+3	Welche Funktion prüft, ob ein Modellargument eine Hugging-Face-Repo-ID der Form owner/name ist und kein lokaler Pfad oder Dateiname?	core/hf_model.cpp:78-88
+3	Wo wird der Pfad der Steuervektor-Datei (.control-vector.gguf) neben der Modelldatei abgeleitet?	core/cvec.cpp:30-35
+3	Wie zerlegt das LTX-2-Plugin das latente Raster für den VAE-Decoder in Kacheln?	arch/ltx2/ltx2.cpp:135-142
+3	Wo liest der Konverter die Schichtnummer aus einem GGUF-Tensornamen der Form blk.N.?	tools/rad_convert.cpp:255-261
+3	Welche Funktion prüft, ob ein Unicode-Codepunkt ein chinesisches Han-Schriftzeichen (CJK-Ideogramm) ist?	vendor/llama/src/unicode.cpp:1192-1222
+4	the HTTP handler for /v1/audio/transcriptions	core/server/speech.cpp:227-257
+4	the HTTP handler for GET /v1/videos/:id (one video job's status)	core/server/videos.cpp:1222-1234
+4	the HTTP handler for the Anthropic-compatible /v1/messages endpoint	core/server/server.cpp:1455-1469
+4	the HTTP handler for /v1/load_lora_adapter and /v1/unload_lora_adapter	core/server/server.cpp:2279-2309
+4	the Prometheus /metrics endpoint handler of the HTTP server	core/server/server.cpp:2338-2348
+4	SDXL architecture plugin: graph declaration of the UNet	arch/sdxl/sdxl.cpp:768-798
+4	libhalo (gfx1151): launcher of the strided 2D peer-to-peer copy kernel with a capped workgroup count	libhalo/halo_p2p_copy2d.hip:34-49
+4	libr4d: the embedding lookup GPU kernel that decodes rows from an IQR-coded token table	libr4d/r4d_iqr_embed.hip:31-61
+4	libr3d: the kv_len_trim kernel that shortens per-sequence context lengths for the prefill overlap slice	libr3d/r3d_kv_len_trim.hip:22-30 | libr3d/r3d_kv_len_trim.hip:36-50
+4	chatparse_serve tool: reassembling the SSE streaming chunks of a chat completion into one assistant message	tools/chatparse_serve.cpp:81-111

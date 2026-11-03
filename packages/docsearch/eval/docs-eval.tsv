@@ -1,0 +1,60 @@
+1	how can a client make the server forget a finished conversation right away instead of waiting for it to expire	docs/GUIDE.md:1606-1617
+1	will tensor parallel still work if my two cards can't read each other's memory directly	docs/GUIDE.md:1501-1510
+1	does attaching an adapter change the output for batch rows that use no adapter at all	docs/OPS.md:855-864
+1	why are there no correctness or timing numbers for the all-reduce kernels in the kernel report	docs/KERNELS.md:4343-4345
+1	why must the per-head width be read from the checkpoint rather than computed from hidden size and head count	docs/ARCHITECTURES.md:44-49
+1	where does the n-gram embedding table live when Flash-Next is served from a single Strix Halo box	STRIX_HALOD_RADIANCE.md:1272-1279
+1	why does the model plugin declare its drafter instead of the engine detecting one from the weight names	spec.md:1243-1258
+1	can my kernel plugin use rocBLAS or MIOpen on the stream the engine hands it	docs/PLUGIN.md:184-189
+1	is it worth keeping only a window of the KV cache on the card for a dense attention model	docs/KV-STREAMING.md:46-48
+1	why are a few experts left in bf16 rather than quantised to four bits	docs/MOE-W4.md:311-318
+1	my GGUF header parser finds zero tensors when reading a sharded repository	docs/qwen3-8-flash-next-gguf-quant-recipes.md:36-40
+1	how does the template engine keep users from smuggling special tokens into the prompt through their message text	vendor/llama/common/jinja/README.md:57-66
+1	how much memory does the sparse attention's block-key cache add per token compared with the regular KV cache	docs/QSA.md:52-59
+1	what does the third GPU do when serving on three cards with a model that has only two KV heads	docs/TP3.md:21-28
+1	the DeepSeek release ships no chat template, how do I get chat completions to stop returning 501	docs/deepseek41-hf-direct.md:19-22 | docs/deepseek41-hf-direct.md:48-50
+2	How does prompt lookup decoding draft tokens when the container has no draft head?	docs/GUIDE.md:1338-1346
+2	Is the int8 all-reduce on four Radeon AI PRO R9700 cards limited by PCIe Gen5 x16 line rate?	docs/TP4.md:194-202 | docs/TP4.md:37-37
+2	Why can't AMD's AddressSanitizer for amdgcn be used on RDNA cards?	docs/KERNELS.md:4331-4333 | docs/PLUGIN.md:270-272
+2	How does Gemma 4's proportional RoPE differ from a partial rotary embedding?	docs/ARCHITECTURES.md:1086-1091
+2	What memory read bandwidth and launch floor were measured on the Radeon 8060S in the Strix Halo nodes?	STRIX_HALOD_RADIANCE.md:50-54
+2	How many monkey-patches did vLLM need to serve four models on one card?	spec.md:19-33
+2	What single-thread FMA throughput does the Ryzen 9 9950X3D reach with AVX-512 versus AVX2?	libavx/README.md:250-257
+2	Why is VOPD dual-issue pairing turned off when building with ROCm 10.1's LLVM?	README.md:194-198 | docs/DOCKER.md:45-45
+2	Does RDNA4 have a dense 16x16x32 fp8 WMMA instruction?	libr4d/isa/README.md:72-74
+2	Which layers of unsloth's Qwen3.8-Flash-Next GGUF get Q8_0 down projections, and why?	docs/qwen3-8-flash-next-gguf-quant-recipes.md:238-256
+2	Can the Grafana dashboard be used with VictoriaMetrics instead of Prometheus?	deploy/grafana/README.md:9-11 | deploy/grafana/README.md:38-40
+2	Which firmware settings does the MSI MPG X670E CARBON WIFI need for Resizable BAR with two R9700s?	docs/PREPARING_YOUR_RIG.md:11-22
+2	How does IQR-V2 use QTIP's bitshift trellis inside GPTQ?	docs/IQR.md:89-101
+2	Why do streamed tool calls stall with the round-to-nearest Gemma 4 31B w4a8 container?	docs/GEMMA4-31B-GPTQ.md:3-7 | docs/GEMMA4-31B-GPTQ.md:89-97
+2	Does ComfyUI's Load LoRA node apply to the Radiance MiniMax node for MiniMax-H3?	integrations/comfyui/ComfyUI-Radiance-MiniMax/README.md:21-24
+3	--prefill-interleave	docs/GUIDE.md:1126-1132
+3	R4D_AR_MAX_BLOCKS two engines same cards	docs/GUIDE.md:4023-4036
+3	rad-schemas a.so b.so schema disagreement	docs/OPS.md:177-184 | docs/TOOLS.md:683-690
+3	rad-tune --tp 2 hangs rank 0 declare	docs/TOOLS.md:656-662
+3	gfx11-generic libr3d code object	libr3d/README.md:3-8 | libr3d/README.md:119-123
+3	printf assert hostcall device code refused	docs/PLUGIN.md:193-195
+3	kvstream_host_gate --host-headroom-mib refusal	docs/KV-STREAMING.md:223-228
+3	ctest -LE 'gpu|oot'	README.md:324-329
+3	-mcumode -ffp-contract=off libr4d per-unit flags	libr4d/README.md:98-101 | docs/OPS.md:2471-2474
+3	rope_type llama3 longrope mscale refused	docs/YARN.md:35-38
+3	rad_memset_async RAD_MEM_HOST	docs/IMPLEMENTATION.md:105-111
+3	--kernels libhalo libr3d order	libhalo/README.md:11-23
+3	gen_stubs.py --check HALO_UNITS halo_stubs.cpp	libhalo/PORTING.md:118-125
+3	statsdump.py --max-mib --every	scripts/README.md:47-47
+3	RADIANCE_DEBUG_POISON_ALLOC	docs/TP3.md:113-121
+4	Ist --tp-wire wht6 verlustbehaftet und welche Nachrichten bleiben exakt?	docs/GUIDE.md:1468-1472
+4	Warum bekomme ich leeren content mit finish_reason length bei kurzen Chat-Antworten?	docs/GUIDE.md:3998-3998
+4	Wie füge ich eine neue Op zum Vokabular hinzu?	docs/OPS.md:3414-3419
+4	Welche Gate-Funktion hat der Ausgang des Delta-Net bei Qwen4-Exp im Unterschied zu Qwen3.5?	docs/ARCHITECTURES.md:215-218
+4	Warum schlug der Build mit dem System-g++ auf dem Strix-Halo-Node fehl?	STRIX_HALOD_RADIANCE.md:1739-1742
+4	Wie vergleiche ich die Token-IDs meines Tokenizers mit HuggingFace, ohne Python auszuführen?	docs/TOOLS.md:780-790
+4	Warum wird fp8 auf der CPU nicht per Tabellen-Gather dekodiert?	libavx/README.md:675-678
+4	Bringt eine Hadamard-Rotation ohne GPTQ etwas beim int4-Runden?	docs/MOE-W4.md:210-215
+4	Welche Schritte brauche ich, um einen neuen Kernel zur RDNA4-Bibliothek hinzuzufügen?	libr4d/README.md:103-116
+4	Welche Standardwerte haben beta_fast und beta_slow bei YaRN?	docs/YARN.md:26-33
+4	Wie prüfe ich, ob eine Sitzung nach dem Auslagern aus dem VRAM byte-identisch zurückkommt?	scripts/README.md:59-59 | spec.md:1169-1174 | docs/TOOLS.md:1008-1008
+4	Kann das Modellverzeichnis auf btrfs mit Kompression liegen?	docs/DOCKER.md:174-180
+4	Ist Tensor-Parallelität über drei R9700 schneller als über zwei?	docs/TP3.md:155-171
+4	Warum war ein einfaches Minimum über die Decode-Schritte als Untergrenze falsch?	docs/DEVLOG-decode-floor.md:21-32
+4	Start bricht mit vram_kv resolved to 0 MiB ab, wenn ich LoRAs für MiniMax-H3 lade – was tun?	integrations/comfyui/ComfyUI-Radiance-MiniMax/README.md:26-31 | docs/GUIDE.md:1872-1875
