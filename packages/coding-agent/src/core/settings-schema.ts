@@ -30,6 +30,36 @@ const CompactionModelOverrideSchema = Type.Object({
 	maxContextTokens: Type.Optional(maxContextTokens()),
 });
 
+const ToolResultPruningSettingsSchema = Type.Object({
+	enabled: Type.Optional(
+		Type.Boolean({
+			description: "Send old, large tool results to the model as a one-line note. The session keeps them in full.",
+			default: SETTINGS_DEFAULTS.toolResultPruning.enabled,
+		}),
+	),
+	triggerTokens: Type.Optional(
+		nonNegativeSafeInteger({
+			description: "Clear only once the context is at least this many tokens (estimated).",
+			default: SETTINGS_DEFAULTS.toolResultPruning.triggerTokens,
+		}),
+	),
+	keepRecent: Type.Optional(
+		Type.Integer({
+			minimum: 1,
+			maximum: Number.MAX_SAFE_INTEGER,
+			description:
+				"The most recent tool results that are never cleared. The boundary moves in steps of this many results, so the prompt cache breaks only once per step.",
+			default: SETTINGS_DEFAULTS.toolResultPruning.keepRecent,
+		}),
+	),
+	minChars: Type.Optional(
+		nonNegativeSafeInteger({
+			description: "Clear only results with at least this many characters of text, or with an image.",
+			default: SETTINGS_DEFAULTS.toolResultPruning.minChars,
+		}),
+	),
+});
+
 const CompactionSettingsSchema = Type.Object({
 	enabled: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.compaction.enabled })),
 	reserveTokens: Type.Optional(
@@ -287,6 +317,7 @@ export const SettingsSchema = Type.Object(
 		),
 		theme: Type.Optional(Type.String()),
 		compaction: Type.Optional(CompactionSettingsSchema),
+		toolResultPruning: Type.Optional(ToolResultPruningSettingsSchema),
 		branchSummary: Type.Optional(BranchSummarySettingsSchema),
 		retry: Type.Optional(RetrySettingsSchema),
 		hideThinkingBlock: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.hideThinkingBlock })),

@@ -93,6 +93,17 @@ The defaults scale with the context window only while the matching setting is un
 
 See [Compaction Reference](compaction.md) for trigger, summarization, and validation behavior.
 
+### Old tool results
+
+Once the context passes `triggerTokens`, tool results older than the most recent `keepRecent` are sent to the model as a one-line note when their text is at least `minChars` long or they hold an image. The session keeps the full results, and compaction summarizes them in full. The boundary moves in steps of `keepRecent` results, so the prompt cache is rebuilt from the boundary once per step rather than on every call.
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `toolResultPruning.enabled` | boolean | `true` | Clear old, large tool results from what is sent. |
+| `toolResultPruning.triggerTokens` | number | `40000` | Clear only once the context is at least this many tokens (estimated from its characters). |
+| `toolResultPruning.keepRecent` | number | `8` | Recent tool results never cleared, and the step of the boundary. |
+| `toolResultPruning.minChars` | number | `2000` | Clear only results with at least this many characters of text, or with an image. |
+
 ### Branch summaries
 
 | Setting | Type | Default | Description |

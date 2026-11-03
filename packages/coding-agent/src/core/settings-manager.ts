@@ -28,6 +28,7 @@ import type {
 	TuiMode,
 	WarningSettings,
 } from "./settings-schema.ts";
+import type { ToolResultPruningSettings } from "./tool-result-pruning.ts";
 
 export type {
 	BranchSummarySettings,
@@ -1692,6 +1693,19 @@ export class SettingsManager {
 		this.globalSettings.images.autoResize = enabled;
 		this.markModified("images", "autoResize");
 		this.save();
+	}
+
+	getToolResultPruningSettings(): ToolResultPruningSettings {
+		const settings = this.settings.toolResultPruning;
+		const defaults = SETTINGS_DEFAULTS.toolResultPruning;
+		const count = (value: unknown, fallback: number, min: number) =>
+			typeof value === "number" && Number.isSafeInteger(value) && value >= min ? value : fallback;
+		return {
+			enabled: settings?.enabled ?? defaults.enabled,
+			triggerTokens: count(settings?.triggerTokens, defaults.triggerTokens, 0),
+			keepRecent: count(settings?.keepRecent, defaults.keepRecent, 1),
+			minChars: count(settings?.minChars, defaults.minChars, 0),
+		};
 	}
 
 	getBlockImages(): boolean {

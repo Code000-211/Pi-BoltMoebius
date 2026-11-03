@@ -176,6 +176,37 @@
         }
       }
     },
+    "toolResultPruning": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Send old, large tool results to the model as a one-line note. The session keeps them in full.",
+          "default": true
+        },
+        "triggerTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Clear only once the context is at least this many tokens (estimated).",
+          "default": 40000
+        },
+        "keepRecent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "The most recent tool results that are never cleared. The boundary moves in steps of this many results, so the prompt cache breaks only once per step.",
+          "default": 8
+        },
+        "minChars": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Clear only results with at least this many characters of text, or with an image.",
+          "default": 2000
+        }
+      }
+    },
     "branchSummary": {
       "type": "object",
       "properties": {
