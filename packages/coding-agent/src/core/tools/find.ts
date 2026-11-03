@@ -7,7 +7,7 @@ import { PIBOLT } from "../../pi-bolt.ts";
 import { createInterface } from "../../utils/readline.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
-import { nativeFind } from "./native-search.ts";
+import { nativeFindDetailed } from "./native-search.ts";
 import { pathExists, resolveToCwd } from "./path-utils.ts";
 import { findRenderers } from "./renderers/find.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -133,6 +133,8 @@ export function windowsGlobSeparators(glob: string): string {
 export interface FindToolDetails {
 	truncation?: TruncationResult;
 	resultLimitReached?: number;
+	/** No entry matched the pattern; the paths are the closest names (Pi-Bolt's in-process find). */
+	fuzzyFallback?: true;
 }
 
 /**
@@ -308,23 +310,29 @@ export function createFindToolDefinition(
 								process.platform === "win32"
 									? windowsGlobSeparators(pattern).replace(/^(?:\.\/)+(?=.)/, "")
 									: pattern;
-							const found = await nativeFind({
+							const { paths: found, fuzzy } = await nativeFindDetailed({
 								root: searchPath,
 								pattern: globPattern,
 								limit: effectiveLimit,
 								signal,
 								fuzzyFallback: true,
 							});
-							settle(() =>
-								resolve(
-									found.length === 0
-										? {
-												content: [{ type: "text", text: "No files found matching pattern" }],
-												details: undefined,
-											}
-										: formatFindResults(found, effectiveLimit),
-								),
-							);
+							if (found.length === 0) {
+								settle(() =>
+									resolve({
+										content: [{ type: "text", text: "No files found matching pattern" }],
+										details: undefined,
+									}),
+								);
+								return;
+							}
+							const result = formatFindResults(found, effectiveLimit);
+							if (fuzzy) {
+								// Not matches: say so, or the model takes the closest names for files the pattern found.
+								result.content[0].text = `No files match the pattern. The closest paths by name (not matches of the pattern):\n${result.content[0].text}`;
+								result.details = { ...result.details, fuzzyFallback: true };
+							}
+							settle(() => resolve(result));
 							return;
 						}
 
