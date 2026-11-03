@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
@@ -705,5 +705,40 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 				edits: [{ oldText: "__global__ void softmax()", newText: "__global__ void softmax_v2()" }],
 			}),
 		).rejects.toThrow(/File has been modified since it was last read/);
+	});
+
+	it("supports Codex-style seek_sequence indentation-tolerant fallback matching in edit", async () => {
+		const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
+		const readTool = createReadTool(testDir, { harness });
+		const editTool = createEditTool(testDir, {
+			harness,
+			enforceReadBeforeEdit: true,
+			enableDiagnostics: false,
+		});
+
+		const filePath = join(testDir, "indented.ts");
+		writeFileSync(
+			filePath,
+			["export function compute() {", "\tif (ready) {", "\t\treturn 1;", "\t}", "\treturn 0;", "}", ""].join("\n"),
+			"utf-8",
+		);
+
+		await readTool.execute("r-indent-1", { path: "indented.ts" });
+
+		// Model sends spaces instead of tabs for oldText and newText
+		await editTool.execute("e-indent-1", {
+			path: "indented.ts",
+			edits: [
+				{
+					oldText: "  if (ready) {\n    return 1;\n  }",
+					newText: "  if (ready) {\n\t\treturn 42;\n  }",
+				},
+			],
+		});
+
+		const updated = readFileSync(filePath, "utf-8");
+		expect(updated).toBe(
+			["export function compute() {", "\tif (ready) {", "\t\treturn 42;", "\t}", "\treturn 0;", "}", ""].join("\n"),
+		);
 	});
 });

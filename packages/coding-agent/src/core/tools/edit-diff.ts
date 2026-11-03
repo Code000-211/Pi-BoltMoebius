@@ -281,6 +281,132 @@ function countOccurrences(fuzzyContent: string, oldText: string): number {
 	return fuzzyContent.split(fuzzyOldText).length - 1;
 }
 
+interface TrimmedSequenceMatch {
+	matchIndex: number;
+	matchLength: number;
+	occurrences: number;
+	adjustedNewText: string;
+}
+
+function getLeadingWhitespace(line: string): string {
+	let i = 0;
+	while (i < line.length && (line[i] === " " || line[i] === "\t")) {
+		i++;
+	}
+	return line.slice(0, i);
+}
+
+/**
+ * Adjust the leading indentation of `newText` lines when `oldText` matched via
+ * Codex-style trimmed line matching (e.g., model sent 2-space indent instead of tab indent).
+ */
+function reindentNewTextForMatchedLines(matchedOriginalSlice: string, oldText: string, newText: string): string {
+	const hasTrailingNewline = newText.endsWith("\n");
+	const origLines = matchedOriginalSlice.endsWith("\n")
+		? matchedOriginalSlice.slice(0, -1).split("\n")
+		: matchedOriginalSlice.split("\n");
+	const oldLines = oldText.endsWith("\n") ? oldText.slice(0, -1).split("\n") : oldText.split("\n");
+	const newLines = hasTrailingNewline ? newText.slice(0, -1).split("\n") : newText.split("\n");
+
+	let origAnchorIndent: string | undefined;
+	let oldAnchorIndent: string | undefined;
+	const pairCount = Math.min(origLines.length, oldLines.length);
+	for (let i = 0; i < pairCount; i++) {
+		if (origLines[i].trim().length > 0 && oldLines[i].trim().length > 0) {
+			origAnchorIndent = getLeadingWhitespace(origLines[i]);
+			oldAnchorIndent = getLeadingWhitespace(oldLines[i]);
+			break;
+		}
+	}
+
+	if (origAnchorIndent === undefined || oldAnchorIndent === undefined || origAnchorIndent === oldAnchorIndent) {
+		return newText;
+	}
+
+	const adjustedLines = newLines.map((line) => {
+		if (line.trim().length === 0) return line;
+		if (oldAnchorIndent.length === 0) {
+			return origAnchorIndent + line;
+		}
+		if (line.startsWith(oldAnchorIndent)) {
+			return origAnchorIndent + line.slice(oldAnchorIndent.length);
+		}
+		return line;
+	});
+
+	const joined = adjustedLines.join("\n");
+	return hasTrailingNewline ? `${joined}\n` : joined;
+}
+
+/**
+ * Codex `seek_sequence` fallback pass (`codex-rs/apply-patch/src/seek_sequence.rs`):
+ * When exact and trailing-whitespace matches fail, match line-by-line ignoring
+ * leading/trailing whitespace and Unicode punctuation differences.
+ */
+function findTrimmedLineSequence(content: string, oldText: string, newText: string): TrimmedSequenceMatch | undefined {
+	const rawLines = splitLinesWithEndings(content);
+	if (rawLines.length === 0) return undefined;
+
+	const lineOffsets: number[] = new Array(rawLines.length);
+	const trimmedFileLines: string[] = new Array(rawLines.length);
+	let offset = 0;
+	for (let i = 0; i < rawLines.length; i++) {
+		lineOffsets[i] = offset;
+		const lineWithoutEnding = rawLines[i].endsWith("\n") ? rawLines[i].slice(0, -1) : rawLines[i];
+		trimmedFileLines[i] = normalizeForFuzzyMatch(lineWithoutEnding).trim();
+		offset += rawLines[i].length;
+	}
+
+	const patternEndsWithNewline = oldText.endsWith("\n");
+	const rawPatternLines = (patternEndsWithNewline ? oldText.slice(0, -1) : oldText).split("\n");
+	if (rawPatternLines.length === 0 || rawPatternLines.length > rawLines.length) {
+		return undefined;
+	}
+
+	const trimmedPatternLines = rawPatternLines.map((line) => normalizeForFuzzyMatch(line).trim());
+	// Avoid matching purely blank patterns via trimmed sequence
+	if (trimmedPatternLines.every((line) => line.length === 0)) {
+		return undefined;
+	}
+
+	const maxStart = rawLines.length - trimmedPatternLines.length;
+	let firstMatchStartLine = -1;
+	let occurrences = 0;
+
+	for (let i = 0; i <= maxStart; i++) {
+		let ok = true;
+		for (let p = 0; p < trimmedPatternLines.length; p++) {
+			if (trimmedFileLines[i + p] !== trimmedPatternLines[p]) {
+				ok = false;
+				break;
+			}
+		}
+		if (ok) {
+			if (firstMatchStartLine === -1) {
+				firstMatchStartLine = i;
+			}
+			occurrences++;
+		}
+	}
+
+	if (occurrences === 0) return undefined;
+
+	const endLineIdx = firstMatchStartLine + trimmedPatternLines.length - 1;
+	const matchIndex = lineOffsets[firstMatchStartLine];
+	const lastLine = rawLines[endLineIdx];
+	const lastLineLength = !patternEndsWithNewline && lastLine.endsWith("\n") ? lastLine.length - 1 : lastLine.length;
+	const matchEnd = lineOffsets[endLineIdx] + lastLineLength;
+	const matchLength = matchEnd - matchIndex;
+	const matchedOriginalSlice = content.slice(matchIndex, matchEnd);
+
+	return {
+		matchIndex,
+		matchLength,
+		occurrences,
+		adjustedNewText: reindentNewTextForMatchedLines(matchedOriginalSlice, oldText, newText),
+	};
+}
+
 function getNotFoundError(path: string, editIndex: number, totalEdits: number): Error {
 	if (totalEdits === 1) {
 		return new Error(
@@ -363,7 +489,20 @@ export function applyEditsToNormalizedContent(
 		const edit = normalizedEdits[i];
 		const matchResult = findText(replacementBaseContent, edit.oldText, getReplacementBaseFuzzyContent);
 		if (!matchResult.found) {
-			throw getNotFoundError(path, i, normalizedEdits.length);
+			const trimmedMatch = findTrimmedLineSequence(replacementBaseContent, edit.oldText, edit.newText);
+			if (!trimmedMatch) {
+				throw getNotFoundError(path, i, normalizedEdits.length);
+			}
+			if (trimmedMatch.occurrences > 1) {
+				throw getDuplicateError(path, i, normalizedEdits.length, trimmedMatch.occurrences);
+			}
+			matchedEdits.push({
+				editIndex: i,
+				matchIndex: trimmedMatch.matchIndex,
+				matchLength: trimmedMatch.matchLength,
+				newText: trimmedMatch.adjustedNewText,
+			});
+			continue;
 		}
 
 		// normalizeForFuzzyMatch is idempotent, so this is the normalized replacement base either way.
