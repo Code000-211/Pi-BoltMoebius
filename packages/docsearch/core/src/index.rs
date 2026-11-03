@@ -322,7 +322,8 @@ fn parse_file(path: &Path, extra: Option<&ExtraEntities>) -> Vec<Parsed> {
 
 /// Bumped whenever the file layout or what goes into it changes, so an old file is rebuilt.
 const FORMAT: u64 = 3;
-const MAGIC: &[u8; 8] = b"DSINDEX\0";
+/// The format's version is its last byte: 2 with the table hash of `store.rs` (0, before it, hashed with FxHash).
+const MAGIC: &[u8; 8] = b"DSINDEX\x02";
 
 fn nanos(t: SystemTime) -> u64 {
     t.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
@@ -761,7 +762,8 @@ impl Index {
         let nodes = self.graph.len();
         let ids = if nd > 0 { d0 + nd } else { n };
         grow(&mut sc.acc, ids);
-        grow(&mut sc.qidf, self.terms.len());
+        // Indexed by term ids, which `check` keeps below `post.len()` (not the map's key count).
+        grow(&mut sc.qidf, self.post.len());
         for &t in &qids {
             sc.qidf[t as usize] = idf(self.post.len_of(t as usize) as f32);
         }

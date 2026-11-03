@@ -2,7 +2,6 @@
 //! index is used where it lies: opening one reads nothing, and every process that maps the same
 //! file shares its pages.
 
-use std::hash::Hasher;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -115,10 +114,28 @@ impl Strs {
     }
 }
 
+/// The table's hash. It is saved with the index, so it is defined here rather than taken from a crate whose next
+/// version may hash differently (the saved tables would then find nothing). Eight bytes at a time, then murmur3's
+/// finalizer, so the low bits the table uses depend on every byte.
 fn hash(key: &[u8]) -> u64 {
-    let mut h = rustc_hash::FxHasher::default();
-    h.write(key);
-    h.finish()
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mix = |h: u64, word: u64| (h ^ word).wrapping_mul(K).rotate_left(31);
+    let mut h = key.len() as u64;
+    let mut words = key.chunks_exact(8);
+    for word in &mut words {
+        h = mix(h, u64::from_le_bytes(word.try_into().unwrap()));
+    }
+    let rest = words.remainder();
+    if !rest.is_empty() {
+        let mut last = [0u8; 8];
+        last[..rest.len()].copy_from_slice(rest);
+        h = mix(h, u64::from_le_bytes(last));
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^ (h >> 33)
 }
 
 /// String -> `u32`, as an open-addressing table over `keys`, usable straight from the file.
@@ -150,7 +167,8 @@ impl StrMap {
     pub fn get(&self, key: &str) -> Option<u32> {
         let mask = self.slots.len().checked_sub(1)?;
         let mut at = hash(key.as_bytes()) as usize & mask;
-        loop {
+        // At most every slot once: a damaged file whose table has no empty slot must not loop forever.
+        for _ in 0..self.slots.len() {
             let s = self.slots[at];
             if s == 0 {
                 return None;
@@ -160,6 +178,7 @@ impl StrMap {
             }
             at = (at + 1) & mask;
         }
+        None
     }
     pub fn len(&self) -> usize {
         self.keys.len()
@@ -273,5 +292,21 @@ mod tests {
         }
         assert_eq!(m.get("nope"), None);
         assert_eq!(StrMap::default().get("x"), None);
+    }
+
+    #[test]
+    fn the_saved_hash_does_not_change() {
+        // Saved tables depend on these values: changing the hash needs a new format version (MAGIC in index.rs).
+        assert_eq!(hash(b""), 0);
+        assert_eq!(hash(b"softmax"), hash(b"softmax"));
+        assert_ne!(hash(b"softmax"), hash(b"softmaz"));
+        assert_eq!(format!("{:016x}", hash(b"PrefixCache::trim")), "9d39b18ad9eca72d");
+    }
+
+    #[test]
+    fn a_table_without_an_empty_slot_ends_the_lookup() {
+        // A damaged file: every slot taken, none holding the key.
+        let m = StrMap { keys: Strs::from_iter(["a", "b"]), vals: vec![1u32, 2].into(), slots: vec![1u32, 2].into() };
+        assert_eq!(m.get("zzz"), None);
     }
 }

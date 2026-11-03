@@ -74,7 +74,8 @@ it in the executable. `PI_DOCSEARCH=off` leaves the extension out of a run (no t
 | `results`, `resultChars` | `6`, `[1500, 1000, 600]` | The best three results come with this much text, the rest as `path:lines` only. |
 | `autoRecall` | `true` | Add matching doc sections to a typed prompt; `/docs auto on\|off`. |
 
-The index files live in `~/.cache/docsearch/index/` (`DOCSEARCH_CACHE_DIR` to move them). A folder whose build takes
+The index files live in `~/.cache/docsearch/index/` (`DOCSEARCH_CACHE_DIR` to move them). A file of another format
+version (the last byte of its magic) is built again. A folder whose build takes
 less than 100 ms is kept in memory only. Files unused for 30 days are removed.
 
 ## Layout
