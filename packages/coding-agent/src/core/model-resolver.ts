@@ -49,6 +49,7 @@ export const defaultModelPerProvider: Partial<Record<KnownProvider, string>> = {
 	opencode: "kimi-k2.6",
 	"opencode-go": "kimi-k3",
 	"kimi-coding": "kimi-for-coding",
+	melious: "glm-5.3",
 	meta: "muse-spark-1.3",
 	"cloudflare-workers-ai": "@cf/moonshotai/kimi-k2.6",
 	"cloudflare-ai-gateway": "workers-ai/@cf/moonshotai/kimi-k2.6",

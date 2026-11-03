@@ -17,6 +17,7 @@ import type { GOOGLE_VERTEX_CLASSIFIER_MODELS, GOOGLE_VERTEX_IMAGE_MODELS, GOOGL
 import type { GROQ_CLASSIFIER_MODELS, GROQ_IMAGE_MODELS, GROQ_MODELS } from "./providers/groq.models.ts";
 import type { HUGGINGFACE_CLASSIFIER_MODELS, HUGGINGFACE_IMAGE_MODELS, HUGGINGFACE_MODELS } from "./providers/huggingface.models.ts";
 import type { KIMI_CODING_CLASSIFIER_MODELS, KIMI_CODING_IMAGE_MODELS, KIMI_CODING_MODELS } from "./providers/kimi-coding.models.ts";
+import type { MELIOUS_CLASSIFIER_MODELS, MELIOUS_IMAGE_MODELS, MELIOUS_MODELS } from "./providers/melious.models.ts";
 import type { META_CLASSIFIER_MODELS, META_IMAGE_MODELS, META_MODELS } from "./providers/meta.models.ts";
 import type { MINIMAX_CLASSIFIER_MODELS, MINIMAX_IMAGE_MODELS, MINIMAX_MODELS } from "./providers/minimax.models.ts";
 import type { MINIMAX_CN_CLASSIFIER_MODELS, MINIMAX_CN_IMAGE_MODELS, MINIMAX_CN_MODELS } from "./providers/minimax-cn.models.ts";
@@ -59,6 +60,7 @@ import { GOOGLE_VERTEX_MODEL_CATALOG } from "./providers/google-vertex.catalog.g
 import { GROQ_MODEL_CATALOG } from "./providers/groq.catalog.generated.ts";
 import { HUGGINGFACE_MODEL_CATALOG } from "./providers/huggingface.catalog.generated.ts";
 import { KIMI_CODING_MODEL_CATALOG } from "./providers/kimi-coding.catalog.generated.ts";
+import { MELIOUS_MODEL_CATALOG } from "./providers/melious.catalog.generated.ts";
 import { META_MODEL_CATALOG } from "./providers/meta.catalog.generated.ts";
 import { MINIMAX_MODEL_CATALOG } from "./providers/minimax.catalog.generated.ts";
 import { MINIMAX_CN_MODEL_CATALOG } from "./providers/minimax-cn.catalog.generated.ts";
@@ -103,6 +105,7 @@ export const MODELS: {
 	readonly "groq": typeof GROQ_MODELS;
 	readonly "huggingface": typeof HUGGINGFACE_MODELS;
 	readonly "kimi-coding": typeof KIMI_CODING_MODELS;
+	readonly "melious": typeof MELIOUS_MODELS;
 	readonly "meta": typeof META_MODELS;
 	readonly "minimax": typeof MINIMAX_MODELS;
 	readonly "minimax-cn": typeof MINIMAX_CN_MODELS;
@@ -177,6 +180,9 @@ export const MODELS: {
 	},
 	get "kimi-coding"() {
 		return KIMI_CODING_MODEL_CATALOG.chat();
+	},
+	get "melious"() {
+		return MELIOUS_MODEL_CATALOG.chat();
 	},
 	get "meta"() {
 		return META_MODEL_CATALOG.chat();
@@ -275,6 +281,7 @@ export const IMAGE_MODELS: {
 	readonly "groq": typeof GROQ_IMAGE_MODELS;
 	readonly "huggingface": typeof HUGGINGFACE_IMAGE_MODELS;
 	readonly "kimi-coding": typeof KIMI_CODING_IMAGE_MODELS;
+	readonly "melious": typeof MELIOUS_IMAGE_MODELS;
 	readonly "meta": typeof META_IMAGE_MODELS;
 	readonly "minimax": typeof MINIMAX_IMAGE_MODELS;
 	readonly "minimax-cn": typeof MINIMAX_CN_IMAGE_MODELS;
@@ -349,6 +356,9 @@ export const IMAGE_MODELS: {
 	},
 	get "kimi-coding"() {
 		return KIMI_CODING_MODEL_CATALOG.image();
+	},
+	get "melious"() {
+		return MELIOUS_MODEL_CATALOG.image();
 	},
 	get "meta"() {
 		return META_MODEL_CATALOG.image();
@@ -447,6 +457,7 @@ export const CLASSIFIER_MODELS: {
 	readonly "groq": typeof GROQ_CLASSIFIER_MODELS;
 	readonly "huggingface": typeof HUGGINGFACE_CLASSIFIER_MODELS;
 	readonly "kimi-coding": typeof KIMI_CODING_CLASSIFIER_MODELS;
+	readonly "melious": typeof MELIOUS_CLASSIFIER_MODELS;
 	readonly "meta": typeof META_CLASSIFIER_MODELS;
 	readonly "minimax": typeof MINIMAX_CLASSIFIER_MODELS;
 	readonly "minimax-cn": typeof MINIMAX_CN_CLASSIFIER_MODELS;
@@ -521,6 +532,9 @@ export const CLASSIFIER_MODELS: {
 	},
 	get "kimi-coding"() {
 		return KIMI_CODING_MODEL_CATALOG.classifier();
+	},
+	get "melious"() {
+		return MELIOUS_MODEL_CATALOG.classifier();
 	},
 	get "meta"() {
 		return META_MODEL_CATALOG.classifier();
@@ -620,6 +634,7 @@ export const MODEL_CATALOGS = [
 	GROQ_MODEL_CATALOG,
 	HUGGINGFACE_MODEL_CATALOG,
 	KIMI_CODING_MODEL_CATALOG,
+	MELIOUS_MODEL_CATALOG,
 	META_MODEL_CATALOG,
 	MINIMAX_MODEL_CATALOG,
 	MINIMAX_CN_MODEL_CATALOG,

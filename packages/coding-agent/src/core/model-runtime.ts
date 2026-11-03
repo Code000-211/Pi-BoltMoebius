@@ -58,6 +58,7 @@ import {
 	type StreamOptions,
 } from "@earendil-works/pi-ai";
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
+import { personalizeMeliousCatalog } from "@earendil-works/pi-ai/providers/melious";
 import { getModelListing, type ModelListing } from "@earendil-works/pi-ai/providers/model-listing";
 import { personalizeOpenRouterCatalog } from "@earendil-works/pi-ai/providers/openrouter";
 import {
@@ -276,6 +277,14 @@ export class ModelRuntime implements Models {
 				return withPersonalizedCatalog(
 					provider,
 					personalizeOpenRouterCatalog,
+					options.catalogBaseUrl,
+					builtinModelDataGeneratedAt,
+				);
+			}
+			if (provider.id === "melious") {
+				return withPersonalizedCatalog(
+					provider,
+					personalizeMeliousCatalog,
 					options.catalogBaseUrl,
 					builtinModelDataGeneratedAt,
 				);

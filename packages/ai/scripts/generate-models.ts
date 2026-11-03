@@ -3388,6 +3388,21 @@ async function generateModels() {
 		}));
 	allModels.push(...azureDeepSeekModels);
 
+	if (!allModels.some((model) => model.provider === "melious")) {
+		const meliousDataPath = join(packageRoot, "src/providers/data/melious.json");
+		if (existsSync(meliousDataPath)) {
+			const meliousGroups = JSON.parse(readFileSync(meliousDataPath, "utf8")) as Record<
+				string,
+				Record<string, Model<Api>>
+			>;
+			for (const group of Object.values(meliousGroups)) {
+				for (const model of Object.values(group)) {
+					allModels.push(model);
+				}
+			}
+		}
+	}
+
 	for (const model of allModels) {
 		applyOpenAICompletionsCompatMetadata(model);
 		applyAnthropicMessagesCompatMetadata(model);
