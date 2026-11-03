@@ -252,14 +252,28 @@ class StrippedClangdFallback {
 	}
 }
 
-const EMPTY_FLAGS: string[] = [];
+/** The folders `-I`, `-iquote` and `-isystem` name in compiler flags, absolute (relative ones from the working directory). */
+function includeDirs(flags: string[], baseDir: string): string[] {
+	const workingDir = flags.find((a) => a.startsWith("-working-directory="))?.slice("-working-directory=".length);
+	const base = workingDir ? resolve(baseDir, workingDir) : baseDir;
+	const dirs: string[] = [];
+	for (let i = 0; i < flags.length; i++) {
+		for (const flag of ["-I", "-iquote", "-isystem"]) {
+			if (flags[i] === flag && i + 1 < flags.length) dirs.push(resolve(base, flags[++i]));
+			else if (flags[i].startsWith(flag) && flags[i].length > flag.length)
+				dirs.push(resolve(base, flags[i].slice(flag.length)));
+			else continue;
+			break;
+		}
+	}
+	return dirs;
+}
 
 export class CppHipDiagnosticsEngine {
 	private nativeAddon: NativeLibclangAddon | null | undefined = undefined;
 	private readonly compileCommands = new CompileCommandsResolver();
 	private readonly clangdFallback = new StrippedClangdFallback();
 	private readonly inflightWarmups = new Map<string, Promise<DiagnosticsResult>>();
-	private readonly warmedUpTuKeys = new Set<string>();
 	/** Target file -> translation unit its baseline diagnostics were collected from. */
 	private readonly baselineTuByFile = new Map<string, string>();
 	private readonly stateTracker: FileStateTracker;
@@ -313,7 +327,7 @@ export class CppHipDiagnosticsEngine {
 		// re-collect the baseline from the pre-edit text in the TU the edit will use.
 		const resolvedTarget = resolve(workspaceCwd, absolutePath);
 		const targetKey = normalizeFileCompare(resolvedTarget);
-		const tuFilePath = this.resolveTranslationUnit(resolvedTarget);
+		const tuFilePath = this.resolveTranslationUnit(resolvedTarget, workspaceCwd);
 		const tuKey = normalizeFileCompare(tuFilePath);
 		const previous = this.stateTracker.getTrackedState(resolvedTarget);
 		if (this.baselineTuByFile.get(targetKey) !== tuKey && previous?.contentComplete) {
@@ -328,14 +342,28 @@ export class CppHipDiagnosticsEngine {
 	}
 
 	/**
-	 * Headers are parsed inside the host source that includes them when that source is known (and was
-	 * read completely), so they get the host's flags and preceding declarations.
+	 * Headers are parsed inside a source that includes them when one was read completely, so they get its flags and
+	 * preceding declarations: one that includes it relative to its own folder, else through one of its -I folders.
+	 * Otherwise the header is parsed on its own, with the flags of a source near it.
 	 */
-	private resolveTranslationUnit(resolvedTarget: string): string {
+	private resolveTranslationUnit(resolvedTarget: string, workspaceCwd: string): string {
 		if (!isCppOrHipHeader(resolvedTarget)) return resolvedTarget;
-		const hostSource = this.stateTracker.findHostSourceForHeader(resolvedTarget);
-		if (!hostSource) return resolvedTarget;
-		return this.stateTracker.getTrackedState(hostSource)?.contentComplete ? hostSource : resolvedTarget;
+		const complete = (source: string | undefined) =>
+			source && this.stateTracker.getTrackedState(source)?.contentComplete ? source : undefined;
+		const direct = complete(this.stateTracker.findHostSourceForHeader(resolvedTarget));
+		if (direct) return direct;
+		const targetKey = normalizeFileCompare(resolvedTarget);
+		for (const { source, include } of this.stateTracker.findSourcesIncludingByPath(resolvedTarget)) {
+			const content = complete(source) && this.stateTracker.getTrackedState(source)?.content;
+			if (!content) continue;
+			const flags = this.compileCommands.getFlagsForFile(source, workspaceCwd, content);
+			if (
+				includeDirs(flags, dirname(source)).some((dir) => normalizeFileCompare(join(dir, include)) === targetKey)
+			) {
+				return source;
+			}
+		}
+		return resolvedTarget;
 	}
 
 	private async checkFileInternal(
@@ -349,7 +377,7 @@ export class CppHipDiagnosticsEngine {
 
 		// If the file is a header (.h/.hpp/.cuh) included by a known host .hip/.cpp TU, parse the host
 		// TU with the header's text injected as a CXUnsavedFile overlay.
-		const tuFilePath = this.resolveTranslationUnit(resolvedTarget);
+		const tuFilePath = this.resolveTranslationUnit(resolvedTarget, workspaceCwd);
 		const tuKey = normalizeFileCompare(tuFilePath);
 		const unsavedFiles: Array<{ filename: string; content: string }> = [{ filename: resolvedTarget, content }];
 
@@ -365,14 +393,11 @@ export class CppHipDiagnosticsEngine {
 		const addon = this.getAddon();
 		if (addon) {
 			try {
-				// When TU is already warm in libclang's hash table, clang_reparseTranslationUnit ignores argv,
-				// so skip resolving & marshaling compiler flags across the N-API boundary!
+				// Always the flags (resolved once and cached): the bridge reparses a TU kept with the same flags, and parses
+				// it again when they changed (compile_commands.json) or a reparse failed.
 				const tuContent = tuKey === targetKey ? content : this.stateTracker.getTrackedState(tuFilePath)?.content;
-				const flags = this.warmedUpTuKeys.has(tuKey)
-					? EMPTY_FLAGS
-					: this.compileCommands.getFlagsForFile(tuFilePath, workspaceCwd, tuContent);
+				const flags = this.compileCommands.getFlagsForFile(tuFilePath, workspaceCwd, tuContent);
 				const jsonStr = await addon.checkFileAsync(tuFilePath, flags, unsavedFiles);
-				this.warmedUpTuKeys.add(tuKey);
 				const rawDiags = JSON.parse(jsonStr) as RawClangDiagnostic[];
 				return { diagnostics: this.filterRelevantDiagnostics(rawDiags, targetKey), complete: true };
 			} catch {

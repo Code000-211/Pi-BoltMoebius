@@ -92,9 +92,10 @@ const LOCAL_INCLUDE_REGEX = /^\s*#\s*include\s*"([^"]+)"/gm;
 export class FileStateTracker {
 	private readonly files = new Map<string, TrackedFileState>();
 	private readonly headerToHostSource = new Map<string, string>();
+	/** `#include "..."` text (with `/`) -> the sources that include it that way, for headers found through -I folders. */
+	private readonly includeTextToSources = new Map<string, Set<string>>();
 	private readonly dirInstructionCache = new Map<string, { path: string; content: string } | null>();
 	private readonly sentNestedInstructions = new Set<string>();
-	private lastActiveCppHipSource: string | undefined;
 
 	private normalizeKey(filePath: string): string {
 		const norm = normalize(resolve(filePath));
@@ -204,7 +205,6 @@ export class FileStateTracker {
 		this.files.set(key, state);
 
 		if (contentComplete && isCppOrHipSource(absolutePath)) {
-			this.lastActiveCppHipSource = state.absolutePath;
 			this.indexLocalIncludes(state.absolutePath, content);
 		}
 		return state;
@@ -238,7 +238,6 @@ export class FileStateTracker {
 		}
 
 		if (isCppOrHipSource(normalizedPath)) {
-			this.lastActiveCppHipSource = normalizedPath;
 			this.indexLocalIncludes(normalizedPath, newContent);
 		}
 	}
@@ -296,12 +295,27 @@ export class FileStateTracker {
 	}
 
 	/**
-	 * If a header (.h/.hpp/.cuh) is edited, find the best host source (.hip/.cpp) that includes it
-	 * (or the most recently active source file in the session) so libclang can reparse it with full TU context.
+	 * The source read in this session that includes a header (.h/.hpp/.cuh) by a path relative to its own folder, so
+	 * libclang can reparse the header with the full TU context. A source that does not include the header would give it
+	 * no diagnostics at all, so there is no fallback to another source here (see `findSourcesIncludingByPath`).
 	 */
 	findHostSourceForHeader(headerAbsolutePath: string): string | undefined {
-		const key = this.normalizeKey(headerAbsolutePath);
-		return this.headerToHostSource.get(key) ?? this.lastActiveCppHipSource;
+		return this.headerToHostSource.get(this.normalizeKey(headerAbsolutePath));
+	}
+
+	/**
+	 * The sources read in this session with an `#include "..."` whose text is a trailing part of the header's path
+	 * (`kernels/gemm.h` for `/src/include/kernels/gemm.h`), longest first: candidates to check against their -I folders.
+	 */
+	findSourcesIncludingByPath(headerAbsolutePath: string): Array<{ source: string; include: string }> {
+		const parts = normalize(resolve(headerAbsolutePath)).split(/[\\/]/);
+		const found: Array<{ source: string; include: string }> = [];
+		for (let k = Math.min(parts.length - 1, 6); k >= 1; k--) {
+			const include = parts.slice(-k).join("/");
+			const key = process.platform === "win32" ? include.toLowerCase() : include;
+			for (const source of this.includeTextToSources.get(key) ?? []) found.push({ source, include });
+		}
+		return found;
 	}
 
 	/**
@@ -328,14 +342,19 @@ export class FileStateTracker {
 			if (!relInclude) continue;
 			const resolvedHeader = resolve(sourceDir, relInclude);
 			this.headerToHostSource.set(this.normalizeKey(resolvedHeader), sourceAbsolutePath);
+			const text = relInclude.replace(/\\/g, "/").replace(/^(\.\/)+/, "");
+			const textKey = process.platform === "win32" ? text.toLowerCase() : text;
+			let sources = this.includeTextToSources.get(textKey);
+			if (!sources) this.includeTextToSources.set(textKey, (sources = new Set()));
+			sources.add(sourceAbsolutePath);
 		}
 	}
 
 	clear(): void {
 		this.files.clear();
 		this.headerToHostSource.clear();
+		this.includeTextToSources.clear();
 		this.dirInstructionCache.clear();
 		this.sentNestedInstructions.clear();
-		this.lastActiveCppHipSource = undefined;
 	}
 }

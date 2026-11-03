@@ -96,7 +96,12 @@ is read.
   (`LIBCLANG_PATH`, ROCm's, or the system's), else clangd (`CLANGD_PATH`, `/opt/rocm/llvm/bin/clangd`, or on `PATH`).
   Flags come from `compile_commands.json` in the project or one of up to 5 parent folders (also in `build/`, `out/`,
   `cmake-build-*`), cleaned of GCC-only flags; HIP gets one `--offload-arch` (`HCC_AMDGPU_TARGET`, `HIP_OFFLOAD_ARCH`, else
-  `gfx1100`). A header is checked inside a source file that includes it.
+  `gfx1100`). A header is checked inside a source read in the session that includes it, relative to its own folder or
+  through one of its `-I` folders; without one, on its own with the flags of a source near it (before, the source read
+  last stood in, and a header it did not include got no diagnostics).
+- libclang keeps the 8 translation units used last (before: every one, for the whole session; one with the ROCm
+  headers' preamble holds tens to hundreds of MB). A unit is parsed again when its flags change (a new
+  `compile_commands.json`), and a failed reparse parses with the unit's own flags (before: with none).
 - **Rust:** rust-analyzer (`RUST_ANALYZER_PATH` or on `PATH`) with cargo check on save. The wait for an edit ends when
   the cargo check of the saved file ends: rust-analyzer 1.99 reports nothing else after an edit, so an edit without
   errors used to wait the whole 400 ms. Measured on a 400-function crate: an edit without errors 401 → 104 ms, with an
