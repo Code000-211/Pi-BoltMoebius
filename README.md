@@ -111,6 +111,11 @@ When `oldText` matches neither exactly nor by the existing fuzzy match, the edit
 leading and trailing whitespace (Codex's `seek_sequence`), and re-indents `newText` to the file's indentation, for example
 when the model sends spaces and the file uses tabs. More than one match is still refused.
 
+When `oldText` matches nowhere, the error shows the closest text in the file with its line numbers (up to 20 lines)
+and the first line that differs, so the model can correct the edit without reading the file again. Candidates are the
+lines equal to one of `oldText`'s lines, else the lines most like its first line (character-pair similarity of at least
+0.5). Measured on 50,000 near-identical lines: 9 ms when one line of `oldText` is in the file, 48 ms when none is.
+
 ## Nested AGENTS.md and CLAUDE.md
 
 When the agent reads a file, the `AGENTS.override.md`, `AGENTS.md` or `CLAUDE.md` of each folder between the project root

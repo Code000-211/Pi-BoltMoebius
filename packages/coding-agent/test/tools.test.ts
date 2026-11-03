@@ -12,7 +12,7 @@ import {
 	createLocalBashOperations,
 } from "../src/core/tools/bash.ts";
 import { createEditToolDefinition } from "../src/core/tools/edit.ts";
-import { computeEditsDiff } from "../src/core/tools/edit-diff.ts";
+import { computeEditsDiff, describeClosestText } from "../src/core/tools/edit-diff.ts";
 import { createFindToolDefinition } from "../src/core/tools/find.ts";
 import { createGrepToolDefinition } from "../src/core/tools/grep.ts";
 import { createLsToolDefinition } from "../src/core/tools/ls.ts";
@@ -316,6 +316,50 @@ describe("Coding Agent Tools", () => {
 					edits: [{ oldText: "nonexistent", newText: "testing" }],
 				}),
 			).rejects.toThrow(/Could not find the exact text/);
+		});
+
+		it("points a failed edit at the closest text, with line numbers", async () => {
+			const testFile = join(testDir, "closest.ts");
+			const lines = Array.from({ length: 50 }, (_, i) => `const value${i} = compute(${i});`);
+			lines[30] = "function render(items: Item[]) {";
+			lines[31] = "\treturn items.map((item) => item.label);";
+			lines[32] = "}";
+			writeFileSync(testFile, `${lines.join("\n")}\n`);
+
+			const error = await editTool
+				.execute("test-call-closest", {
+					path: testFile,
+					edits: [
+						{
+							oldText: "function render(items: Item[]) {\n\treturn items.map((item) => item.name);\n}",
+							newText: "x",
+						},
+					],
+				})
+				.catch((err: Error) => err);
+			expect((error as Error).message).toContain("Could not find the exact text");
+			expect((error as Error).message).toContain(
+				"The closest text in the file is at lines 31-33. It differs from oldText first at line 32.\n" +
+					"31→function render(items: Item[]) {\n32→\treturn items.map((item) => item.label);\n33→}",
+			);
+		});
+
+		it("gives no closest text for an oldText unlike anything in the file", async () => {
+			const testFile = join(testDir, "unlike.txt");
+			writeFileSync(testFile, "alpha beta\ngamma delta\n");
+			const error = await editTool
+				.execute("test-call-unlike", { path: testFile, edits: [{ oldText: "zzzz qqqq", newText: "x" }] })
+				.catch((err: Error) => err);
+			expect((error as Error).message).toMatch(/Could not find the exact text/);
+			expect((error as Error).message).not.toContain("closest text");
+		});
+
+		it("finds the closest text of a typo in a large file quickly", () => {
+			const lines = Array.from({ length: 50_000 }, (_, i) => `    let item_${i} = store.get(${i}).unwrap();`);
+			const start = performance.now();
+			const hint = describeClosestText(lines.join("\n"), "    let item_4242 = store.gte(4242).unwrap();");
+			expect(performance.now() - start).toBeLessThan(500);
+			expect(hint).toContain("at line 4243.");
 		});
 
 		it("should include ENOENT when the edit target does not exist", async () => {

@@ -7,8 +7,10 @@ import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { type ClaudeHarnessManager, defaultClaudeHarnessManager, StaleFileError } from "../harness/index.ts";
 import {
 	applyEditsToNormalizedContent,
+	describeClosestText,
 	detectLineEnding,
 	type Edit,
+	EditNotFoundError,
 	generateDiffString,
 	generateUnifiedPatch,
 	normalizeToLF,
@@ -235,7 +237,15 @@ export function createEditToolDefinition(
 					}
 					throwIfAborted();
 				}
-				const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+				let applied: ReturnType<typeof applyEditsToNormalizedContent>;
+				try {
+					applied = applyEditsToNormalizedContent(normalizedContent, edits, path);
+				} catch (error) {
+					if (!(error instanceof EditNotFoundError)) throw error;
+					const closest = describeClosestText(normalizedContent, edits[error.editIndex].oldText);
+					throw closest ? new Error(`${error.message}\n\n${closest}`) : error;
+				}
+				const { baseContent, newContent } = applied;
 				throwIfAborted();
 
 				const finalContent = bom + restoreLineEndings(newContent, originalEnding);
