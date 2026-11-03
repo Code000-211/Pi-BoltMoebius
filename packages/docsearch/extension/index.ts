@@ -24,7 +24,8 @@ import { Type } from "typebox";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
-// A literal path, so that `pi-bolt compile` embeds the addon in the executable.
+// A literal path, so that `pi-bolt compile` embeds the addon in the executable; install.sh puts in the platform it
+// builds on (docsearch.darwin-arm64.node, docsearch.win32-x64.node, ...).
 const { DocIndex } = require("./docsearch.linux-x64.node");
 
 interface Hit {

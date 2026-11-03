@@ -1,6 +1,7 @@
 //! The in-memory index: BM25 over sections, plus a section–entity graph searched with
 //! personalized PageRank (HippoRAG's retrieval, without an LLM at query time).
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -203,6 +204,32 @@ pub fn scan(cfg: &Config) -> Signature {
         }
     }
     out
+}
+
+/// A path as the index stores it: the system's bytes on Unix, UTF-8 elsewhere (Windows).
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Cow<'_, [u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    Cow::Borrowed(path.as_os_str().as_bytes())
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> Cow<'_, [u8]> {
+    match path.to_string_lossy() {
+        Cow::Borrowed(s) => Cow::Borrowed(s.as_bytes()),
+        Cow::Owned(s) => Cow::Owned(s.into_bytes()),
+    }
+}
+
+#[cfg(unix)]
+fn bytes_path(bytes: &[u8]) -> &Path {
+    use std::os::unix::ffi::OsStrExt;
+    Path::new(std::ffi::OsStr::from_bytes(bytes))
+}
+
+#[cfg(not(unix))]
+fn bytes_path(bytes: &[u8]) -> &Path {
+    Path::new(std::str::from_utf8(bytes).unwrap_or(""))
 }
 
 /// The language of a source file, split at its definitions rather than at headings.
@@ -451,11 +478,10 @@ impl Index {
             })
             .collect();
         let (def_names, def_lists): (Vec<String>, Vec<Vec<u32>>) = definitions.into_iter().unzip();
-        use std::os::unix::ffi::OsStrExt;
         Index {
             hub_limit,
             avg_len,
-            files: Strs::from_iter(signature.iter().map(|(p, _, _)| p.as_os_str().as_bytes())),
+            files: Strs::from_iter(signature.iter().map(|(p, _, _)| path_bytes(p))),
             file_mtime: signature.iter().map(|x| nanos(x.1)).collect::<Vec<_>>().into(),
             file_size: signature.iter().map(|x| x.2).collect::<Vec<_>>().into(),
             sec_file: sec_file.into(),
@@ -585,12 +611,11 @@ impl Index {
     /// What changed since this index was built: the files of `sig` that are new or differ, and per
     /// file of this index whether it changed or is gone.
     pub fn diff(&self, sig: &Signature) -> (Signature, Vec<bool>) {
-        use std::os::unix::ffi::OsStrExt;
         let by_path: FxHashMap<&[u8], usize> = (0..self.files.len()).map(|i| (self.files.bytes(i), i)).collect();
         let mut gone = vec![true; self.files.len()];
         let mut changed = Vec::new();
         for (p, t, size) in sig {
-            match by_path.get(p.as_os_str().as_bytes()) {
+            match by_path.get(path_bytes(p).as_ref()) {
                 Some(&i) if self.file_mtime[i] == nanos(*t) && self.file_size[i] == *size => gone[i] = false,
                 Some(&i) => {
                     gone[i] = true;
@@ -609,10 +634,9 @@ impl Index {
 
     /// Whether the index was built from exactly these files, as `scan` lists them now.
     pub fn matches(&self, sig: &Signature) -> bool {
-        use std::os::unix::ffi::OsStrExt;
         sig.len() == self.files.len()
             && sig.iter().enumerate().all(|(i, (p, t, size))| {
-                self.files.bytes(i) == p.as_os_str().as_bytes() && self.file_mtime[i] == nanos(*t) && self.file_size[i] == *size
+                self.files.bytes(i) == path_bytes(p).as_ref() && self.file_mtime[i] == nanos(*t) && self.file_size[i] == *size
             })
     }
 
@@ -625,8 +649,7 @@ impl Index {
     }
 
     pub fn file_path(&self, i: usize) -> &Path {
-        use std::os::unix::ffi::OsStrExt;
-        Path::new(std::ffi::OsStr::from_bytes(self.files.bytes(i)))
+        bytes_path(self.files.bytes(i))
     }
 
     pub fn section(&self, s: usize) -> SectionRef<'_> {

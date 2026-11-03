@@ -114,10 +114,19 @@ const SAVE_ABOVE_MS: u32 = 100;
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FileId(u64, u64);
 
+#[cfg(unix)]
 fn file_id(path: &Path) -> Option<FileId> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::metadata(path).ok()?;
     Some(FileId(m.dev(), m.ino()))
+}
+
+/// Without inodes (Windows): the file a rename brought keeps the creation time it was written with.
+#[cfg(not(unix))]
+fn file_id(path: &Path) -> Option<FileId> {
+    let m = std::fs::metadata(path).ok()?;
+    let created = m.created().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(FileId(created.as_nanos() as u64, m.len()))
 }
 
 /// Hands memory freed after a build back to the system. glibc keeps it for later allocations
