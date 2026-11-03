@@ -12,6 +12,7 @@ import {
 	globMatch,
 	nativeFind,
 	nativeGrep,
+	notifySearchFileTouched,
 	requiredLiteral,
 	translatePattern,
 	walk,
@@ -370,6 +371,35 @@ const has = (command: string) => spawnSync(command, ["--version"], { stdio: "ign
 
 // The tools' output with ripgrep and fd and in-process, on the same files: the same lines (as sets: ripgrep and fd give
 // them in no fixed order; .git, which they would search, holds nothing that matches).
+describe("the cached tree", () => {
+	test("is walked again only for a file of its own it does not know", async () => {
+		const top = mkdtempSync(join(tmpdir(), "pi-tree-touch-"));
+		const project = join(top, "project");
+		const other = join(top, "other");
+		mkdirSync(join(project, "build"), { recursive: true });
+		mkdirSync(other);
+		writeFileSync(join(project, ".gitignore"), "build/\n");
+		writeFileSync(join(project, "a.ts"), "a");
+		writeFileSync(join(project, "build", "out.ts"), "out");
+		writeFileSync(join(other, "b.ts"), "b");
+		try {
+			clearNativeSearchCache();
+			const find = () => nativeFind({ root: project, pattern: "*.ts", limit: 100 });
+			expect(await find()).toEqual(["a.ts"]);
+			// On disk, but not yet in the tree, which is reused for 2 s without checks.
+			writeFileSync(join(project, "new.ts"), "new");
+			notifySearchFileTouched(join(other, "b.ts"), "b", Date.now());
+			notifySearchFileTouched(join(project, "build", "next.ts"), "next", Date.now());
+			notifySearchFileTouched(join(project, "a.ts"), "a", Date.now());
+			expect(await find()).toEqual(["a.ts"]);
+			notifySearchFileTouched(join(project, "new.ts"), "new", Date.now());
+			expect(await find()).toEqual(["a.ts", "new.ts"]);
+		} finally {
+			rmSync(top, { recursive: true, force: true });
+		}
+	});
+});
+
 describe.skipIf(!has("rg") || !has("fd"))("the same results as ripgrep and fd", () => {
 	const text = (result: { content: Array<{ type: string; text?: string }> }) =>
 		(result.content[0] as { text: string }).text.split("\n").sort();

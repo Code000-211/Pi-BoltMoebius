@@ -524,6 +524,8 @@ export interface WalkOptions {
 	keep?: (rel: string, kind: WalkEntry["kind"]) => boolean;
 	/** Given, the files an ignore file leaves out (not those in a folder left out) are added to it instead of passed over. */
 	ignoredFiles?: WalkEntry[];
+	/** Given, the folders an ignore file leaves out are added to it (absolute paths). */
+	ignoredDirs?: string[];
 	signal?: AbortSignal;
 }
 
@@ -593,7 +595,10 @@ export async function walk(options: WalkOptions): Promise<WalkEntry[]> {
 			const rel = task.rel ? `${task.rel}/${dirent.name}` : dirent.name;
 			const abs = path.join(task.abs, dirent.name);
 			if (taskRules.length > 0 && isIgnored(taskRules, topRel(rel), kind === "dir")) {
-				if (kind === "dir") continue;
+				if (kind === "dir") {
+					options.ignoredDirs?.push(abs);
+					continue;
+				}
 				if (!options.override?.(rel)) {
 					options.ignoredFiles?.push({ rel, abs, kind });
 					continue;
@@ -621,12 +626,16 @@ const byPath = (a: WalkEntry, b: WalkEntry) => (a.rel < b.rel ? -1 : a.rel > b.r
 // --- fff-style persistent in-memory tree & content cache + frecency -----------------------------------------------------
 
 interface CachedTreeEntry {
+	/** The search folder, as `normalizeCacheKey` gives it. */
+	rootKey: string;
 	entries: WalkEntry[];
 	/** The files ignore files leave out, outside folders left out, sorted: a glob of grep takes them (ripgrep's --glob). */
 	ignoredFiles: WalkEntry[];
 	displayPaths: string[];
 	packedPathsBuffer?: Buffer;
 	knownAbsKeys: Set<string>;
+	/** The folders the walk left out, as `normalizeCacheKey` gives them: what is below them is not in the tree. */
+	ignoredDirKeys: Set<string>;
 	dirMtimes: Map<string, number>;
 	timestamp: number;
 }
@@ -675,12 +684,29 @@ export function notifySearchFileTouched(filePath: string, content?: string | Buf
 		}
 	}
 
-	// Only invalidate tree cache if this file is NOT already known in the cached tree
+	// A tree is walked again only when the file belongs in it and it does not know the file (one the agent created): not for
+	// a file outside its folder, or below a folder it leaves out (a build directory).
 	for (const [cacheKey, cachedTree] of treeCache.entries()) {
-		if (!cachedTree.knownAbsKeys.has(key)) {
-			treeCache.delete(cacheKey);
-		}
+		if (cachedTree.knownAbsKeys.has(key) || !isBelow(key, cachedTree.rootKey)) continue;
+		if (isBelowIgnoredDir(key, cachedTree)) continue;
+		treeCache.delete(cacheKey);
 	}
+}
+
+function isBelow(key: string, rootKey: string): boolean {
+	return (
+		key.length > rootKey.length &&
+		key.startsWith(rootKey) &&
+		(key[rootKey.length] === path.sep || rootKey.endsWith(path.sep))
+	);
+}
+
+function isBelowIgnoredDir(key: string, tree: CachedTreeEntry): boolean {
+	if (tree.ignoredDirKeys.size === 0) return false;
+	for (let dir = path.dirname(key); dir.length > tree.rootKey.length; dir = path.dirname(dir)) {
+		if (tree.ignoredDirKeys.has(dir)) return true;
+	}
+	return false;
 }
 
 export function getFileFrecencyScore(filePath: string): number {
@@ -722,7 +748,8 @@ async function getCachedTree(root: string, requireGit: boolean, signal?: AbortSi
 	}
 
 	const ignoredFiles: WalkEntry[] = [];
-	const allEntries = await walk({ root: resolvedRoot, requireGit, signal, ignoredFiles });
+	const ignoredDirs: string[] = [];
+	const allEntries = await walk({ root: resolvedRoot, requireGit, signal, ignoredFiles, ignoredDirs });
 	allEntries.sort(byPath);
 	ignoredFiles.sort(byPath);
 
@@ -750,10 +777,12 @@ async function getCachedTree(root: string, requireGit: boolean, signal?: AbortSi
 	for (const entry of ignoredFiles) knownAbsKeys.add(normalizeCacheKey(entry.abs));
 
 	const treeEntry: CachedTreeEntry = {
+		rootKey: normalizeCacheKey(resolvedRoot),
 		entries: allEntries,
 		ignoredFiles,
 		displayPaths,
 		knownAbsKeys,
+		ignoredDirKeys: new Set(ignoredDirs.map(normalizeCacheKey)),
 		dirMtimes,
 		timestamp: performance.now(),
 	};
