@@ -7,8 +7,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	ClaudeHarnessManager,
 	CompileCommandsResolver,
+	FileStateTracker,
 	fuzzyFilterPaths,
 	type HarnessDiagnostic,
+	RustDiagnosticsEngine,
 	sanitizeCompileFlags,
 } from "../src/core/harness/index.ts";
 import { buildEnvDiffScript, createBashTool } from "../src/core/tools/bash.ts";
@@ -980,6 +982,59 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 			testDir,
 		);
 		expect(cppFlags.slice(0, 2)).toEqual(["-x", "c++-header"]);
+	});
+
+	// As rust-analyzer 1.99 does: no quiescence after an edit, and no diagnostics but those of the cargo check.
+	it("ends a Rust edit's wait when its cargo check ends, and checks in rust-analyzer's own target folder", async () => {
+		const mockRaScript = join(testDir, "mock-rust-analyzer-check-end.mjs");
+		const initFile = join(testDir, "ra-init.json");
+		writeFileSync(
+			mockRaScript,
+			`
+			import { writeFileSync } from "node:fs";
+			let buf = Buffer.alloc(0);
+			function send(msg) {
+				const body = Buffer.from(JSON.stringify(msg), "utf-8");
+				process.stdout.write(Buffer.concat([Buffer.from("Content-Length: " + body.length + "\\r\\n\\r\\n", "ascii"), body]));
+			}
+			const progress = (kind) => send({ jsonrpc: "2.0", method: "$/progress", params: { token: "rust-analyzer/flycheck/0", value: { kind } } });
+			process.stdin.on("data", (chunk) => {
+				buf = Buffer.concat([buf, chunk]);
+				while (true) {
+					const end = buf.indexOf("\\r\\n\\r\\n");
+					if (end === -1) break;
+					const len = Number.parseInt(/Content-Length:\\s*(\\d+)/i.exec(buf.subarray(0, end).toString("ascii"))[1], 10);
+					if (buf.length < end + 4 + len) break;
+					const msg = JSON.parse(buf.subarray(end + 4, end + 4 + len).toString("utf-8"));
+					buf = buf.subarray(end + 4 + len);
+					if (msg.method === "initialize") {
+						writeFileSync(${JSON.stringify(initFile)}, JSON.stringify(msg.params.initializationOptions));
+						send({ jsonrpc: "2.0", id: msg.id, result: { capabilities: {} } });
+					} else if (msg.method === "textDocument/didSave") {
+						setTimeout(() => progress("begin"), 20);
+						setTimeout(() => progress("end"), 60);
+					}
+				}
+			});
+			`,
+			"utf-8",
+		);
+		process.env.RUST_ANALYZER_PATH = mockRaScript;
+		const tracker = new FileStateTracker();
+		const engine = new RustDiagnosticsEngine(tracker);
+		try {
+			const rsFile = join(testDir, "lib.rs");
+			writeFileSync(rsFile, "pub fn a() {}\n", "utf-8");
+			tracker.recordFileRead(rsFile, "pub fn a() {}\n", Date.now());
+			await engine.warmupFile(rsFile, "pub fn a() {}\n", testDir);
+			const start = performance.now();
+			const result = await engine.checkEditedFile(rsFile, "pub fn b() {}\n", testDir);
+			expect(performance.now() - start).toBeLessThan(300);
+			expect(result.diagnostics).toEqual([]);
+			expect(JSON.parse(readFileSync(initFile, "utf-8")).cargo.targetDir).toBe(true);
+		} finally {
+			engine.dispose();
+		}
 	});
 
 	it("reports cargo flycheck diagnostics that settle after a fast in-budget result, despite stderr noise", async () => {

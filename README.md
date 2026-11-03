@@ -88,7 +88,7 @@ is read.
 |---|---:|
 | Diagnostics listed per edit | 15, then "and N more" |
 | C/C++/HIP, clangd: wait for an edit / for the baseline on read | 350 ms / 1.5 s |
-| Rust, rust-analyzer: wait for an edit / for the baseline on read | 400 ms / 0.8 s |
+| Rust, rust-analyzer: wait for an edit / for the baseline on read, at most | 400 ms / 0.8 s |
 | Rust: cargo check results that arrive later | settled 0.3 s after the check ends, or after 2 s without news; then added to the next tool result (up to 10 per file) |
 | Error limit passed to the compiler | 20 |
 
@@ -97,7 +97,11 @@ is read.
   Flags come from `compile_commands.json` in the project or one of up to 5 parent folders (also in `build/`, `out/`,
   `cmake-build-*`), cleaned of GCC-only flags; HIP gets one `--offload-arch` (`HCC_AMDGPU_TARGET`, `HIP_OFFLOAD_ARCH`, else
   `gfx1100`). A header is checked inside a source file that includes it.
-- **Rust:** rust-analyzer (`RUST_ANALYZER_PATH` or on `PATH`) with cargo check on save.
+- **Rust:** rust-analyzer (`RUST_ANALYZER_PATH` or on `PATH`) with cargo check on save. The wait for an edit ends when
+  the cargo check of the saved file ends: rust-analyzer 1.99 reports nothing else after an edit, so an edit without
+  errors used to wait the whole 400 ms. Measured on a 400-function crate: an edit without errors 401 → 104 ms, with an
+  error 104 ms as before. cargo check runs in its own folder (`target/rust-analyzer`), so it does not hold the lock of
+  the agent's `cargo build` and `cargo test` (`PI_RUST_ANALYZER_TARGET_DIR=shared` to share `target/`, or a folder).
 - Without these tools the edit goes through as before, with no diagnostics. A diagnostic that was fixed and comes back is
   reported again; a second copy of an existing one counts as new.
 
