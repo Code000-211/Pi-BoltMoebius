@@ -860,6 +860,39 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		);
 	});
 
+	it("writes lines the edit adds in the file's unit of indentation, not the model's", async () => {
+		const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
+		const readTool = createReadTool(testDir, { harness });
+		const editTool = createEditTool(testDir, { harness, enforceReadBeforeEdit: true, enableDiagnostics: false });
+		const edit = async (name: string, file: string, oldText: string, newText: string) => {
+			const filePath = join(testDir, name);
+			writeFileSync(filePath, file, "utf-8");
+			await readTool.execute(`r-${name}`, { path: name });
+			await editTool.execute(`e-${name}`, { path: name, edits: [{ oldText, newText }] });
+			return readFileSync(filePath, "utf-8");
+		};
+
+		// Tabs in the file, four spaces from the model; the new lines are deeper than any oldText line.
+		expect(
+			await edit(
+				"tabs.ts",
+				"function f() {\n\tif (a) {\n\t\tg();\n\t}\n}\n",
+				"    if (a) {\n        g();\n    }",
+				"    if (a) {\n        g();\n        if (b) {\n            h();\n        }\n    }",
+			),
+		).toBe("function f() {\n\tif (a) {\n\t\tg();\n\t\tif (b) {\n\t\t\th();\n\t\t}\n\t}\n}\n");
+
+		// Two spaces in the file, four from the model, and the same depth of the first line.
+		expect(
+			await edit(
+				"two.py",
+				"def f():\n  if a:\n    g()\n",
+				"def f():\n    if a:\n        g()",
+				"def f():\n    if a:\n        g()\n        for x in y:\n            h(x)",
+			),
+		).toBe("def f():\n  if a:\n    g()\n    for x in y:\n      h(x)\n");
+	});
+
 	it("allows consecutive edits of a CRLF file with a BOM and keeps its bytes intact", async () => {
 		const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
 		const readTool = createReadTool(testDir, { harness });

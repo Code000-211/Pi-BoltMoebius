@@ -127,7 +127,9 @@ is read.
 
 When `oldText` matches neither exactly nor by the existing fuzzy match, the edit tool compares line by line ignoring
 leading and trailing whitespace (Codex's `seek_sequence`), and re-indents `newText` to the file's indentation, for example
-when the model sends spaces and the file uses tabs. More than one match is still refused.
+when the model sends spaces and the file uses tabs. More than one match is still refused. Lines `newText` adds deeper
+than any line of `oldText` are counted in the model's unit of indentation (4 spaces, say) and written in the file's (a
+tab, 2 spaces): before, only the first line's indentation was swapped, so such a line came out as a tab and 4 spaces.
 
 When `oldText` matches nowhere, the error shows the closest text in the file with its line numbers (up to 20 lines)
 and the first line that differs, so the model can correct the edit without reading the file again. Candidates are the

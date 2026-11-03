@@ -300,6 +300,28 @@ function getLeadingWhitespace(line: string): string {
  * Adjust the leading indentation of `newText` lines when `oldText` matched via
  * Codex-style trimmed line matching (e.g., model sent 2-space indent instead of tab indent).
  */
+function gcd(a: number, b: number): number {
+	return b === 0 ? a : gcd(b, a % b);
+}
+
+/** The step of indentation in `indents` beyond `base`: a tab, or the largest run of spaces they all are multiples of. */
+function indentUnit(indents: string[], base: string): string | undefined {
+	let spaces = 0;
+	for (const indent of indents) {
+		if (indent.length <= base.length || !indent.startsWith(base)) continue;
+		const extra = indent.slice(base.length);
+		if (extra.startsWith("\t")) return "\t";
+		const run = extra.length - extra.trimStart().length;
+		if (/^ +$/.test(extra)) spaces = gcd(spaces, run);
+	}
+	return spaces > 0 ? " ".repeat(spaces) : undefined;
+}
+
+/**
+ * newText's lines in the file's indentation, when oldText matched lines indented differently (the model sent spaces, the
+ * file uses tabs, or another depth). An indentation that oldText's lines have is mapped to that of the file's line it
+ * matched; a deeper one (a line newText adds) is counted in oldText's unit of indentation and written in the file's.
+ */
 function reindentNewTextForMatchedLines(matchedOriginalSlice: string, oldText: string, newText: string): string {
 	const hasTrailingNewline = newText.endsWith("\n");
 	const origLines = matchedOriginalSlice.endsWith("\n")
@@ -308,30 +330,51 @@ function reindentNewTextForMatchedLines(matchedOriginalSlice: string, oldText: s
 	const oldLines = oldText.endsWith("\n") ? oldText.slice(0, -1).split("\n") : oldText.split("\n");
 	const newLines = hasTrailingNewline ? newText.slice(0, -1).split("\n") : newText.split("\n");
 
+	const mapped = new Map<string, string>();
 	let origAnchorIndent: string | undefined;
 	let oldAnchorIndent: string | undefined;
+	let differs = false;
 	const pairCount = Math.min(origLines.length, oldLines.length);
 	for (let i = 0; i < pairCount; i++) {
-		if (origLines[i].trim().length > 0 && oldLines[i].trim().length > 0) {
-			origAnchorIndent = getLeadingWhitespace(origLines[i]);
-			oldAnchorIndent = getLeadingWhitespace(oldLines[i]);
-			break;
+		if (origLines[i].trim().length === 0 || oldLines[i].trim().length === 0) continue;
+		const orig = getLeadingWhitespace(origLines[i]);
+		const old = getLeadingWhitespace(oldLines[i]);
+		if (origAnchorIndent === undefined) {
+			origAnchorIndent = orig;
+			oldAnchorIndent = old;
 		}
+		if (!mapped.has(old)) mapped.set(old, orig);
+		if (orig !== old) differs = true;
 	}
-
-	if (origAnchorIndent === undefined || oldAnchorIndent === undefined || origAnchorIndent === oldAnchorIndent) {
+	if (origAnchorIndent === undefined || oldAnchorIndent === undefined || !differs) {
 		return newText;
 	}
 
+	const oldIndents = [...oldLines, ...newLines].filter((l) => l.trim().length > 0).map(getLeadingWhitespace);
+	const oldUnit = indentUnit(oldIndents, oldAnchorIndent);
+	const fileUnit =
+		indentUnit(origLines.filter((l) => l.trim().length > 0).map(getLeadingWhitespace), origAnchorIndent) ??
+		(origAnchorIndent.includes("\t") ? "\t" : oldUnit);
+
+	const reindent = (indent: string): string | undefined => {
+		const known = mapped.get(indent);
+		if (known !== undefined) return known;
+		if (!indent.startsWith(oldAnchorIndent)) return undefined;
+		let extra = indent.slice(oldAnchorIndent.length);
+		if (!oldUnit || !fileUnit || oldUnit === fileUnit) return origAnchorIndent + extra;
+		let levels = 0;
+		while (extra.startsWith(oldUnit)) {
+			extra = extra.slice(oldUnit.length);
+			levels++;
+		}
+		return origAnchorIndent + fileUnit.repeat(levels) + extra;
+	};
+
 	const adjustedLines = newLines.map((line) => {
 		if (line.trim().length === 0) return line;
-		if (oldAnchorIndent.length === 0) {
-			return origAnchorIndent + line;
-		}
-		if (line.startsWith(oldAnchorIndent)) {
-			return origAnchorIndent + line.slice(oldAnchorIndent.length);
-		}
-		return line;
+		const indent = getLeadingWhitespace(line);
+		const replaced = reindent(indent);
+		return replaced === undefined ? line : replaced + line.slice(indent.length);
 	});
 
 	const joined = adjustedLines.join("\n");
