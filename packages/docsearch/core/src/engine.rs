@@ -23,6 +23,8 @@ pub struct Engine {
     mapped: Mutex<Option<FileId>>,
     /// When the overlay last changed, to rebuild once the files are quiet.
     overlay_since: Mutex<Option<Instant>>,
+    /// When the base index got an overlay (the first change since it was built).
+    overlay_started: Mutex<Option<Instant>>,
     ready: Condvar,
     busy: AtomicBool,
     last_check: Mutex<Instant>,
@@ -34,8 +36,12 @@ pub struct Engine {
 const CHECK_EVERY: Duration = Duration::from_secs(1);
 /// Without a saved index every change is a full rebuild: then never more often than five builds' time.
 const BUILDS_BETWEEN_CHECKS: u32 = 5;
-/// The overlay is folded into a rebuilt, saved index once no file changed for this long...
+/// The overlay is folded into a rebuilt, saved index once no file changed for this long, when it holds
+/// FOLD_MIN_FILES files or has been there for FOLD_AFTER: a rebuild costs every process a new mapping (and
+/// radiance about a second of CPU), a small overlay next to nothing, and an agent changes a file a minute.
 const QUIET_BEFORE_REBUILD: Duration = Duration::from_secs(30);
+const FOLD_MIN_FILES: usize = 20;
+const FOLD_AFTER: Duration = Duration::from_secs(600);
 /// ...or at once when it grows past this many files (a branch switch, a big refactor).
 const OVERLAY_MAX_FILES: usize = 200;
 
@@ -114,19 +120,39 @@ const SAVE_ABOVE_MS: u32 = 100;
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct FileId(u64, u64);
 
-#[cfg(unix)]
 fn file_id(path: &Path) -> Option<FileId> {
+    file_id_of(&std::fs::metadata(path).ok()?)
+}
+
+#[cfg(unix)]
+fn file_id_of(m: &std::fs::Metadata) -> Option<FileId> {
     use std::os::unix::fs::MetadataExt;
-    let m = std::fs::metadata(path).ok()?;
     Some(FileId(m.dev(), m.ino()))
 }
 
 /// Without inodes (Windows): the file a rename brought keeps the creation time it was written with.
 #[cfg(not(unix))]
-fn file_id(path: &Path) -> Option<FileId> {
-    let m = std::fs::metadata(path).ok()?;
+fn file_id_of(m: &std::fs::Metadata) -> Option<FileId> {
     let created = m.created().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
     Some(FileId(created.as_nanos() as u64, m.len()))
+}
+
+/// Beside an index file, the version of it whose contents were checked: a process that maps that version again need
+/// not read every page to check it. (A damaged file is not rewritten in place, so its version is a new one.)
+fn checked_stamp_path(file: &Path) -> PathBuf {
+    file.with_extension("ok")
+}
+
+fn checked_stamp(id: FileId, len: u64) -> String {
+    format!("{} {} {len}\n", id.0, id.1)
+}
+
+fn write_checked_stamp(file: &Path, stamp: &str) {
+    let path = checked_stamp_path(file);
+    let tmp = path.with_extension(format!("ok.{}", std::process::id()));
+    if std::fs::write(&tmp, stamp).is_err() || std::fs::rename(&tmp, &path).is_err() {
+        std::fs::remove_file(&tmp).ok();
+    }
 }
 
 /// Hands memory freed after a build back to the system. glibc keeps it for later allocations
@@ -154,7 +180,7 @@ fn prune_old_indexes(current: &Path) {
     for e in entries.flatten() {
         let path = e.path();
         let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age > KEEP_UNUSED);
-        if old && path != current && path.extension().is_some_and(|x| x == "idx" || x == "lock") {
+        if old && path != current && path.extension().is_some_and(|x| x == "idx" || x == "lock" || x == "ok") {
             std::fs::remove_file(&path).ok();
         }
     }
@@ -195,6 +221,7 @@ impl Engine {
             current: Mutex::new(None),
             mapped: Mutex::new(None),
             overlay_since: Mutex::new(None),
+            overlay_started: Mutex::new(None),
             ready: Condvar::new(),
             busy: AtomicBool::new(false),
             last_check: Mutex::new(Instant::now()),
@@ -258,6 +285,9 @@ impl Engine {
     fn set(&self, mut view: View, from: Option<FileId>) {
         view.generation = self.generations.fetch_add(1, Ordering::Relaxed) + 1;
         *self.overlay_since.lock().unwrap() = view.overlay.as_ref().map(|_| Instant::now());
+        let mut started = self.overlay_started.lock().unwrap();
+        *started = view.overlay.as_ref().map(|_| started.unwrap_or_else(Instant::now));
+        drop(started);
         *self.current.lock().unwrap() = Some(Arc::new(view));
         if from.is_some() {
             *self.mapped.lock().unwrap() = from;
@@ -275,14 +305,24 @@ impl Engine {
         if id.is_none() || id == *self.mapped.lock().unwrap() {
             return false;
         }
-        match Index::load(file) {
+        // The version opened, which a rename may have replaced since `file_id` looked.
+        let Ok(handle) = std::fs::File::open(file) else { return false };
+        let Some((opened, len)) = handle.metadata().ok().and_then(|m| Some((file_id_of(&m)?, m.len()))) else {
+            return false;
+        };
+        let stamp = checked_stamp(opened, len);
+        let checked = std::fs::read_to_string(checked_stamp_path(file)).is_ok_and(|s| s == stamp);
+        match Index::load_file(&handle, !checked) {
             Ok(ix) => {
+                if !checked {
+                    write_checked_stamp(file, &stamp);
+                }
                 // Marks the file as in use, for `prune_old_indexes`; the inode stays, so the other
                 // processes do not take it for a new index.
                 if let Ok(f) = std::fs::File::options().write(true).open(file) {
                     f.set_modified(std::time::SystemTime::now()).ok();
                 }
-                self.set(View::plain(Arc::new(ix)), id);
+                self.set(View::plain(Arc::new(ix)), Some(opened));
                 true
             }
             Err(_) => false,
@@ -316,7 +356,9 @@ impl Engine {
         if view.matches(&sig) {
             // Quiet since the overlay was built: fold it into a saved index.
             let quiet = self.overlay_since.lock().unwrap().is_some_and(|t| t.elapsed() >= QUIET_BEFORE_REBUILD);
-            if view.overlay.is_some() && quiet {
+            let due = view.changed.len() >= FOLD_MIN_FILES
+                || self.overlay_started.lock().unwrap().is_some_and(|t| t.elapsed() >= FOLD_AFTER);
+            if view.overlay.is_some() && quiet && due {
                 self.rebuild(&file);
             }
             return;
@@ -398,6 +440,51 @@ mod tests {
             next = engine.index(Duration::ZERO).unwrap().generation;
         }
         assert!(next > first);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_checked_version_is_mapped_without_checking_it_again() {
+        let dir = std::env::temp_dir().join(format!("docsearch-test-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs/a.md"), "# Stamps\n\nThe checked version of an index file.\n").unwrap();
+        let cfg = Config {
+            roots: vec![dir.join("docs")],
+            extensions: vec!["md".into()],
+            max_file_bytes: 1 << 20,
+            max_files: 100,
+            extra_entities: None,
+        };
+        let file = dir.join("x.idx");
+        Index::build(&cfg).save(&file).unwrap();
+        let engine = Engine {
+            file: Some(file.clone()),
+            cfg,
+            current: Mutex::new(None),
+            mapped: Mutex::new(None),
+            overlay_since: Mutex::new(None),
+            overlay_started: Mutex::new(None),
+            ready: Condvar::new(),
+            busy: AtomicBool::new(false),
+            last_check: Mutex::new(Instant::now()),
+            generations: AtomicU64::new(0),
+        };
+        let stamp_path = checked_stamp_path(&file);
+        // First mapping: checked, then stamped with the version.
+        assert!(engine.take_saved(&file));
+        let stamp = std::fs::read_to_string(&stamp_path).unwrap();
+        let m = std::fs::metadata(&file).unwrap();
+        assert_eq!(stamp, checked_stamp(file_id_of(&m).unwrap(), m.len()));
+        assert_eq!(engine.index(Duration::ZERO).unwrap().search("stamps", &SearchOpts { k: 3, path_prefix: None, max_per_file: 3, graph: true }).hits.len(), 1);
+        // The same version again: mapped on the stamp, which stays as it is.
+        *engine.mapped.lock().unwrap() = None;
+        assert!(engine.take_saved(&file));
+        assert_eq!(std::fs::read_to_string(&stamp_path).unwrap(), stamp);
+        // A stamp of another version: checked again, and stamped anew.
+        std::fs::write(&stamp_path, "0 0 0\n").unwrap();
+        *engine.mapped.lock().unwrap() = None;
+        assert!(engine.take_saved(&file));
+        assert_eq!(std::fs::read_to_string(&stamp_path).unwrap(), stamp);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

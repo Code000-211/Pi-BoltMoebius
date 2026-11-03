@@ -542,11 +542,16 @@ impl Index {
     /// Maps a file `save` wrote. Nothing is read until a search touches it, and every process that
     /// maps the same file shares its pages. A file of another format, or damaged, is refused.
     pub fn load(path: &Path) -> Result<Index, BadFile> {
-        let file = std::fs::File::open(path).map_err(|_| BadFile)?;
+        Index::load_file(&std::fs::File::open(path).map_err(|_| BadFile)?, true)
+    }
+
+    /// Maps an open index file. `validate`: check what every array holds (UTF-8, offsets, ids in bounds), which reads
+    /// every page (12 ms for radiance's 110 MB); false for a version of the file that was checked before.
+    pub fn load_file(file: &std::fs::File, validate: bool) -> Result<Index, BadFile> {
         // SAFETY: the file is only ever replaced by renaming a new one over it, never written in
         // place, so the mapped pages do not change under us.
-        let map = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file) }.map_err(|_| BadFile)?);
-        let mut r = Reader::new(map, 0);
+        let map = std::sync::Arc::new(unsafe { memmap2::Mmap::map(file) }.map_err(|_| BadFile)?);
+        let mut r = if validate { Reader::new(map, 0) } else { Reader::trusting(map, 0) };
         let magic: Buf<u8> = r.buf()?;
         if magic.get(..8) != Some(MAGIC.as_slice()) {
             return Err(BadFile);
@@ -580,7 +585,7 @@ impl Index {
             def_sections: r.lists()?,
             graph: r.lists()?,
         };
-        ix.check().then_some(ix).ok_or(BadFile)
+        (!validate || ix.check()).then_some(ix).ok_or(BadFile)
     }
 
     /// That the arrays agree in length and every id stays in bounds, so a search cannot index past

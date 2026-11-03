@@ -103,7 +103,7 @@ impl Strs {
     #[inline]
     pub fn str(&self, i: usize) -> &str {
         // SAFETY: tables read through `str` are built from Rust strings, and a mapped file is checked
-        // as a whole (`Reader::utf8`) before it is used.
+        // as a whole (`Reader::utf8`) the first time a version of it is used (see `Reader::trusting`).
         unsafe { std::str::from_utf8_unchecked(self.bytes(i)) }
     }
     pub fn len(&self) -> usize {
@@ -227,6 +227,7 @@ impl<W: Write> Writer<W> {
 pub struct Reader {
     map: Arc<Mmap>,
     at: usize,
+    validate: bool,
 }
 
 #[derive(Debug)]
@@ -234,7 +235,12 @@ pub struct BadFile;
 
 impl Reader {
     pub fn new(map: Arc<Mmap>, start: usize) -> Self {
-        Reader { map, at: start }
+        Reader { map, at: start, validate: true }
+    }
+    /// A reader of a file whose contents were checked before (the same version of it): it keeps the checks of each
+    /// array's place in the file, and leaves out those that read the array (offsets, UTF-8, table slots).
+    pub fn trusting(map: Arc<Mmap>, start: usize) -> Self {
+        Reader { map, at: start, validate: false }
     }
     pub fn buf<T: Pod>(&mut self) -> Result<Buf<T>, BadFile> {
         let size = std::mem::size_of::<T>();
@@ -249,25 +255,32 @@ impl Reader {
     }
     pub fn lists(&mut self) -> Result<Lists, BadFile> {
         let l = Lists { off: self.buf()?, val: self.buf()? };
-        check_offsets(&l.off, l.val.len())?;
+        if self.validate {
+            check_offsets(&l.off, l.val.len())?;
+        }
         Ok(l)
     }
     pub fn strs(&mut self) -> Result<Strs, BadFile> {
         let s = Strs { off: self.buf()?, bytes: self.buf()? };
-        check_offsets(&s.off, s.bytes.len())?;
+        if self.validate {
+            check_offsets(&s.off, s.bytes.len())?;
+        }
         Ok(s)
     }
     /// A table read through `Strs::str`: its bytes must be UTF-8 where the offsets cut them.
     pub fn utf8(&mut self) -> Result<Strs, BadFile> {
         let s = self.strs()?;
-        for i in 0..s.len() {
+        for i in 0..if self.validate { s.len() } else { 0 } {
             std::str::from_utf8(s.bytes(i)).map_err(|_| BadFile)?;
         }
         Ok(s)
     }
     pub fn map(&mut self) -> Result<StrMap, BadFile> {
         let m = StrMap { keys: self.strs()?, vals: self.buf()?, slots: self.buf()? };
-        if m.vals.len() != m.keys.len() || !m.slots.len().is_power_of_two() || m.slots.iter().any(|&s| s as usize > m.keys.len()) {
+        if m.vals.len() != m.keys.len()
+            || !m.slots.len().is_power_of_two()
+            || self.validate && m.slots.iter().any(|&s| s as usize > m.keys.len())
+        {
             return Err(BadFile);
         }
         Ok(m)

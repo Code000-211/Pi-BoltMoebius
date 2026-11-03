@@ -77,10 +77,13 @@ answer.</sub>
 - TypeScript, JavaScript, Go and shell files are split at their definitions too (they were split like plain text):
   measured on 60 function and type names in Pi-Bolt's own sources, the definition first 53% → 98%, among the first 3
   83% → 100%.
-- The index is a mapped file: the first process builds it (0.9 s for 1,400 files), every later one is ready in 12 ms.
+- The index is a mapped file: the first process builds it (0.9 s for 1,400 files), every later one is ready in 0.3 ms
+  (measured: 12.4 ms before; the contents of a version of the file are checked once, by the first process that maps it,
+  and a stamp beside it lets the others skip reading every page; their first search takes 1.4–1.7 ms, as before).
 - About 32 MB per process, plus 110 MB of index shared by every process on the project (about 460 MB each without).
 - A changed file is searchable within a second (51 ms in the test) without rewriting the index; the index is rebuilt once
-  nothing has changed for 30 s.
+  nothing has changed for 30 s and the overlay holds 20 files or is 10 minutes old (before: after any 30 s without
+  changes, so an agent editing a file a minute rebuilt it, about 0.9 s of CPU and a new mapping in every process).
 - While the first build runs, a search waits for it on a worker thread (`await whenReady`), so Pi's screen and Escape keep
   working; before, the search blocked the event loop for up to 5 s (measured: a 985 ms build, 911 timer ticks meanwhile
   instead of none). `grep` stays the tool for exact text across all files, such as every call site.

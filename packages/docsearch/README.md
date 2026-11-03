@@ -10,7 +10,8 @@ adds the tool `project_search`, adds matching doc sections to a typed prompt (au
   or type gets its definition first.
 - **The index is a file, mapped.** The first process on a folder builds and saves it; every later one is ready in
   milliseconds and shares the same pages. Changed files are searched from a small overlay within a second of the
-  change; the saved index is rebuilt once the files have been quiet for 30 seconds.
+  change; the saved index is rebuilt once the files have been quiet for 30 seconds and the overlay holds 20 files or is
+  10 minutes old (at once past 200 files).
 
 ## Measured
 
@@ -32,7 +33,7 @@ TypeScript names had 53% / 83% / 98% then (search p50 33 → 38 µs, build 93 �
 | Search, seen from Bun, each query once (p50) | docs 77 µs, names 99 µs, descriptions 336 µs |
 | The same query again (result cache) | ~15 µs |
 | Index build (once per folder) | ~0.9 s |
-| Ready in a process when the index file exists | ~12 ms |
+| Ready in a process when the index file exists | 0.3 ms (12.4 ms before the check stamp; the first process to map a new version checks it, ~12 ms) |
 | Memory per process with the mapped index | ~32 MB private, ~110 MB page cache shared by all |
 | A changed file searchable after | ≤ ~1 s (51 ms in the test), nothing written to disk |
 
