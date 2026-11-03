@@ -760,8 +760,19 @@ export interface NativeFindOptions {
 	fuzzyFallback?: boolean;
 }
 
+/** At most this many paths come back from the fuzzy fallback: past the first few, they rarely are what was meant. */
+const FUZZY_FALLBACK_LIMIT = 20;
+
 /** The entries that match, in path order (or fff fuzzy-ranked on fallback), folders with a trailing `/`, at most `limit`. */
 export async function nativeFind(options: NativeFindOptions): Promise<string[]> {
+	return (await nativeFindDetailed(options)).paths;
+}
+
+/**
+ * As `nativeFind`, and whether the paths are the fuzzy fallback's: names close to the pattern, which no entry matched,
+ * so that a caller can say so rather than present them as matches.
+ */
+export async function nativeFindDetailed(options: NativeFindOptions): Promise<{ paths: string[]; fuzzy: boolean }> {
 	let pattern = options.pattern;
 	const fullPath = pattern.includes("/");
 	if (pattern.startsWith("/")) pattern = pattern.slice(1);
@@ -776,7 +787,7 @@ export async function nativeFind(options: NativeFindOptions): Promise<string[]> 
 	const allEntries = cachedTree.entries;
 	const matched: string[] = [];
 	const maxResults = Math.max(0, options.limit);
-	if (maxResults === 0) return [];
+	if (maxResults === 0) return { paths: [], fuzzy: false };
 
 	for (let i = 0; i < allEntries.length; i++) {
 		const entry = allEntries[i];
@@ -790,10 +801,12 @@ export async function nativeFind(options: NativeFindOptions): Promise<string[]> 
 		if (!cachedTree.packedPathsBuffer && cachedTree.displayPaths.length > 0) {
 			cachedTree.packedPathsBuffer = Buffer.from(`${cachedTree.displayPaths.join("\0")}\0`, "utf8");
 		}
-		return fuzzyFilterPaths(cachedTree.displayPaths, options.pattern, maxResults, cachedTree.packedPathsBuffer);
+		const limit = Math.min(maxResults, FUZZY_FALLBACK_LIMIT);
+		const paths = fuzzyFilterPaths(cachedTree.displayPaths, options.pattern, limit, cachedTree.packedPathsBuffer);
+		return { paths, fuzzy: paths.length > 0 };
 	}
 
-	return matched;
+	return { paths: matched, fuzzy: false };
 }
 
 // --- grep ---------------------------------------------------------------------------------------------------------------

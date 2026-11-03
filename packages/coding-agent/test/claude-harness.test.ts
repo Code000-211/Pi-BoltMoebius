@@ -11,10 +11,11 @@ import {
 	type HarnessDiagnostic,
 	sanitizeCompileFlags,
 } from "../src/core/harness/index.ts";
-import { createBashTool } from "../src/core/tools/bash.ts";
+import { buildEnvDiffScript, createBashTool } from "../src/core/tools/bash.ts";
 import { createEditTool } from "../src/core/tools/edit.ts";
+import { createFindTool } from "../src/core/tools/find.ts";
 import { createLsTool } from "../src/core/tools/ls.ts";
-import { getFileFrecencyScore, nativeFind, nativeGrep } from "../src/core/tools/native-search.ts";
+import { getFileFrecencyScore, nativeFind, nativeFindDetailed, nativeGrep } from "../src/core/tools/native-search.ts";
 import { createReadTool } from "../src/core/tools/read.ts";
 import { createWriteTool } from "../src/core/tools/write.ts";
 import { createHarness, type Harness } from "./suite/harness.ts";
@@ -661,6 +662,48 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		// 4. Single-syscall ls
 		const lsRes = await lsTool.execute("ls-fast", {});
 		expect(getText(lsRes)).toContain("fast.txt");
+	});
+
+	it("gives a command run by the warm bash worker an empty stdin, not the rest of its own script", async () => {
+		const bashTool = createBashTool(testDir);
+		await bashTool.execute("b-stdin-1", { command: "echo first" });
+		await new Promise((r) => setTimeout(r, 40));
+		// With the script on stdin, `read` would take the next line of the command ("echo after") as its input.
+		const res = await bashTool.execute("b-stdin-2", { command: 'read -r line; echo "got:[$line]"\necho after' });
+		expect(getText(res).trim().split("\n")).toEqual(["got:[]", "after"]);
+	});
+
+	it("removes from the warm bash worker the variables the command's environment leaves out", () => {
+		const script = buildEnvDiffScript(
+			{ KEEP: "1", CHANGE: "old", GONE: "x" },
+			{ KEEP: "1", CHANGE: "new", ADDED: "a'b" },
+		);
+		expect(script).toContain("export CHANGE='new'\n");
+		expect(script).toContain("export ADDED='a'\\''b'\n");
+		expect(script).toContain("unset -v GONE\n");
+		expect(script).not.toContain("KEEP");
+	});
+
+	it("labels find's fuzzy fallback as closest names, not matches, and keeps it short", async () => {
+		mkdirSync(join(testDir, "many"), { recursive: true });
+		for (let i = 0; i < 40; i++) writeFileSync(join(testDir, "many", `attention_kernel_${i}.hip`), "", "utf-8");
+		const detailed = await nativeFindDetailed({
+			root: testDir,
+			pattern: "attnkernel",
+			limit: 1000,
+			fuzzyFallback: true,
+		});
+		expect(detailed.fuzzy).toBe(true);
+		expect(detailed.paths.length).toBe(20);
+		const exact = await nativeFindDetailed({ root: testDir, pattern: "*.hip", limit: 1000, fuzzyFallback: true });
+		expect(exact.fuzzy).toBe(false);
+
+		const findTool = createFindTool(testDir, { native: true });
+		const res = await findTool.execute("f-fuzzy", { pattern: "attnkernel" });
+		expect(getText(res)).toMatch(/^No files match the pattern\. The closest paths by name/);
+		expect(res.details).toMatchObject({ fuzzyFallback: true });
+		const found = await findTool.execute("f-exact", { pattern: "attention_kernel_3.hip" });
+		expect(getText(found).trim()).toBe("many/attention_kernel_3.hip");
 	});
 
 	it("discovers nested CLAUDE.md and AGENTS.md files on read once per session and checks content staleness", async () => {

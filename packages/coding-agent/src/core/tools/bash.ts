@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants, existsSync } from "node:fs";
 import { access as fsAccess } from "node:fs/promises";
 import { constants as osConstants } from "node:os";
+import type { Writable } from "node:stream";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type ChildProcess, spawn } from "child_process";
 import { type Static, Type } from "typebox";
@@ -166,14 +167,14 @@ const SHELL_KEYWORDS_AND_BUILTINS = new Set([
 	"umask",
 	"shopt",
 	"set",
-	" pushd",
+	"pushd",
 	"popd",
 	"dirs",
 	"let",
 	"history",
 	"help",
 	"enable",
-	" caller",
+	"caller",
 	"bind",
 	"complete",
 	"compgen",
@@ -220,20 +221,42 @@ interface WarmBashProcess {
 
 let warmBashProcess: WarmBashProcess | undefined;
 
+/** Where a warm shell takes its command: fd 3, or stdin where fd 3 is not used (see WARM_BASH_FD3). */
+function warmCommandInput(child: ChildProcess): Writable | undefined {
+	return (WARM_BASH_FD3 ? child.stdio[3] : child.stdin) as Writable | undefined;
+}
+
 function quoteBashSingle(value: string): string {
 	return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-function buildEnvDiffScript(baseEnv: NodeJS.ProcessEnv, targetEnv: NodeJS.ProcessEnv): string {
+/** The lines that turn the warm shell's environment (`baseEnv`) into `targetEnv`: what it adds or changes, and what it removes. */
+export function buildEnvDiffScript(baseEnv: NodeJS.ProcessEnv, targetEnv: NodeJS.ProcessEnv): string {
+	const name = /^[A-Za-z_][A-Za-z0-9_]*$/;
 	let prefix = "";
 	for (const [key, val] of Object.entries(targetEnv)) {
-		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+		if (!name.test(key)) continue;
 		if (val !== undefined && baseEnv[key] !== val) {
 			prefix += `export ${key}=${quoteBashSingle(val)}\n`;
 		}
 	}
+	// A variable the target leaves out (PI_* removed for the command, a spawn hook's removal) must not survive from the
+	// warm shell's environment.
+	for (const [key, val] of Object.entries(baseEnv)) {
+		if (val !== undefined && targetEnv[key] === undefined && name.test(key)) {
+			prefix += `unset -v ${key}\n`;
+		}
+	}
 	return prefix;
 }
+
+/**
+ * The warm shell reads its command from fd 3 and runs it with stdin on /dev/null, as a command started normally gets it.
+ * Reading the command from stdin instead would hand a command that reads stdin (`read`, `cat` with no file) the rest of its
+ * own script. Windows' MSYS shells cannot be handed a fourth descriptor reliably, so they keep reading from stdin.
+ */
+const WARM_BASH_FD3 = process.platform !== "win32";
+const WARM_BASH_FD3_SCRIPT = `IFS= read -r -d '' __pi_command <&3; exec 3<&-; eval "$__pi_command" </dev/null`;
 
 function spawnWarmBashCandidate(
 	shellExe: string,
@@ -243,12 +266,12 @@ function spawnWarmBashCandidate(
 ): WarmBashProcess | undefined {
 	try {
 		const msys = msysBash ? { bash: msysBash, group: randomUUID() } : undefined;
-		const msysSpawn = msysShellSpawn(shellExe, ["-s"]);
-		const child = spawn(shellExe, msysSpawn?.args ?? ["-s"], {
+		const msysSpawn = WARM_BASH_FD3 ? undefined : msysShellSpawn(shellExe, ["-s"]);
+		const child = spawn(shellExe, WARM_BASH_FD3 ? ["-c", WARM_BASH_FD3_SCRIPT] : (msysSpawn?.args ?? ["-s"]), {
 			cwd,
 			detached: process.platform !== "win32",
 			env: msys ? { ...baseEnv, [MSYS_SHELL_GROUP_VARIABLE]: msys.group } : baseEnv,
-			stdio: ["pipe", "pipe", "pipe"],
+			stdio: WARM_BASH_FD3 ? ["ignore", "pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
 			windowsHide: true,
 			...(msysSpawn && { windowsVerbatimArguments: true, argv0: msysSpawn.argv0 }),
 		});
@@ -323,7 +346,7 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 					warmBashProcess.cwd === cwd &&
 					warmBashProcess.child.exitCode === null &&
 					!warmBashProcess.child.killed &&
-					warmBashProcess.child.stdin?.writable
+					warmCommandInput(warmBashProcess.child)?.writable
 				) {
 					const taken = warmBashProcess;
 					warmBashProcess = undefined;
@@ -331,8 +354,9 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 					msys = taken.msys;
 					child.ref();
 					const envPrefix = env ? buildEnvDiffScript(defaultShellEnv, shellEnv) : "";
-					child.stdin?.on("error", () => {});
-					child.stdin?.end(envPrefix ? `${envPrefix}${command}` : command);
+					const input = warmCommandInput(child);
+					input?.on("error", () => {});
+					input?.end(envPrefix ? `${envPrefix}${command}` : command);
 					setImmediate(() => {
 						if (!warmBashProcess) {
 							warmBashProcess = spawnWarmBashCandidate(shellExe, cwd, defaultShellEnv, msysBash);
