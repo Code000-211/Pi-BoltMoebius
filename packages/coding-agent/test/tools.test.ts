@@ -623,7 +623,7 @@ describe("Coding Agent Tools", () => {
 				expect(error).toBeInstanceOf(Error);
 				const message = (error as Error).message;
 				expect(message).toContain(testCase.expected);
-				expect(message).toMatch(/\[Showing lines \d+-\d+ of \d+\. Full output: /);
+				expect(message).toMatch(/\[Showing lines 1-40 and \d+-\d+ of \d+\. Full output: /);
 				expect(message).not.toContain("Full output: undefined");
 				const fullOutputPath = message.match(/Full output: ([^\]\n]+)/)?.[1];
 				expect(fullOutputPath).toBeDefined();
@@ -788,10 +788,79 @@ describe("Coding Agent Tools", () => {
 
 			expect(result.details?.truncation?.totalLines).toBe(4000);
 			expect(result.details?.truncation?.outputLines).toBe(2000);
-			expect(output).toContain("line-2001");
+			expect(output).toContain("line-0040\n\n[... 2000 lines omitted ...]\n\nline-2041\n");
 			expect(output).toContain("line-4000");
-			expect(output).toMatch(/\[Showing lines 2001-4000 of 4000\. Full output: /);
+			expect(output).toMatch(/\[Showing lines 1-40 and 2041-4000 of 4000\. Full output: /);
+			expect(output).not.toContain("line-0041");
 			expect(output).not.toContain("4001");
+		});
+
+		it("keeps the first lines and the end of a long output, cut to the byte limit", async () => {
+			const operations: BashOperations = {
+				exec: async (_command, _cwd, { onData }) => {
+					onData(Buffer.from("error: the first error\n", "utf-8"));
+					for (let i = 1; i <= 1000; i++) onData(Buffer.from(`${"x".repeat(99)}\n`, "utf-8"));
+					onData(Buffer.from("1 error\n", "utf-8"));
+					return { exitCode: 1 };
+				},
+			};
+			const bash = createBashTool(testDir, { operations });
+			const result = await bash.execute("test-call-head-tail", { command: "build" });
+			const output = getTextOutput(result);
+			expect(output.startsWith("error: the first error\n")).toBe(true);
+			expect(output).toContain("lines omitted ...]");
+			expect(output).toContain("1 error\n");
+			expect(output).toMatch(/\[Showing lines 1-40 and \d+-1002 of 1002 \(32\.0KB limit\)\./);
+			expect(Buffer.byteLength(output)).toBeLessThan(33 * 1024 + 300);
+		});
+
+		it("sends output without escape sequences, control characters or progress-bar redraws", async () => {
+			const operations: BashOperations = {
+				exec: async (_command, _cwd, { onData }) => {
+					onData(Buffer.from("\u001b[32mok\u001b", "utf-8"));
+					onData(Buffer.from("[0m\r\nDownloading  10%\r", "utf-8"));
+					onData(Buffer.from("Downloading  50%\rDownloading 100%\n\u0007done\n", "utf-8"));
+					return { exitCode: 0 };
+				},
+			};
+			const bash = createBashTool(testDir, { operations });
+			const result = await bash.execute("test-call-clean", { command: "fetch" });
+			expect(getTextOutput(result)).toBe("ok\nDownloading 100%\ndone\n");
+		});
+
+		it("shows the last rewrite of a line still open while streaming", async () => {
+			const updates: string[] = [];
+			const operations: BashOperations = {
+				exec: async (_command, _cwd, { onData }) => {
+					onData(Buffer.from("step 1\rstep 2\r", "utf-8"));
+					await new Promise((resolve) => setTimeout(resolve, 150));
+					onData(Buffer.from("step 3", "utf-8"));
+					return { exitCode: 0 };
+				},
+			};
+			const bash = createBashTool(testDir, { operations });
+			const result = await bash.execute("test-call-open-line", { command: "steps" }, undefined, (update) => {
+				const text = update.content[0];
+				if (text?.type === "text") updates.push(text.text);
+			});
+			expect(updates).toContain("step 2");
+			expect(getTextOutput(result)).toBe("step 3");
+		});
+
+		it("runs commands with NO_COLOR unless colors were asked for", () => {
+			const saved = { NO_COLOR: process.env.NO_COLOR, FORCE_COLOR: process.env.FORCE_COLOR };
+			try {
+				delete process.env.NO_COLOR;
+				delete process.env.FORCE_COLOR;
+				expect(shellModule.getShellEnv().NO_COLOR).toBe("1");
+				process.env.FORCE_COLOR = "1";
+				expect(shellModule.getShellEnv().NO_COLOR).toBeUndefined();
+			} finally {
+				for (const [key, value] of Object.entries(saved)) {
+					if (value === undefined) delete process.env[key];
+					else process.env[key] = value;
+				}
+			}
 		});
 
 		it("should decode UTF-8 characters split across output chunks", async () => {
@@ -844,7 +913,7 @@ describe("Coding Agent Tools", () => {
 			expect(result.details?.truncation?.truncatedBy).toBe("lines");
 			expect(result.details?.truncation?.content).toBe("");
 			expect(fullOutputPath).toBeDefined();
-			expect(output).toMatch(/\[Showing lines \d+-\d+ of \d+\. Full output: /);
+			expect(output).toMatch(/\[Showing lines 1-40 and \d+-\d+ of \d+\. Full output: /);
 			expect(output).not.toContain("Full output: undefined");
 
 			for (let i = 0; i < 20 && (!fullOutputPath || !existsSync(fullOutputPath)); i++) {

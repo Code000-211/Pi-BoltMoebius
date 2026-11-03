@@ -248,6 +248,8 @@ export function getShellEnv(): NodeJS.ProcessEnv {
 	return {
 		...process.env,
 		[pathKey]: updatedPath,
+		// Commands print without colors unless asked for them (FORCE_COLOR) or told otherwise (NO_COLOR set).
+		...(process.env.NO_COLOR === undefined && process.env.FORCE_COLOR === undefined ? { NO_COLOR: "1" } : {}),
 	};
 }
 

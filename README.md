@@ -125,6 +125,10 @@ and that file is added to the result, once per session (as Claude Code does). Th
   starting a shell.
 - Other commands run in a bash started ahead of time and kept ready, when the shell and folder match.
 - Shell lookups on Windows are cached. Not measured.
+- The model gets the output without escape sequences, control characters or progress-bar redraws (a line rewritten
+  after `\r` only as it was last written), and commands run with `NO_COLOR=1` unless `NO_COLOR` or `FORCE_COLOR` is set.
+- Output over 2000 lines or 32 KB (was 50 KB, the end only) keeps its first 40 lines (up to 4 KB) and its end, so the
+  first compiler error and the summary are both there. The full output is still saved to a file.
 
 ## Melious provider
 
