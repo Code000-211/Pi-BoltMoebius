@@ -284,9 +284,15 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		harness.onFileRead(headerCuh, "__device__ int helper() { return 1; }\n", Date.now(), testDir);
 
 		expect(harness.stateTracker.findHostSourceForHeader(headerCuh)).toBe(mainHip);
+		// Headers that were only read are not overlaid: their tracked text may be stale against the disk
+		expect(harness.stateTracker.getUnsavedHeaderOverlays()).toHaveLength(0);
+
+		const newHeader = "__device__ int helper() { return 2; }\n";
+		harness.stateTracker.recordFileModifiedByAgent(headerCuh, newHeader, Date.now());
 		const overlays = harness.stateTracker.getUnsavedHeaderOverlays();
 		expect(overlays).toHaveLength(1);
 		expect(overlays[0].filename).toBe(headerCuh);
+		expect(overlays[0].content).toBe(newHeader);
 	});
 
 	it("handles 2-tier Rust LSP diagnostics (fast in-memory + late borrow-checker via <system-reminder>)", async () => {
@@ -394,10 +400,11 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 			50,
 		);
 		// Immediate return at 50ms did not block waiting for the 120ms cargo check
-		expect(slowDiags.some((d) => d.code === "E0502")).toBe(false);
+		expect(slowDiags.diagnostics.some((d) => d.code === "E0502")).toBe(false);
+		expect(slowDiags.complete).toBe(false);
 
-		// Wait for the background flycheck to finish (220ms > 120ms)
-		await new Promise((r) => setTimeout(r, 220));
+		// Wait for the background flycheck (120ms) plus the settle grace after quiescence
+		await new Promise((r) => setTimeout(r, 600));
 
 		// Next read tool call automatically delivers the late borrow-checker error in <system-reminder>!
 		const nextRead = await readTool.execute("r2", { path: "lib.rs" });
@@ -740,5 +747,205 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		expect(updated).toBe(
 			["export function compute() {", "\tif (ready) {", "\t\treturn 42;", "\t}", "\treturn 0;", "}", ""].join("\n"),
 		);
+	});
+
+	it("allows consecutive edits of a CRLF file with a BOM and keeps its bytes intact", async () => {
+		const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
+		const readTool = createReadTool(testDir, { harness });
+		const editTool = createEditTool(testDir, {
+			harness,
+			enforceReadBeforeEdit: true,
+			includePostEditSnippet: true,
+			enableDiagnostics: false,
+		});
+
+		const filePath = join(testDir, "windows.cpp");
+		writeFileSync(filePath, "﻿int a = 1;\r\nint b = 2;\r\n", "utf-8");
+		await readTool.execute("r-crlf", { path: "windows.cpp" });
+
+		await editTool.execute("e-crlf-1", {
+			path: "windows.cpp",
+			edits: [{ oldText: "int a = 1;", newText: "int a = 10;" }],
+		});
+		const second = await editTool.execute("e-crlf-2", {
+			path: "windows.cpp",
+			edits: [{ oldText: "int b = 2;", newText: "int b = 20;" }],
+		});
+
+		expect(readFileSync(filePath, "utf-8")).toBe("﻿int a = 10;\r\nint b = 20;\r\n");
+		// The snippet is rendered from the LF-normalized text
+		expect(getText(second)).toContain("     2→int b = 20;\n");
+		expect(getText(second)).not.toContain("\r");
+	});
+
+	it("allows editing a file larger than the chunked-read threshold after reading part of it", async () => {
+		const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
+		const readTool = createReadTool(testDir, { harness });
+		const editTool = createEditTool(testDir, {
+			harness,
+			enforceReadBeforeEdit: true,
+			enableDiagnostics: false,
+		});
+
+		const filePath = join(testDir, "big.txt");
+		const lines = Array.from({ length: 40_000 }, (_, i) => `line ${i} ${"x".repeat(32)}`);
+		writeFileSync(filePath, `${lines.join("\n")}\n`, "utf-8");
+
+		await readTool.execute("r-big", { path: "big.txt", offset: 100, limit: 10 });
+		const res = await editTool.execute("e-big", {
+			path: "big.txt",
+			edits: [{ oldText: `line 39999 ${"x".repeat(32)}`, newText: "last line" }],
+		});
+		expect(getText(res)).toContain("Successfully replaced 1 block(s) in big.txt.");
+		expect(readFileSync(filePath, "utf-8").endsWith("last line\n")).toBe(true);
+		expect(harness.stateTracker.getTrackedState(filePath)?.contentComplete).toBe(true);
+	});
+
+	it("counts identical diagnostics and reports re-introduced ones again", async () => {
+		const harness = new ClaudeHarnessManager({
+			customProvider: (absPath, content) =>
+				content
+					.split("\n")
+					.flatMap((line, i): HarnessDiagnostic[] =>
+						line.includes("BAD")
+							? [{ file: absPath, line: i + 1, column: 1, severity: "error", message: "expected ';'" }]
+							: [],
+					),
+		});
+		const readTool = createReadTool(testDir, { harness });
+		const editTool = createEditTool(testDir, {
+			harness,
+			enforceReadBeforeEdit: true,
+			enableDiagnostics: true,
+		});
+
+		const filePath = join(testDir, "count.cpp");
+		writeFileSync(filePath, "int a = 1; // BAD\nint b = 2;\nint c = 3;\n", "utf-8");
+		await readTool.execute("r-count", { path: "count.cpp" });
+		await new Promise((r) => setTimeout(r, 20));
+
+		// Same message on a second line is a new diagnostic, not the pre-existing one
+		const dup = await editTool.execute("e-dup", {
+			path: "count.cpp",
+			edits: [{ oldText: "int b = 2;", newText: "int b = 2; // BAD" }],
+		});
+		expect(getText(dup)).toContain("<new-diagnostics>");
+		expect(getText(dup)).toContain("Line 2");
+
+		// Fixing it and the original leaves no diagnostics
+		const fixed = await editTool.execute("e-fix", {
+			path: "count.cpp",
+			edits: [
+				{ oldText: "int a = 1; // BAD", newText: "int a = 1;" },
+				{ oldText: "int b = 2; // BAD", newText: "int b = 2;" },
+			],
+		});
+		expect(getText(fixed)).not.toContain("<new-diagnostics>");
+
+		// Re-introducing it after the fix is reported again
+		const again = await editTool.execute("e-again", {
+			path: "count.cpp",
+			edits: [{ oldText: "int c = 3;", newText: "int c = 3; // BAD" }],
+		});
+		expect(getText(again)).toContain("<new-diagnostics>");
+		expect(getText(again)).toContain("Line 3");
+	});
+
+	it("parses headers that borrow flags from a C compile entry as C", () => {
+		const cFlags = sanitizeCompileFlags(
+			["gcc", "-std=c11", "-Iinclude", "-c", "src/util.c", "-o", "util.o"],
+			join(testDir, "src", "util.h"),
+			testDir,
+		);
+		expect(cFlags.slice(0, 2)).toEqual(["-x", "c-header"]);
+		expect(cFlags).toContain("-std=c11");
+		expect(cFlags).not.toContain("-std=c++20");
+
+		const noStd = sanitizeCompileFlags(["cc", "-c", "src/util.c"], join(testDir, "src", "util.h"), testDir);
+		expect(noStd.slice(0, 2)).toEqual(["-x", "c-header"]);
+		expect(noStd).not.toContain("-std=c++20");
+
+		const cppFlags = sanitizeCompileFlags(
+			["g++", "-std=gnu++17", "-c", "src/util.cpp"],
+			join(testDir, "src", "util.h"),
+			testDir,
+		);
+		expect(cppFlags.slice(0, 2)).toEqual(["-x", "c++-header"]);
+	});
+
+	it("reports cargo flycheck diagnostics that settle after a fast in-budget result, despite stderr noise", async () => {
+		const mockRaScript = join(testDir, "mock-rust-analyzer-flycheck.mjs");
+		writeFileSync(
+			mockRaScript,
+			`
+			let buf = Buffer.alloc(0);
+			function send(msg) {
+				const body = Buffer.from(JSON.stringify(msg), "utf-8");
+				process.stdout.write(Buffer.concat([Buffer.from("Content-Length: " + body.length + "\\r\\n\\r\\n", "ascii"), body]));
+			}
+			// More stderr than a pipe buffer holds: the client must drain it or this process blocks
+			process.stderr.write("x".repeat(512 * 1024));
+			const pre = { range: { start: { line: 0, character: 0 } }, severity: 2, code: "dead_code", message: "function is never used" };
+			const borrow = { range: { start: { line: 2, character: 4 } }, severity: 1, code: "E0502", message: "cannot borrow x as mutable" };
+			process.stdin.on("data", (chunk) => {
+				buf = Buffer.concat([buf, chunk]);
+				while (true) {
+					const end = buf.indexOf("\\r\\n\\r\\n");
+					if (end === -1) break;
+					const len = Number.parseInt(/Content-Length:\\s*(\\d+)/i.exec(buf.subarray(0, end).toString("ascii"))[1], 10);
+					if (buf.length < end + 4 + len) break;
+					const msg = JSON.parse(buf.subarray(end + 4, end + 4 + len).toString("utf-8"));
+					buf = buf.subarray(end + 4 + len);
+					if (msg.method === "initialize") {
+						send({ jsonrpc: "2.0", id: msg.id, result: { capabilities: {} } });
+					} else if (msg.method === "textDocument/didOpen") {
+						send({ jsonrpc: "2.0", method: "textDocument/publishDiagnostics", params: { uri: msg.params.textDocument.uri, diagnostics: [pre] } });
+						send({ jsonrpc: "2.0", method: "experimental/serverStatus", params: { quiescent: true } });
+					} else if (msg.method === "textDocument/didSave") {
+						const uri = msg.params.textDocument.uri;
+						const text = msg.params.text || "";
+						// Native diagnostics arrive at once, then quiescence, then a slower cargo check
+						send({ jsonrpc: "2.0", method: "textDocument/publishDiagnostics", params: { uri, diagnostics: [pre] } });
+						send({ jsonrpc: "2.0", method: "experimental/serverStatus", params: { quiescent: true } });
+						setTimeout(() => {
+							send({ jsonrpc: "2.0", method: "$/progress", params: { token: "rust-analyzer/flycheck/0", value: { kind: "begin" } } });
+						}, 50);
+						setTimeout(() => {
+							const diagnostics = text.includes("BORROW") ? [pre, borrow] : [pre];
+							send({ jsonrpc: "2.0", method: "textDocument/publishDiagnostics", params: { uri, diagnostics } });
+						}, 500);
+						setTimeout(() => {
+							send({ jsonrpc: "2.0", method: "$/progress", params: { token: "rust-analyzer/flycheck/0", value: { kind: "end" } } });
+						}, 550);
+					}
+				}
+			});
+			`,
+			"utf-8",
+		);
+
+		process.env.RUST_ANALYZER_PATH = mockRaScript;
+		const harness = new ClaudeHarnessManager({ enableDiagnostics: true });
+		claudeManagers.push(harness);
+		const readTool = createReadTool(testDir, { harness });
+		const editTool = createEditTool(testDir, { harness, enforceReadBeforeEdit: true, enableDiagnostics: true });
+
+		const rsFile = join(testDir, "main.rs");
+		writeFileSync(rsFile, "fn unused() {}\nfn main() {\n    let x = 1;\n}\n", "utf-8");
+		await readTool.execute("r-rs", { path: "main.rs" });
+		// Let the warmup's own flycheck settle so it is part of the baseline
+		await new Promise((r) => setTimeout(r, 1000));
+
+		const edit = await editTool.execute("e-rs", {
+			path: "main.rs",
+			edits: [{ oldText: "    let x = 1;", newText: "    let x = 1; BORROW;" }],
+		});
+		// The pre-existing dead_code warning is not reported as new
+		expect(getText(edit)).not.toContain("<new-diagnostics>");
+
+		await new Promise((r) => setTimeout(r, 1000));
+		const late = getText(await readTool.execute("r-rs-2", { path: "main.rs" }));
+		expect(late).toContain("E0502");
+		expect(late).not.toContain("dead_code");
 	});
 });

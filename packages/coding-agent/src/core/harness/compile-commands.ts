@@ -118,6 +118,10 @@ export function sanitizeCompileFlags(
 	let seenOffloadArch = false;
 	let hasExplicitLanguage = false;
 	let hasStdFlag = false;
+	// A header inherits its language from the compile entry it borrows flags from: a C `-std=`
+	// (no "++") or a `.c` input means the header must be parsed as C, not C++.
+	let hasCStdFlag = false;
+	let entrySourceIsC = false;
 
 	// Skip the first token if it looks like a compiler binary (clang++, hipcc, g++, nvcc, c++, etc.)
 	let startIndex = 0;
@@ -187,6 +191,7 @@ export function sanitizeCompileFlags(
 
 		if (arg.startsWith("-std=")) {
 			hasStdFlag = true;
+			hasCStdFlag = !arg.includes("++");
 		}
 
 		// Skip input source file path
@@ -196,6 +201,9 @@ export function sanitizeCompileFlags(
 				continue;
 			}
 			const argExt = extname(arg).toLowerCase();
+			if (argExt === ".c") {
+				entrySourceIsC = true;
+			}
 			if (
 				argExt === ".cpp" ||
 				argExt === ".cc" ||
@@ -212,20 +220,22 @@ export function sanitizeCompileFlags(
 	}
 
 	const isHip = isHipByExt || isHipByContent || seenOffloadArch;
+	const isHeader = isCppOrHipHeader(targetFilePath);
+	const isC = !isHip && (ext === ".c" || (isHeader && (hasCStdFlag || entrySourceIsC)));
 
 	if (!hasExplicitLanguage) {
 		if (isHip) {
-			result.unshift("-x", isCppOrHipHeader(targetFilePath) ? "hip-header" : "hip");
-		} else if (isCppOrHipHeader(targetFilePath)) {
+			result.unshift("-x", isHeader ? "hip-header" : "hip");
+		} else if (isC) {
+			result.unshift("-x", isHeader ? "c-header" : "c");
+		} else if (isHeader) {
 			result.unshift("-x", "c++-header");
-		} else if (ext === ".c") {
-			result.unshift("-x", "c");
 		} else {
 			result.unshift("-x", "c++");
 		}
 	}
 
-	if (!hasStdFlag && ext !== ".c") {
+	if (!hasStdFlag && !isC) {
 		result.push("-std=c++20");
 	}
 

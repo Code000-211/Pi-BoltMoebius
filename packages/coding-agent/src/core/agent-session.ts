@@ -777,7 +777,13 @@ export class AgentSession {
 				})
 			: undefined;
 
-		const content = hookResult?.content ?? result.content ?? [];
+		const resultContent = hookResult?.content ?? result.content ?? [];
+		// Late Rust borrow-checker diagnostics otherwise only reach the model with the next
+		// read/edit/write; attach them to whichever tool result comes first.
+		const lateDiagnostics = this._claudeHarness.drainPendingSystemReminder().trimStart();
+		const content = lateDiagnostics
+			? [...resultContent, { type: "text" as const, text: lateDiagnostics }]
+			: resultContent;
 		// Runs after the extension hook so images injected or replaced by extensions are normalized too.
 		const resizeOptions = this._limitsModel()?.inputLimits?.images?.resize;
 		const normalizedContent = await normalizeToolResultImages(content, {
@@ -785,7 +791,7 @@ export class AgentSession {
 			...(resizeOptions ? { resizeOptions } : {}),
 		});
 
-		if (!hookResult && normalizedContent === content) {
+		if (!hookResult && !lateDiagnostics && normalizedContent === content) {
 			return undefined;
 		}
 
@@ -1570,6 +1576,8 @@ export class AgentSession {
 			this._cacheWarmer.onWarmed = undefined;
 			this._cacheWarmer.cancel();
 		}
+		// Stop rust-analyzer / clangd so replaced sessions do not leak language-server processes.
+		this._claudeHarness.dispose();
 		cleanupSessionResources(this.sessionId);
 	}
 

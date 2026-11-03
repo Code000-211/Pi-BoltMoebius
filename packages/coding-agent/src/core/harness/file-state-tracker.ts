@@ -14,8 +14,29 @@ export interface HarnessDiagnostic {
 export interface TrackedFileState {
 	absolutePath: string;
 	lastReadMtimeMs: number;
+	/** Exact on-disk text (BOM and line endings included), or a prefix when `contentComplete` is false. */
 	content: string;
-	baselineFingerprints: Set<string>;
+	/** False when only a prefix of a large file was read, so `content` cannot be compared or reparsed. */
+	contentComplete: boolean;
+	/** True once the agent has written this file through edit/write. */
+	modifiedByAgent: boolean;
+	/** Fingerprint -> occurrence count of the diagnostics present before the agent's latest change. */
+	baselineCounts: Map<string, number>;
+}
+
+/**
+ * How newly collected diagnostics update the baseline: "replace" when the list is the complete,
+ * settled set for the file; "merge" when it may be partial (e.g. a language server timed out).
+ */
+export type BaselineUpdateMode = "replace" | "merge";
+
+/**
+ * Diagnostics collected by an engine. `complete` is false when the engine could not wait for the
+ * settled set (timeout, or a language server still working), so the list may be partial or empty.
+ */
+export interface DiagnosticsResult {
+	diagnostics: HarnessDiagnostic[];
+	complete: boolean;
 }
 
 const CPP_HIP_SOURCE_EXTENSIONS = new Set([".cpp", ".cc", ".cxx", ".c", ".cu", ".hip"]);
@@ -45,6 +66,15 @@ export function isRustFile(filePath: string): boolean {
  */
 export function diagnosticFingerprint(diag: HarnessDiagnostic): string {
 	return `${diag.severity}|${diag.code ?? ""}|${diag.message.trim()}`;
+}
+
+function countFingerprints(diagnostics: HarnessDiagnostic[]): Map<string, number> {
+	const counts = new Map<string, number>();
+	for (const diag of diagnostics) {
+		const fp = diagnosticFingerprint(diag);
+		counts.set(fp, (counts.get(fp) ?? 0) + 1);
+	}
+	return counts;
 }
 
 const LOCAL_INCLUDE_REGEX = /^\s*#\s*include\s*"([^"]+)"/gm;
@@ -82,8 +112,9 @@ export class FileStateTracker {
 			);
 		}
 		// Also guard against sub-millisecond external modifications where mtimeMs did not advance
-		// (Claude Code v2.1.295 parity: compare exact content when available).
-		if (currentContent !== undefined && state.content.length > 0 && currentContent !== state.content) {
+		// (Claude Code v2.1.295 parity: compare exact content when available). A partial read of a
+		// large file only recorded a prefix, so only the mtime check applies there.
+		if (currentContent !== undefined && state.contentComplete && currentContent !== state.content) {
 			throw new Error(
 				"File has been modified since it was last read (either by the user or an external tool). Read the file again before editing it.",
 			);
@@ -147,20 +178,22 @@ export class FileStateTracker {
 	}
 
 	/**
-	 * Record that a file was read (or updated by edit/write).
+	 * Record that a file was read. Pass `contentComplete: false` when `content` is only a prefix.
 	 */
-	recordFileRead(absolutePath: string, content: string, mtimeMs: number): TrackedFileState {
+	recordFileRead(absolutePath: string, content: string, mtimeMs: number, contentComplete = true): TrackedFileState {
 		const key = this.normalizeKey(absolutePath);
 		const existing = this.files.get(key);
 		const state: TrackedFileState = {
 			absolutePath: normalize(resolve(absolutePath)),
 			lastReadMtimeMs: mtimeMs,
 			content,
-			baselineFingerprints: existing?.baselineFingerprints ?? new Set<string>(),
+			contentComplete,
+			modifiedByAgent: existing?.modifiedByAgent ?? false,
+			baselineCounts: existing?.baselineCounts ?? new Map<string, number>(),
 		};
 		this.files.set(key, state);
 
-		if (isCppOrHipSource(absolutePath)) {
+		if (contentComplete && isCppOrHipSource(absolutePath)) {
 			this.lastActiveCppHipSource = state.absolutePath;
 			this.indexLocalIncludes(state.absolutePath, content);
 		}
@@ -169,28 +202,30 @@ export class FileStateTracker {
 
 	/**
 	 * Update the file's content and mtime after a successful edit/write by the agent.
+	 * `newContent` must be exactly what was written to disk. The diagnostics collected for the new
+	 * content become the baseline for the next change (see `BaselineUpdateMode`).
 	 */
 	recordFileModifiedByAgent(
 		absolutePath: string,
 		newContent: string,
 		newMtimeMs: number,
 		currentDiagnostics?: HarnessDiagnostic[],
+		baselineMode: BaselineUpdateMode = "replace",
 	): void {
 		const key = this.normalizeKey(absolutePath);
 		const existing = this.files.get(key);
-		const baselineFingerprints = existing ? new Set(existing.baselineFingerprints) : new Set<string>();
-		if (currentDiagnostics) {
-			for (const diag of currentDiagnostics) {
-				baselineFingerprints.add(diagnosticFingerprint(diag));
-			}
-		}
 		const normalizedPath = normalize(resolve(absolutePath));
 		this.files.set(key, {
 			absolutePath: normalizedPath,
 			lastReadMtimeMs: newMtimeMs,
 			content: newContent,
-			baselineFingerprints,
+			contentComplete: true,
+			modifiedByAgent: true,
+			baselineCounts: existing ? new Map(existing.baselineCounts) : new Map<string, number>(),
 		});
+		if (currentDiagnostics) {
+			this.updateBaselineDiagnostics(absolutePath, currentDiagnostics, baselineMode);
+		}
 
 		if (isCppOrHipSource(normalizedPath)) {
 			this.lastActiveCppHipSource = normalizedPath;
@@ -199,29 +234,47 @@ export class FileStateTracker {
 	}
 
 	/**
-	 * Store baseline diagnostics captured during initial warmup on `read`.
+	 * Store baseline diagnostics (captured during warmup on `read`, or the settled result of an edit).
 	 */
 	setBaselineDiagnostics(absolutePath: string, diagnostics: HarnessDiagnostic[]): void {
-		const key = this.normalizeKey(absolutePath);
-		const state = this.files.get(key);
+		this.updateBaselineDiagnostics(absolutePath, diagnostics, "replace");
+	}
+
+	/**
+	 * Replace the baseline with `diagnostics`, or merge them in (keeping the higher count per
+	 * fingerprint) when they may be an incomplete set.
+	 */
+	updateBaselineDiagnostics(absolutePath: string, diagnostics: HarnessDiagnostic[], mode: BaselineUpdateMode): void {
+		const state = this.files.get(this.normalizeKey(absolutePath));
 		if (!state) return;
-		state.baselineFingerprints.clear();
-		for (const diag of diagnostics) {
-			state.baselineFingerprints.add(diagnosticFingerprint(diag));
+		const counts = countFingerprints(diagnostics);
+		if (mode === "replace") {
+			state.baselineCounts = counts;
+			return;
+		}
+		for (const [fp, count] of counts) {
+			if ((state.baselineCounts.get(fp) ?? 0) < count) state.baselineCounts.set(fp, count);
 		}
 	}
 
 	/**
-	 * Filter a list of diagnostics to only those NOT present in the baseline.
+	 * Filter a list of diagnostics to only those NOT present in the baseline. Fingerprints are
+	 * line-independent, so occurrences are counted: a second identical diagnostic is still new.
 	 */
 	diffAgainstBaseline(absolutePath: string, diagnostics: HarnessDiagnostic[]): HarnessDiagnostic[] {
-		const key = this.normalizeKey(absolutePath);
-		const state = this.files.get(key);
-		const baseline = state?.baselineFingerprints;
+		const state = this.files.get(this.normalizeKey(absolutePath));
+		const baseline = state?.baselineCounts;
 		if (!baseline || baseline.size === 0) {
 			return diagnostics;
 		}
-		return diagnostics.filter((diag) => !baseline.has(diagnosticFingerprint(diag)));
+		const remaining = new Map(baseline);
+		return diagnostics.filter((diag) => {
+			const fp = diagnosticFingerprint(diag);
+			const count = remaining.get(fp) ?? 0;
+			if (count === 0) return true;
+			remaining.set(fp, count - 1);
+			return false;
+		});
 	}
 
 	hasBeenRead(absolutePath: string): boolean {
@@ -242,14 +295,15 @@ export class FileStateTracker {
 	}
 
 	/**
-	 * Return all currently tracked modified headers/files for passing as CXUnsavedFile overlays.
+	 * Return the headers the agent modified in this session for passing as CXUnsavedFile overlays.
+	 * Headers that were only read are left out: their tracked text may be stale against the disk.
 	 */
 	getUnsavedHeaderOverlays(excludePath?: string): Array<{ filename: string; content: string }> {
 		const excludeKey = excludePath ? this.normalizeKey(excludePath) : undefined;
 		const overlays: Array<{ filename: string; content: string }> = [];
 		for (const [key, state] of this.files.entries()) {
 			if (key === excludeKey) continue;
-			if (isCppOrHipHeader(state.absolutePath)) {
+			if (state.modifiedByAgent && state.contentComplete && isCppOrHipHeader(state.absolutePath)) {
 				overlays.push({ filename: state.absolutePath, content: state.content });
 			}
 		}

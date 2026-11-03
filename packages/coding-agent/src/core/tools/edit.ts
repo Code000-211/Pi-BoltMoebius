@@ -232,7 +232,10 @@ export function createEditToolDefinition(
 				const { suffix } = await harness.onFileModified({
 					absolutePath,
 					displayPath: path,
-					newContent,
+					// Track the exact bytes on disk (BOM + original line endings), or the next edit's
+					// read-before-edit content check would always report an external modification.
+					newContent: finalContent,
+					displayContent: newContent,
 					newMtimeMs: afterStat?.mtimeMs ?? Date.now(),
 					workspaceCwd,
 					firstChangedLine: diffResult.firstChangedLine,

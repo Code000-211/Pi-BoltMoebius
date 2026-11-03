@@ -4,7 +4,12 @@ import { createRequire } from "node:module";
 import { dirname, join, normalize, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { CompileCommandsResolver } from "./compile-commands.ts";
-import { type FileStateTracker, type HarnessDiagnostic, isCppOrHipHeader } from "./file-state-tracker.ts";
+import {
+	type DiagnosticsResult,
+	type FileStateTracker,
+	type HarnessDiagnostic,
+	isCppOrHipHeader,
+} from "./file-state-tracker.ts";
 
 interface NativeLibclangAddon {
 	initLibclang(customPath?: string): boolean;
@@ -72,30 +77,31 @@ class StrippedClangdFallback {
 		content: string,
 		workspaceCwd: string,
 		timeoutMs = 350,
-	): Promise<HarnessDiagnostic[]> {
-		if (this.failedToStart) return [];
+	): Promise<DiagnosticsResult> {
+		if (this.failedToStart) return { diagnostics: [], complete: false };
 		if (!this.proc) {
 			this.start(workspaceCwd);
-			if (this.failedToStart || !this.proc) return [];
+			if (this.failedToStart || !this.proc) return { diagnostics: [], complete: false };
 		}
 
 		const uri = pathToFileURL(resolve(absolutePath)).href;
 		const key = normalizeFileCompare(absolutePath);
 		const prevVersion = this.docVersions.get(key);
 
-		const diagPromise = new Promise<HarnessDiagnostic[]>((resolveWait) => {
+		const diagPromise = new Promise<DiagnosticsResult>((resolveWait) => {
 			const timer = setTimeout(() => {
 				const list = this.waiters.get(key);
 				if (list) {
 					const idx = list.indexOf(onDiags);
 					if (idx !== -1) list.splice(idx, 1);
 				}
-				resolveWait(this.latestDiagnostics.get(key) ?? []);
+				// No push for this version within the budget: whatever is cached may be stale.
+				resolveWait({ diagnostics: this.latestDiagnostics.get(key) ?? [], complete: false });
 			}, timeoutMs);
 
 			const onDiags = (diags: HarnessDiagnostic[]) => {
 				clearTimeout(timer);
-				resolveWait(diags);
+				resolveWait({ diagnostics: diags, complete: true });
 			};
 
 			const list = this.waiters.get(key) ?? [];
@@ -147,14 +153,18 @@ class StrippedClangdFallback {
 			return;
 		}
 
-		this.proc.on("error", () => {
+		const proc = this.proc;
+		proc.on("error", () => {
 			this.failedToStart = true;
-			this.proc = null;
+			if (this.proc === proc) this.proc = null;
 		});
-		this.proc.on("exit", () => {
-			this.proc = null;
+		proc.on("exit", () => {
+			if (this.proc === proc) this.proc = null;
 		});
-		this.proc.stdout.on("data", (chunk: Buffer) => this.onData(chunk));
+		// Drain stderr so a chatty server never blocks on a full pipe; ignore EPIPE after exit.
+		proc.stderr.resume();
+		proc.stdin.on("error", () => {});
+		proc.stdout.on("data", (chunk: Buffer) => this.onData(chunk));
 
 		const rootUri = pathToFileURL(resolve(workspaceCwd)).href;
 		this.sendRequest("initialize", {
@@ -184,6 +194,7 @@ class StrippedClangdFallback {
 			} catch {}
 			this.proc = null;
 		}
+		this.docVersions.clear();
 	}
 
 	private writeMessage(msg: unknown): void {
@@ -247,8 +258,10 @@ export class CppHipDiagnosticsEngine {
 	private nativeAddon: NativeLibclangAddon | null | undefined = undefined;
 	private readonly compileCommands = new CompileCommandsResolver();
 	private readonly clangdFallback = new StrippedClangdFallback();
-	private readonly inflightWarmups = new Map<string, Promise<HarnessDiagnostic[]>>();
+	private readonly inflightWarmups = new Map<string, Promise<DiagnosticsResult>>();
 	private readonly warmedUpTuKeys = new Set<string>();
+	/** Target file -> translation unit its baseline diagnostics were collected from. */
+	private readonly baselineTuByFile = new Map<string, string>();
 	private readonly stateTracker: FileStateTracker;
 
 	constructor(stateTracker: FileStateTracker) {
@@ -269,7 +282,7 @@ export class CppHipDiagnosticsEngine {
 	/**
 	 * Pre-warm the translation unit (and its precompiled preamble in RAM) when a file is read.
 	 */
-	warmupFile(absolutePath: string, content: string, workspaceCwd: string): Promise<HarnessDiagnostic[]> {
+	warmupFile(absolutePath: string, content: string, workspaceCwd: string): Promise<DiagnosticsResult> {
 		const key = normalizeFileCompare(absolutePath);
 		const existing = this.inflightWarmups.get(key);
 		if (existing) return existing;
@@ -284,7 +297,7 @@ export class CppHipDiagnosticsEngine {
 	/**
 	 * Reparse the file in-memory after an edit/write using the pre-warmed preamble.
 	 */
-	async checkEditedFile(absolutePath: string, newContent: string, workspaceCwd: string): Promise<HarnessDiagnostic[]> {
+	async checkEditedFile(absolutePath: string, newContent: string, workspaceCwd: string): Promise<DiagnosticsResult> {
 		const key = normalizeFileCompare(absolutePath);
 		const pendingWarmup = this.inflightWarmups.get(key);
 		if (pendingWarmup) {
@@ -294,7 +307,35 @@ export class CppHipDiagnosticsEngine {
 				// Ignore warmup error and proceed with reparse
 			}
 		}
-		return this.checkFileInternal(absolutePath, newContent, workspaceCwd, false);
+
+		// A header's baseline may come from parsing it standalone while the edit now parses it inside
+		// its host TU (or the other way round). Diagnostics from different TUs are not comparable, so
+		// re-collect the baseline from the pre-edit text in the TU the edit will use.
+		const resolvedTarget = resolve(workspaceCwd, absolutePath);
+		const targetKey = normalizeFileCompare(resolvedTarget);
+		const tuFilePath = this.resolveTranslationUnit(resolvedTarget);
+		const tuKey = normalizeFileCompare(tuFilePath);
+		const previous = this.stateTracker.getTrackedState(resolvedTarget);
+		if (this.baselineTuByFile.get(targetKey) !== tuKey && previous?.contentComplete) {
+			const baseline = await this.checkFileInternal(resolvedTarget, previous.content, workspaceCwd, true);
+			this.stateTracker.updateBaselineDiagnostics(
+				resolvedTarget,
+				baseline.diagnostics,
+				baseline.complete ? "replace" : "merge",
+			);
+		}
+		return this.checkFileInternal(resolvedTarget, newContent, workspaceCwd, false);
+	}
+
+	/**
+	 * Headers are parsed inside the host source that includes them when that source is known (and was
+	 * read completely), so they get the host's flags and preceding declarations.
+	 */
+	private resolveTranslationUnit(resolvedTarget: string): string {
+		if (!isCppOrHipHeader(resolvedTarget)) return resolvedTarget;
+		const hostSource = this.stateTracker.findHostSourceForHeader(resolvedTarget);
+		if (!hostSource) return resolvedTarget;
+		return this.stateTracker.getTrackedState(hostSource)?.contentComplete ? hostSource : resolvedTarget;
 	}
 
 	private async checkFileInternal(
@@ -302,61 +343,57 @@ export class CppHipDiagnosticsEngine {
 		content: string,
 		workspaceCwd: string,
 		isWarmup: boolean,
-	): Promise<HarnessDiagnostic[]> {
+	): Promise<DiagnosticsResult> {
 		const resolvedTarget = resolve(workspaceCwd, absolutePath);
 		const targetKey = normalizeFileCompare(resolvedTarget);
 
-		// If editing a header (.h/.hpp/.cuh) and we have an active host .hip/.cpp TU that includes it,
-		// reparse the host TU with the modified header injected as a CXUnsavedFile overlay!
-		let tuFilePath = resolvedTarget;
+		// If the file is a header (.h/.hpp/.cuh) included by a known host .hip/.cpp TU, parse the host
+		// TU with the header's text injected as a CXUnsavedFile overlay.
+		const tuFilePath = this.resolveTranslationUnit(resolvedTarget);
+		const tuKey = normalizeFileCompare(tuFilePath);
 		const unsavedFiles: Array<{ filename: string; content: string }> = [{ filename: resolvedTarget, content }];
 
-		if (!isWarmup && isCppOrHipHeader(resolvedTarget)) {
-			const hostSource = this.stateTracker.findHostSourceForHeader(resolvedTarget);
-			if (hostSource) {
-				const hostState = this.stateTracker.getTrackedState(hostSource);
-				if (hostState) {
-					tuFilePath = hostSource;
-					unsavedFiles.push({ filename: hostSource, content: hostState.content });
-				}
-			}
-		}
-
-		// Also include any other modified headers tracked in the session
+		// Also include the other headers the agent modified in this session
 		for (const overlay of this.stateTracker.getUnsavedHeaderOverlays(resolvedTarget)) {
 			unsavedFiles.push(overlay);
+		}
+
+		if (isWarmup) {
+			this.baselineTuByFile.set(targetKey, tuKey);
 		}
 
 		const addon = this.getAddon();
 		if (addon) {
 			try {
-				const tuKey = normalizeFileCompare(tuFilePath);
 				// When TU is already warm in libclang's hash table, clang_reparseTranslationUnit ignores argv,
 				// so skip resolving & marshaling compiler flags across the N-API boundary!
+				const tuContent = tuKey === targetKey ? content : this.stateTracker.getTrackedState(tuFilePath)?.content;
 				const flags = this.warmedUpTuKeys.has(tuKey)
 					? EMPTY_FLAGS
-					: this.compileCommands.getFlagsForFile(tuFilePath, workspaceCwd, content);
+					: this.compileCommands.getFlagsForFile(tuFilePath, workspaceCwd, tuContent);
 				const jsonStr = await addon.checkFileAsync(tuFilePath, flags, unsavedFiles);
 				this.warmedUpTuKeys.add(tuKey);
 				const rawDiags = JSON.parse(jsonStr) as RawClangDiagnostic[];
-				return this.filterRelevantDiagnostics(rawDiags, targetKey, tuKey);
+				return { diagnostics: this.filterRelevantDiagnostics(rawDiags, targetKey), complete: true };
 			} catch {
 				// Fallback if native call failed
 			}
 		}
 
+		// clangd parses each open file in its own context, so the baseline TU is the file itself.
+		this.baselineTuByFile.set(targetKey, targetKey);
 		return this.clangdFallback.updateFile(resolvedTarget, content, workspaceCwd, isWarmup ? 1500 : 350);
 	}
 
-	private filterRelevantDiagnostics(
-		rawDiags: RawClangDiagnostic[],
-		targetKey: string,
-		tuKey: string,
-	): HarnessDiagnostic[] {
+	/**
+	 * Keep only diagnostics located in the target file. For a header parsed inside its host TU,
+	 * diagnostics in the host source refer to the host's lines and belong to the host's own baseline.
+	 */
+	private filterRelevantDiagnostics(rawDiags: RawClangDiagnostic[], targetKey: string): HarnessDiagnostic[] {
 		const results: HarnessDiagnostic[] = [];
 		for (const d of rawDiags) {
 			const diagFileKey = d.file ? normalizeFileCompare(d.file) : targetKey;
-			if (diagFileKey !== targetKey && diagFileKey !== tuKey) {
+			if (diagFileKey !== targetKey) {
 				continue;
 			}
 			results.push({

@@ -1,10 +1,21 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, normalize, resolve } from "node:path";
 import { stripBom } from "../../utils/text.ts";
 import { notifySearchFileTouched } from "../tools/native-search.ts";
 import { CppHipDiagnosticsEngine } from "./cpp-hip-engine.ts";
-import { FileStateTracker, type HarnessDiagnostic, isCppOrHipFile, isRustFile } from "./file-state-tracker.ts";
+import {
+	type DiagnosticsResult,
+	FileStateTracker,
+	type HarnessDiagnostic,
+	isCppOrHipFile,
+	isRustFile,
+} from "./file-state-tracker.ts";
 import { type LateRustDiagnosticBatch, RustDiagnosticsEngine } from "./rust-engine.ts";
+
+function normalizeWarmupKey(filePath: string): string {
+	const norm = normalize(resolve(filePath));
+	return process.platform === "win32" ? norm.toLowerCase() : norm;
+}
 
 const NESTED_INSTRUCTION_CANDIDATES = ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
 
@@ -175,12 +186,14 @@ export class ClaudeHarnessManager {
 	dispose(): void {
 		this.cppHipEngine.dispose();
 		this.rustEngine.dispose();
+		this.inflightWarmups.clear();
 	}
 
 	/**
 	 * Called by `read.ts` as soon as a file is read.
 	 * Records the file's mtime & content, starts background LSP/libclang warmup (0ms blocking),
 	 * and returns any pending late Rust `<system-reminder>` block.
+	 * Pass `contentComplete: false` when `content` is only a prefix of a large file.
 	 */
 	onFileRead(
 		absolutePath: string,
@@ -188,19 +201,26 @@ export class ClaudeHarnessManager {
 		mtimeMs: number,
 		workspaceCwd: string,
 		rawBuffer?: Buffer,
+		contentComplete = true,
 	): string {
-		this.stateTracker.recordFileRead(absolutePath, content, mtimeMs);
-		notifySearchFileTouched(absolutePath, rawBuffer ?? content, mtimeMs);
+		this.stateTracker.recordFileRead(absolutePath, content, mtimeMs, contentComplete);
+		if (contentComplete) {
+			notifySearchFileTouched(absolutePath, rawBuffer ?? content, mtimeMs);
+		}
 
 		// Fire-and-forget pre-warming on background worker / LSP so `read` returns in 0ms!
+		// A prefix of a large file would only produce bogus baseline diagnostics, so skip it.
 		if (
+			contentComplete &&
 			this.defaultEnableDiagnostics &&
 			(this.customProvider !== undefined || isCppOrHipFile(absolutePath) || isRustFile(absolutePath))
 		) {
-			const p = this.runWarmupInBackground(absolutePath, content, workspaceCwd).finally(() => {
-				this.inflightWarmups.delete(absolutePath);
+			const key = normalizeWarmupKey(absolutePath);
+			const p: Promise<void> = this.runWarmupInBackground(absolutePath, content, workspaceCwd).finally(() => {
+				// A newer read may have replaced this warmup; only remove our own entry.
+				if (this.inflightWarmups.get(key) === p) this.inflightWarmups.delete(key);
 			});
-			this.inflightWarmups.set(absolutePath, p);
+			this.inflightWarmups.set(key, p);
 		}
 
 		const nestedFiles = this.stateTracker.discoverNestedInstructionsOnRead(
@@ -227,11 +247,16 @@ export class ClaudeHarnessManager {
 	 * Called by `edit.ts` / `write.ts` after writing the new content.
 	 * Runs fast in-memory reparse, diffs against baseline diagnostics, updates tracked state,
 	 * and returns the formatted snippet + `<new-diagnostics>` suffix.
+	 *
+	 * `newContent` must be exactly what was written to disk (BOM and line endings included) so the
+	 * next read-before-edit content check matches. `displayContent` is the LF-normalized text used
+	 * for the snippet and diagnostic source lines; it defaults to `newContent`.
 	 */
 	async onFileModified(params: {
 		absolutePath: string;
 		displayPath: string;
 		newContent: string;
+		displayContent?: string;
 		newMtimeMs: number;
 		workspaceCwd: string;
 		firstChangedLine?: number;
@@ -242,6 +267,7 @@ export class ClaudeHarnessManager {
 			absolutePath,
 			displayPath,
 			newContent,
+			displayContent = newContent,
 			newMtimeMs,
 			workspaceCwd,
 			firstChangedLine,
@@ -249,7 +275,7 @@ export class ClaudeHarnessManager {
 			enableDiagnostics = this.defaultEnableDiagnostics,
 		} = params;
 
-		let allDiagnostics: HarnessDiagnostic[] = [];
+		let result: DiagnosticsResult | undefined;
 		let newDiagnostics: HarnessDiagnostic[] = [];
 
 		// Fast path: only enter the async diagnostics pipeline for supported languages or custom providers
@@ -258,23 +284,34 @@ export class ClaudeHarnessManager {
 			(this.customProvider !== undefined || isCppOrHipFile(absolutePath) || isRustFile(absolutePath));
 
 		if (shouldRunDiagnostics) {
-			const pendingWarmup = this.inflightWarmups.get(absolutePath);
+			const pendingWarmup = this.inflightWarmups.get(normalizeWarmupKey(absolutePath));
 			if (pendingWarmup) {
 				await pendingWarmup;
 			}
-			allDiagnostics = await this.collectDiagnostics(absolutePath, newContent, workspaceCwd, false);
-			newDiagnostics = this.stateTracker.diffAgainstBaseline(absolutePath, allDiagnostics);
+			try {
+				result = await this.collectDiagnostics(absolutePath, newContent, workspaceCwd, false);
+				newDiagnostics = this.stateTracker.diffAgainstBaseline(absolutePath, result.diagnostics);
+			} catch {
+				// A failing diagnostics provider must never fail the edit/write itself
+				result = undefined;
+			}
 		}
 
-		this.stateTracker.recordFileModifiedByAgent(absolutePath, newContent, newMtimeMs, allDiagnostics);
+		this.stateTracker.recordFileModifiedByAgent(
+			absolutePath,
+			newContent,
+			newMtimeMs,
+			result?.diagnostics,
+			result?.complete === false ? "merge" : "replace",
+		);
 		notifySearchFileTouched(absolutePath, newContent, newMtimeMs);
 
 		let suffix = "";
 		if (includePostEditSnippet && firstChangedLine !== undefined) {
-			suffix += formatPostEditSnippet(newContent, firstChangedLine);
+			suffix += formatPostEditSnippet(displayContent, firstChangedLine);
 		}
 		if (newDiagnostics.length > 0) {
-			suffix += formatNewDiagnosticsBlock(displayPath, newContent, newDiagnostics);
+			suffix += formatNewDiagnosticsBlock(displayPath, displayContent, newDiagnostics);
 		}
 		suffix += this.drainPendingSystemReminder();
 
@@ -288,8 +325,12 @@ export class ClaudeHarnessManager {
 
 	private async runWarmupInBackground(absolutePath: string, content: string, workspaceCwd: string): Promise<void> {
 		try {
-			const diags = await this.collectDiagnostics(absolutePath, content, workspaceCwd, true);
-			this.stateTracker.setBaselineDiagnostics(absolutePath, diags);
+			const result = await this.collectDiagnostics(absolutePath, content, workspaceCwd, true);
+			this.stateTracker.updateBaselineDiagnostics(
+				absolutePath,
+				result.diagnostics,
+				result.complete ? "replace" : "merge",
+			);
 		} catch {
 			// Never let background warmup errors surface as unhandled rejections
 		}
@@ -300,9 +341,10 @@ export class ClaudeHarnessManager {
 		content: string,
 		workspaceCwd: string,
 		isWarmup: boolean,
-	): Promise<HarnessDiagnostic[]> {
+	): Promise<DiagnosticsResult> {
 		if (this.customProvider) {
-			return await this.customProvider(absolutePath, content, workspaceCwd, isWarmup);
+			const diagnostics = await this.customProvider(absolutePath, content, workspaceCwd, isWarmup);
+			return { diagnostics, complete: true };
 		}
 		if (isCppOrHipFile(absolutePath)) {
 			return isWarmup
@@ -314,7 +356,7 @@ export class ClaudeHarnessManager {
 				? await this.rustEngine.warmupFile(absolutePath, content, workspaceCwd)
 				: await this.rustEngine.checkEditedFile(absolutePath, content, workspaceCwd);
 		}
-		return [];
+		return { diagnostics: [], complete: true };
 	}
 }
 

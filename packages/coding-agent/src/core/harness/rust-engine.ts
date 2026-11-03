@@ -1,9 +1,17 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { normalize, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { diagnosticFingerprint, type FileStateTracker, type HarnessDiagnostic } from "./file-state-tracker.ts";
+import type { DiagnosticsResult, FileStateTracker, HarnessDiagnostic } from "./file-state-tracker.ts";
 
 const RUST_EDIT_WAIT_BUDGET_MS = 400;
+const RUST_WARMUP_WAIT_BUDGET_MS = 800;
+/**
+ * After the server reports quiescence (or diagnostics stop arriving) wait this long before treating
+ * a file's late diagnostics as settled, so a cargo flycheck that starts right after still counts.
+ */
+const LATE_SETTLE_GRACE_MS = 300;
+/** Idle fallback when neither quiescence nor flycheck progress is reported by the server. */
+const LATE_IDLE_FALLBACK_MS = 2000;
 
 function normalizeFileKey(p: string): string {
 	const norm = normalize(resolve(p));
@@ -11,9 +19,14 @@ function normalizeFileKey(p: string): string {
 }
 
 interface PendingWaiter {
-	resolve: (diags: HarnessDiagnostic[]) => void;
+	resolve: (result: DiagnosticsResult) => void;
 	timer: ReturnType<typeof setTimeout>;
 	receivedInitialPush: boolean;
+}
+
+interface LateFlycheckState {
+	filePath: string;
+	receivedPush: boolean;
 }
 
 export interface LateRustDiagnosticBatch {
@@ -29,10 +42,16 @@ export class RustDiagnosticsEngine {
 	private docVersions = new Map<string, number>();
 	private latestDiagnostics = new Map<string, HarnessDiagnostic[]>();
 	private waiters = new Map<string, PendingWaiter[]>();
-	private awaitingLateFlycheck = new Set<string>();
+	/** Files edited by the agent whose post-save (cargo check) diagnostics have not settled yet. */
+	private awaitingLateFlycheck = new Map<string, LateFlycheckState>();
+	/** Files read but not yet edited: diagnostics pushed for them keep refreshing their baseline. */
+	private baselinePending = new Set<string>();
+	private activeFlycheckTokens = new Set<string>();
+	private lateSettleTimer: ReturnType<typeof setTimeout> | undefined;
 	private lateDiagnosticsQueue: LateRustDiagnosticBatch[] = [];
 	private serverQuiescent = false;
-	private inflightWarmups = new Map<string, Promise<HarnessDiagnostic[]>>();
+	private flycheckPrimed = false;
+	private inflightWarmups = new Map<string, Promise<DiagnosticsResult>>();
 	private readonly stateTracker: FileStateTracker;
 
 	constructor(stateTracker: FileStateTracker) {
@@ -40,14 +59,24 @@ export class RustDiagnosticsEngine {
 	}
 
 	/**
-	 * Pre-warm rust-analyzer when a .rs file is read (sends textDocument/didOpen).
+	 * Pre-warm rust-analyzer when a .rs file is read (sends textDocument/didOpen). The first warmup
+	 * also saves once so cargo check runs and the baseline includes borrow-checker diagnostics.
 	 */
-	warmupFile(absolutePath: string, content: string, workspaceCwd: string): Promise<HarnessDiagnostic[]> {
+	warmupFile(absolutePath: string, content: string, workspaceCwd: string): Promise<DiagnosticsResult> {
 		const key = normalizeFileKey(resolve(workspaceCwd, absolutePath));
 		const existing = this.inflightWarmups.get(key);
 		if (existing) return existing;
 
-		const promise = this.updateDocument(absolutePath, content, workspaceCwd, false, 800).finally(() => {
+		this.baselinePending.add(key);
+		const triggerSave = !this.flycheckPrimed;
+		this.flycheckPrimed = true;
+		const promise = this.updateDocument(
+			absolutePath,
+			content,
+			workspaceCwd,
+			triggerSave,
+			RUST_WARMUP_WAIT_BUDGET_MS,
+		).finally(() => {
 			this.inflightWarmups.delete(key);
 		});
 		this.inflightWarmups.set(key, promise);
@@ -56,17 +85,18 @@ export class RustDiagnosticsEngine {
 
 	/**
 	 * Two-tier check on edit/write:
-	 * Sends didChange + didSave (triggers flycheck/borrow-checker), returns immediately if
-	 * quiescent within 400ms, or returns fast in-memory diagnostics at 400ms and queues late
-	 * borrow-checker diagnostics for the next turn's <system-reminder>.
+	 * Sends didChange + didSave (triggers flycheck/borrow-checker) and returns what arrives within
+	 * the budget. The result is never marked complete because cargo check finishes later; once it
+	 * settles, the diagnostics not yet reported are queued for the next `<system-reminder>`.
 	 */
 	async checkEditedFile(
 		absolutePath: string,
 		newContent: string,
 		workspaceCwd: string,
 		budgetMs = RUST_EDIT_WAIT_BUDGET_MS,
-	): Promise<HarnessDiagnostic[]> {
-		const key = normalizeFileKey(resolve(workspaceCwd, absolutePath));
+	): Promise<DiagnosticsResult> {
+		const resolved = resolve(workspaceCwd, absolutePath);
+		const key = normalizeFileKey(resolved);
 		const pendingWarmup = this.inflightWarmups.get(key);
 		if (pendingWarmup) {
 			try {
@@ -75,7 +105,10 @@ export class RustDiagnosticsEngine {
 				// Ignore warmup errors
 			}
 		}
-		return this.updateDocument(absolutePath, newContent, workspaceCwd, true, budgetMs);
+		this.baselinePending.delete(key);
+		this.awaitingLateFlycheck.set(key, { filePath: resolved, receivedPush: false });
+		const result = await this.updateDocument(absolutePath, newContent, workspaceCwd, true, budgetMs);
+		return { diagnostics: result.diagnostics, complete: false };
 	}
 
 	dispose(): void {
@@ -83,12 +116,19 @@ export class RustDiagnosticsEngine {
 			for (const w of waiters) clearTimeout(w.timer);
 		}
 		this.waiters.clear();
+		if (this.lateSettleTimer) clearTimeout(this.lateSettleTimer);
+		this.lateSettleTimer = undefined;
+		this.awaitingLateFlycheck.clear();
+		this.baselinePending.clear();
+		this.activeFlycheckTokens.clear();
 		if (this.proc) {
 			try {
 				this.proc.kill();
 			} catch {}
 			this.proc = null;
 		}
+		this.docVersions.clear();
+		this.flycheckPrimed = false;
 	}
 
 	/**
@@ -105,11 +145,11 @@ export class RustDiagnosticsEngine {
 		workspaceCwd: string,
 		triggerSave: boolean,
 		timeoutMs: number,
-	): Promise<HarnessDiagnostic[]> {
-		if (this.failedToStart) return Promise.resolve([]);
+	): Promise<DiagnosticsResult> {
+		if (this.failedToStart) return Promise.resolve({ diagnostics: [], complete: false });
 		if (!this.proc) {
 			this.start(workspaceCwd);
-			if (this.failedToStart || !this.proc) return Promise.resolve([]);
+			if (this.failedToStart || !this.proc) return Promise.resolve({ diagnostics: [], complete: false });
 		}
 
 		const resolved = resolve(workspaceCwd, absolutePath);
@@ -119,24 +159,21 @@ export class RustDiagnosticsEngine {
 		this.serverQuiescent = false;
 		this.latestDiagnostics.delete(key);
 
-		const promise = new Promise<HarnessDiagnostic[]>((resolveWait) => {
+		const promise = new Promise<DiagnosticsResult>((resolveWait) => {
 			const waiter: PendingWaiter = {
 				receivedInitialPush: false,
-				resolve: (diags) => {
+				resolve: (result) => {
 					clearTimeout(waiter.timer);
-					resolveWait(diags);
+					resolveWait(result);
 				},
 				timer: setTimeout(() => {
 					const list = this.waiters.get(key);
 					if (list) {
 						const idx = list.indexOf(waiter);
 						if (idx !== -1) list.splice(idx, 1);
+						if (list.length === 0) this.waiters.delete(key);
 					}
-					if (triggerSave) {
-						// Timed out before diagnostics + quiescence completed; queue late diagnostics for next <system-reminder>
-						this.awaitingLateFlycheck.add(key);
-					}
-					resolveWait(this.latestDiagnostics.get(key) ?? []);
+					resolveWait({ diagnostics: this.latestDiagnostics.get(key) ?? [], complete: false });
 				}, timeoutMs),
 			};
 
@@ -186,20 +223,25 @@ export class RustDiagnosticsEngine {
 			return;
 		}
 
-		this.proc.on("error", () => {
+		const proc = this.proc;
+		proc.on("error", () => {
 			this.failedToStart = true;
-			this.proc = null;
+			if (this.proc === proc) this.proc = null;
 		});
-		this.proc.on("exit", () => {
-			this.proc = null;
+		proc.on("exit", () => {
+			if (this.proc === proc) this.proc = null;
 		});
-		this.proc.stdout.on("data", (chunk: Buffer) => this.onData(chunk));
+		// Drain stderr so a chatty server never blocks on a full pipe; ignore EPIPE after exit.
+		proc.stderr.resume();
+		proc.stdin.on("error", () => {});
+		proc.stdout.on("data", (chunk: Buffer) => this.onData(chunk));
 
 		const rootUri = pathToFileURL(resolve(workspaceCwd)).href;
 		this.sendRequest("initialize", {
 			processId: process.pid,
 			rootUri,
 			capabilities: {
+				window: { workDoneProgress: true },
 				textDocument: {
 					publishDiagnostics: { relatedInformation: false },
 					synchronization: { didSave: true },
@@ -255,51 +297,121 @@ export class RustDiagnosticsEngine {
 			this.buffer = this.buffer.subarray(totalLength);
 
 			try {
-				const msg = JSON.parse(jsonBytes.toString("utf-8"));
-				if (msg.method === "experimental/serverStatus") {
-					this.serverQuiescent = Boolean(msg.params?.quiescent);
-					if (this.serverQuiescent) {
-						this.flushAllWaiters();
-					}
-				} else if (msg.method === "textDocument/publishDiagnostics" && msg.params?.uri) {
-					const filePath = fileURLToPath(msg.params.uri);
-					const key = normalizeFileKey(filePath);
-					const diags: HarnessDiagnostic[] = [];
-					for (const d of msg.params.diagnostics ?? []) {
-						if (d.severity === 1 || d.severity === 2) {
-							diags.push({
-								file: filePath,
-								line: (d.range?.start?.line ?? 0) + 1,
-								column: (d.range?.start?.character ?? 0) + 1,
-								severity: d.severity === 1 ? "error" : "warning",
-								message: String(d.message ?? "").split("\n")[0],
-								code: d.code ? String(d.code) : undefined,
-							});
-						}
-					}
-					this.latestDiagnostics.set(key, diags);
-
-					const waiters = this.waiters.get(key);
-					if (waiters && waiters.length > 0) {
-						for (const w of waiters) w.receivedInitialPush = true;
-						if (this.serverQuiescent || diags.some((d) => d.severity === "error")) {
-							this.waiters.delete(key);
-							for (const w of waiters) w.resolve(diags);
-						}
-					} else if (this.awaitingLateFlycheck.has(key)) {
-						this.awaitingLateFlycheck.delete(key);
-						const diffed = this.stateTracker.diffAgainstBaseline(filePath, diags);
-						if (diffed.length > 0) {
-							const state = this.stateTracker.getTrackedState(filePath);
-							if (state) {
-								for (const d of diffed) state.baselineFingerprints.add(diagnosticFingerprint(d));
-							}
-							this.lateDiagnosticsQueue.push({ filePath, diagnostics: diffed });
-						}
-					}
-				}
+				this.handleMessage(JSON.parse(jsonBytes.toString("utf-8")));
 			} catch {
 				// Ignore malformed packets
+			}
+		}
+	}
+
+	private handleMessage(msg: {
+		id?: number | string;
+		method?: string;
+		params?: {
+			quiescent?: boolean;
+			token?: number | string;
+			value?: { kind?: string };
+			uri?: string;
+			diagnostics?: Array<{
+				severity?: number;
+				range?: { start?: { line?: number; character?: number } };
+				message?: unknown;
+				code?: unknown;
+			}>;
+		};
+	}): void {
+		// Server-to-client requests (e.g. window/workDoneProgress/create) expect a reply.
+		if (msg.method && msg.id !== undefined) {
+			this.writeMessage({ jsonrpc: "2.0", id: msg.id, result: null });
+			return;
+		}
+
+		if (msg.method === "experimental/serverStatus") {
+			this.serverQuiescent = Boolean(msg.params?.quiescent);
+			if (this.serverQuiescent) {
+				this.flushAllWaiters();
+				this.scheduleLateSettle(LATE_SETTLE_GRACE_MS);
+			}
+			return;
+		}
+
+		if (msg.method === "$/progress" && msg.params?.token !== undefined) {
+			const token = String(msg.params.token);
+			if (!token.includes("flycheck")) return;
+			const kind = msg.params.value?.kind;
+			if (kind === "begin") {
+				this.activeFlycheckTokens.add(token);
+				if (this.lateSettleTimer) clearTimeout(this.lateSettleTimer);
+				this.lateSettleTimer = undefined;
+			} else if (kind === "end") {
+				this.activeFlycheckTokens.delete(token);
+				this.scheduleLateSettle(LATE_SETTLE_GRACE_MS);
+			}
+			return;
+		}
+
+		if (msg.method !== "textDocument/publishDiagnostics" || !msg.params?.uri) return;
+
+		const filePath = fileURLToPath(msg.params.uri);
+		const key = normalizeFileKey(filePath);
+		const diags: HarnessDiagnostic[] = [];
+		for (const d of msg.params.diagnostics ?? []) {
+			if (d.severity === 1 || d.severity === 2) {
+				diags.push({
+					file: filePath,
+					line: (d.range?.start?.line ?? 0) + 1,
+					column: (d.range?.start?.character ?? 0) + 1,
+					severity: d.severity === 1 ? "error" : "warning",
+					message: String(d.message ?? "").split("\n")[0],
+					code: d.code ? String(d.code) : undefined,
+				});
+			}
+		}
+		this.latestDiagnostics.set(key, diags);
+
+		const waiters = this.waiters.get(key);
+		if (waiters && waiters.length > 0) {
+			for (const w of waiters) w.receivedInitialPush = true;
+			if (this.serverQuiescent || diags.some((d) => d.severity === "error")) {
+				this.waiters.delete(key);
+				for (const w of waiters) w.resolve({ diagnostics: diags, complete: this.serverQuiescent });
+			}
+		}
+
+		const late = this.awaitingLateFlycheck.get(key);
+		if (late) {
+			late.receivedPush = true;
+			// Keep waiting while a flycheck runs; otherwise settle once pushes go quiet.
+			this.scheduleLateSettle(this.serverQuiescent ? LATE_SETTLE_GRACE_MS : LATE_IDLE_FALLBACK_MS);
+		} else if (this.baselinePending.has(key) && !(waiters && waiters.length > 0)) {
+			// Diagnostics arriving after the warmup budget still describe the pre-edit file.
+			this.stateTracker.setBaselineDiagnostics(filePath, diags);
+		}
+	}
+
+	private scheduleLateSettle(delayMs: number): void {
+		if (this.awaitingLateFlycheck.size === 0) return;
+		if (this.lateSettleTimer) clearTimeout(this.lateSettleTimer);
+		this.lateSettleTimer = setTimeout(() => {
+			this.lateSettleTimer = undefined;
+			if (this.activeFlycheckTokens.size > 0) return;
+			this.settleLateDiagnostics();
+		}, delayMs);
+	}
+
+	/**
+	 * Report the diagnostics that appeared after an edit's budget and make the settled set the new
+	 * baseline. Files whose diagnostics were never pushed again keep waiting.
+	 */
+	private settleLateDiagnostics(): void {
+		for (const [key, late] of this.awaitingLateFlycheck) {
+			if (!late.receivedPush) continue;
+			this.awaitingLateFlycheck.delete(key);
+			const diags = this.latestDiagnostics.get(key) ?? [];
+			const diffed = this.stateTracker.diffAgainstBaseline(late.filePath, diags);
+			this.stateTracker.setBaselineDiagnostics(late.filePath, diags);
+			if (diffed.length > 0) {
+				this.lateDiagnosticsQueue.push({ filePath: late.filePath, diagnostics: diffed });
 			}
 		}
 	}
@@ -316,7 +428,7 @@ export class RustDiagnosticsEngine {
 				this.waiters.set(key, remaining);
 			}
 			for (const w of ready) {
-				w.resolve(diags);
+				w.resolve({ diagnostics: diags, complete: true });
 			}
 		}
 	}

@@ -352,7 +352,11 @@ export function createReadToolDefinition(
 								const mtimeMs = fileStat?.mtimeMs ?? Date.now();
 								let warmupContent = "";
 								let warmupBuffer: Buffer | undefined;
+								// The chunked path only decodes the selected lines, so the harness must not
+								// treat its text as the whole file (content checks, diagnostics warmup).
+								let warmupContentComplete = true;
 								if (size >= CHUNKED_READ_MIN_BYTES) {
+									warmupContentComplete = false;
 									const file = await fsOpen(absolutePath, "r");
 									let selection: ChunkedSelection | undefined;
 									try {
@@ -407,6 +411,7 @@ export function createReadToolDefinition(
 									mtimeMs,
 									ctx?.cwd || cwd,
 									warmupBuffer,
+									warmupContentComplete,
 								);
 								const userLimitedLines =
 									limit !== undefined ? Math.min(requestedEndLine, totalFileLines) - startLine : undefined;
