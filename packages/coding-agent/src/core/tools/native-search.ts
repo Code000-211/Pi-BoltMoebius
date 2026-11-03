@@ -637,11 +637,20 @@ interface CachedTreeEntry {
 	/** The folders the walk left out, as `normalizeCacheKey` gives them: what is below them is not in the tree. */
 	ignoredDirKeys: Set<string>;
 	dirMtimes: Map<string, number>;
+	/** More folders than MAX_VERIFIED_DIRS: their modification times cannot tell a change after an external one. */
+	partial: boolean;
 	timestamp: number;
 }
 
 const treeCache = new Map<string, CachedTreeEntry>();
 const TREE_CACHE_VERIFY_MS = 2000;
+/** The folders whose modification times tell whether a tree is still current (about 1.5 µs each to check). */
+const MAX_VERIFIED_DIRS = 4096;
+/**
+ * When something may have changed files without a read, edit or write (a bash command): a tree or a file content checked
+ * before this is checked again on its next use, without waiting for its time without checks to end.
+ */
+let externalChangeAt = Number.NEGATIVE_INFINITY;
 
 interface CachedFileBuffer {
 	mtimeMs: number;
@@ -709,6 +718,11 @@ function isBelowIgnoredDir(key: string, tree: CachedTreeEntry): boolean {
 	return false;
 }
 
+/** Files may have changed outside read, edit and write (a bash command ran): check the cached trees and contents again. */
+export function notifySearchExternalChange(): void {
+	externalChangeAt = performance.now();
+}
+
 export function getFileFrecencyScore(filePath: string): number {
 	return frecencyScores.get(normalizeCacheKey(filePath)) ?? 0;
 }
@@ -726,10 +740,11 @@ async function getCachedTree(root: string, requireGit: boolean, signal?: AbortSi
 	const cached = treeCache.get(cacheKey);
 
 	if (cached) {
-		if (now - cached.timestamp < TREE_CACHE_VERIFY_MS) {
+		const changedSince = cached.timestamp <= externalChangeAt;
+		if (now - cached.timestamp < TREE_CACHE_VERIFY_MS && !changedSince) {
 			return cached;
 		}
-		let valid = true;
+		let valid = !(changedSince && cached.partial);
 		for (const [dirPath, oldMtime] of cached.dirMtimes) {
 			try {
 				if (statSync(dirPath).mtimeMs !== oldMtime) {
@@ -765,7 +780,7 @@ async function getCachedTree(root: string, requireGit: boolean, signal?: AbortSi
 		const entry = allEntries[i];
 		displayPaths[i] = entry.kind === "dir" ? `${entry.rel}/` : entry.rel;
 		knownAbsKeys.add(normalizeCacheKey(entry.abs));
-		if (entry.kind === "dir" && dirMtimes.size < 256) {
+		if (entry.kind === "dir" && dirMtimes.size < MAX_VERIFIED_DIRS) {
 			try {
 				dirMtimes.set(entry.abs, statSync(entry.abs).mtimeMs);
 			} catch {
@@ -784,6 +799,7 @@ async function getCachedTree(root: string, requireGit: boolean, signal?: AbortSi
 		knownAbsKeys,
 		ignoredDirKeys: new Set(ignoredDirs.map(normalizeCacheKey)),
 		dirMtimes,
+		partial: dirMtimes.size >= MAX_VERIFIED_DIRS,
 		timestamp: performance.now(),
 	};
 	treeCache.set(cacheKey, treeEntry);
@@ -1492,7 +1508,12 @@ export async function nativeGrep(
 			for (const end = Math.min(files.length, index + STAT_AHEAD); sized < end; sized++) {
 				const fKey = normalizeCacheKey(files[sized]);
 				const cBuf = contentCache.get(fKey);
-				if (cBuf && now - cBuf.verifiedAt < CONTENT_CACHE_STAT_FREE_MS && cBuf.size <= wholeFileBytes) {
+				if (
+					cBuf &&
+					now - cBuf.verifiedAt < CONTENT_CACHE_STAT_FREE_MS &&
+					cBuf.verifiedAt > externalChangeAt &&
+					cBuf.size <= wholeFileBytes
+				) {
 					sizes[sized] = undefined;
 				} else {
 					sizes[sized] = stat(files[sized]).catch(skip);
@@ -1509,6 +1530,7 @@ export async function nativeGrep(
 					cachedBuf &&
 					sizes[requested] === undefined &&
 					now - cachedBuf.verifiedAt < CONTENT_CACHE_STAT_FREE_MS &&
+					cachedBuf.verifiedAt > externalChangeAt &&
 					cachedBuf.size <= wholeFileBytes
 				) {
 					reads[requested] = Promise.resolve(cachedBuf.buffer ?? undefined);

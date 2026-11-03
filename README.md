@@ -30,7 +30,11 @@ literal patterns with a native SIMD search (AVX2 on x86-64, NEON on ARM64).
 <sub>Measured: both implementations in Bun on a 1,400-file C++/HIP project, Linux x86-64 (Ryzen 7 5800X3D); 60 function
 names and 60 words, each searched 5 times, medians; two runs agreed within 0.4 ms.</sub>
 
-- File tree reused for 2 s without checks, then revalidated against the modification times of up to 256 folders.
+- File tree reused for 2 s without checks, then revalidated against the modification times of up to 4096 folders
+  (measured: 0.2 ms for 137 folders, 0.43 ms for 296).
+- After every `bash` command (the agent's or a `!` command) the next `grep` or `find` checks the tree and the files'
+  times at once, so files a command created or changed (`sed -i`, a code generator) are found without waiting out
+  those 2 s and 1.5 s. A tree of more than 4096 folders is walked again then.
 - `grep` with a glob uses the cached tree too (it walked the folders again on every call): the walk keeps the files ignore
   files leave out aside, for globs, which take them as ripgrep's `--glob` does. Measured on the same project, p50 of 24
   searches: `*.cpp` 3.8 → 2.2 ms, `*.{h,hpp}` 2.7 → 1.4 ms, `src/**/*.hip` 1.4 → 0.08 ms.

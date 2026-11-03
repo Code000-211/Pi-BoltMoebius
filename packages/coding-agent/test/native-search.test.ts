@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { createBashTool } from "../src/core/tools/bash.ts";
 import { createFindTool } from "../src/core/tools/find.ts";
 import { createGrepTool } from "../src/core/tools/grep.ts";
 import {
@@ -396,6 +397,30 @@ describe("the cached tree", () => {
 			expect(await find()).toEqual(["a.ts", "new.ts"]);
 		} finally {
 			rmSync(top, { recursive: true, force: true });
+		}
+	});
+
+	test("a bash command's changes are seen by the next grep and find at once", async () => {
+		const project = mkdtempSync(join(tmpdir(), "pi-tree-bash-"));
+		writeFileSync(join(project, "a.txt"), "needle old\n");
+		try {
+			clearNativeSearchCache();
+			const grepped = async () =>
+				(
+					await nativeGrep({ root: project, isDirectory: true, pattern: "needle", limit: 10, keepChars: 200 })
+				).matches
+					.map((m) => `${m.filePath.slice(project.length + 1)}:${m.lineText}`)
+					.sort();
+			expect(await grepped()).toEqual(["a.txt:needle old"]);
+			expect(await nativeFind({ root: project, pattern: "*.txt", limit: 10 })).toEqual(["a.txt"]);
+			// Same size, and within the times the caches are used without checks (2 s, 1.5 s).
+			await createBashTool(project).execute("bash-change", {
+				command: "printf 'needle new\\n' > a.txt && printf 'needle b\\n' > b.txt",
+			});
+			expect(await grepped()).toEqual(["a.txt:needle new", "b.txt:needle b"]);
+			expect(await nativeFind({ root: project, pattern: "*.txt", limit: 10 })).toEqual(["a.txt", "b.txt"]);
+		} finally {
+			rmSync(project, { recursive: true, force: true });
 		}
 	});
 });

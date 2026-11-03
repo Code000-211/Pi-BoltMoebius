@@ -20,6 +20,7 @@ import {
 	untrackDetachedChildPid,
 } from "../../utils/shell.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
+import { notifySearchExternalChange } from "./native-search.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -696,6 +697,8 @@ export function createShellToolDefinition(
 				return { content: [{ type: "text", text: outputText }], details, structuredContent };
 			} finally {
 				clearUpdateTimer();
+				// The command may have created, changed or removed files that grep and find hold in their caches.
+				notifySearchExternalChange();
 			}
 		},
 		...createShellRenderers(config.prompt),
