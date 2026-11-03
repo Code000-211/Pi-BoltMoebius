@@ -87,10 +87,11 @@ fn cut(text: &str, max: usize) -> (String, bool) {
 type CacheKey = (String, u32, u32, Option<String>, u32);
 
 /// Results of recent searches on one index: an agent asks the same thing more than once (the
-/// prompt's recall, then the tool; a retry). Emptied whenever another index takes over.
+/// prompt's recall, then the tool; a retry). Emptied whenever another view takes over (by its
+/// generation: the address of a freed view can come back for the next one).
 #[derive(Default)]
 struct Cache {
-    index: usize,
+    generation: u64,
     results: HashMap<CacheKey, SearchResult>,
 }
 
@@ -132,9 +133,8 @@ impl DocIndex {
         let key: CacheKey = (query.clone(), o.k.unwrap_or(6), o.max_chars.unwrap_or(1500), o.path_prefix.clone(), o.max_per_file.unwrap_or(3));
         {
             let mut cache = self.cache.lock().unwrap();
-            let here = Arc::as_ptr(&ix) as usize;
-            if cache.index != here {
-                cache.index = here;
+            if cache.generation != ix.generation {
+                cache.generation = ix.generation;
                 cache.results.clear();
             }
             if let Some(hit) = cache.results.get(&key) {
@@ -180,7 +180,7 @@ impl DocIndex {
             micros: t0.elapsed().as_micros() as u32,
         };
         let mut cache = self.cache.lock().unwrap();
-        if cache.index == Arc::as_ptr(&ix) as usize {
+        if cache.generation == ix.generation {
             if cache.results.len() >= CACHE_ENTRIES {
                 cache.results.clear();
             }

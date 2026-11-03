@@ -8,7 +8,7 @@
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,7 @@ pub struct Engine {
     ready: Condvar,
     busy: AtomicBool,
     last_check: Mutex<Instant>,
+    generations: AtomicU64,
 }
 
 /// How often a search may trigger a check for changed files. A check costs a scan and, when files
@@ -40,6 +41,8 @@ const OVERLAY_MAX_FILES: usize = 200;
 
 /// What a search runs on: the base index, and the files changed since laid over it.
 pub struct View {
+    /// Which view this is: a new one for every change, never reused (unlike its address once it is freed).
+    pub generation: u64,
     pub base: Arc<Index>,
     overlay: Option<Overlay>,
     /// What the overlay was built from: the changed files, and which files of the base it replaces.
@@ -49,7 +52,7 @@ pub struct View {
 
 impl View {
     fn plain(base: Arc<Index>) -> View {
-        View { base, overlay: None, changed: Vec::new(), gone: Vec::new() }
+        View { generation: 0, base, overlay: None, changed: Vec::new(), gone: Vec::new() }
     }
 
     pub fn search<'a>(&'a self, query: &str, opts: &SearchOpts) -> Results<'a> {
@@ -186,6 +189,7 @@ impl Engine {
             ready: Condvar::new(),
             busy: AtomicBool::new(false),
             last_check: Mutex::new(Instant::now()),
+            generations: AtomicU64::new(0),
         });
         engine.update_in_background(Mode::Start);
         engine
@@ -242,7 +246,8 @@ impl Engine {
         });
     }
 
-    fn set(&self, view: View, from: Option<FileId>) {
+    fn set(&self, mut view: View, from: Option<FileId>) {
+        view.generation = self.generations.fetch_add(1, Ordering::Relaxed) + 1;
         *self.overlay_since.lock().unwrap() = view.overlay.as_ref().map(|_| Instant::now());
         *self.current.lock().unwrap() = Some(Arc::new(view));
         if from.is_some() {
@@ -316,7 +321,7 @@ impl Engine {
         let index = Index::build_from(&self.cfg, changed.clone(), Some(&view.base));
         let excluded = view.base.sections_in(&gone);
         let base = Arc::clone(&view.base);
-        self.set(View { base, overlay: Some(Overlay { index, excluded }), changed, gone }, None);
+        self.set(View { generation: 0, base, overlay: Some(Overlay { index, excluded }), changed, gone }, None);
     }
 
     /// Rebuilds everything; one process at a time saves, the others wait here and take its file.
@@ -351,5 +356,39 @@ impl Engine {
         }
         // Saving failed (a full or read-only disk): keep the build in memory.
         self.set(View::plain(Arc::new(built)), None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_view_has_a_new_generation() {
+        let dir = std::env::temp_dir().join(format!("docsearch-test-generation-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.md"), "# Title\n\nSome text about generations.\n").unwrap();
+        let cfg = Config {
+            roots: vec![dir.clone()],
+            extensions: vec!["md".into()],
+            max_file_bytes: 1 << 20,
+            max_files: 100,
+            extra_entities: Some(Default::default()), // (Not saved: built in memory.)
+        };
+        let engine = Engine::start(cfg);
+        let first = engine.index(Duration::from_secs(10)).unwrap().generation;
+        assert!(first > 0);
+        while engine.building() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        engine.rebuild_in_background();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut next = first;
+        while next == first && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            next = engine.index(Duration::ZERO).unwrap().generation;
+        }
+        assert!(next > first);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
