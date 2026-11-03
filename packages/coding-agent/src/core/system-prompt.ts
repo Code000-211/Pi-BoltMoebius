@@ -120,6 +120,14 @@ function buildRules(
 		for (const rule of toolGuidelines[name] ?? []) addRule(rule);
 	}
 	for (const rule of promptGuidelines) addRule(rule);
+	if (selectedTools.length > 0) {
+		addRule(
+			"If you intend to call multiple tools and there are no dependencies between them, make all independent tool calls in parallel in a single response",
+		);
+	}
+	addRule(
+		"Keep changes surgical and focused on the request: do not add unrequested features, refactor unrelated code, or add comments/docstrings to code you did not change",
+	);
 	addRule("Be concise in your responses");
 	addRule("Show file paths clearly when working with files");
 	return rules.map((rule) => `- ${rule}`).join("\n");

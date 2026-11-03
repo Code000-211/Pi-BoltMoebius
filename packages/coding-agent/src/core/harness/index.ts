@@ -11,6 +11,7 @@ export {
 	type CustomDiagnosticsProvider,
 	defaultClaudeHarnessManager,
 	formatLateDiagnosticsReminder,
+	formatNestedInstructionsReminder,
 	formatNewDiagnosticsBlock,
 	formatPostEditSnippet,
 } from "./diagnostics-manager.ts";

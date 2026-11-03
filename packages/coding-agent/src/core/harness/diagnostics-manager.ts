@@ -1,7 +1,39 @@
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { stripBom } from "../../utils/text.ts";
 import { notifySearchFileTouched } from "../tools/native-search.ts";
 import { CppHipDiagnosticsEngine } from "./cpp-hip-engine.ts";
 import { FileStateTracker, type HarnessDiagnostic, isCppOrHipFile, isRustFile } from "./file-state-tracker.ts";
 import { type LateRustDiagnosticBatch, RustDiagnosticsEngine } from "./rust-engine.ts";
+
+const NESTED_INSTRUCTION_CANDIDATES = ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
+
+function loadInstructionFileFromDir(dir: string): { path: string; content: string } | null {
+	for (const filename of NESTED_INSTRUCTION_CANDIDATES) {
+		const filePath = join(dir, filename);
+		if (!existsSync(filePath)) continue;
+		try {
+			if (!statSync(filePath).isFile()) continue;
+			return {
+				path: filePath,
+				content: stripBom(readFileSync(filePath, "utf-8")),
+			};
+		} catch {
+			// Ignore unreadable files
+		}
+	}
+	return null;
+}
+
+/**
+ * Format nested `CLAUDE.md` / `AGENTS.md` files discovered on `read`, matching Claude Code's
+ * `mods/agents-md` framing (`Contents of <path>:\n\n<content>`).
+ */
+export function formatNestedInstructionsReminder(files: Array<{ path: string; content: string }>): string {
+	if (files.length === 0) return "";
+	const frames = files.map((f) => `Contents of ${f.path}:\n\n${f.content.trimEnd()}`);
+	return `\n\n<system-reminder>\n${frames.join("\n\n")}\n</system-reminder>`;
+}
 
 export type CustomDiagnosticsProvider = (
 	absolutePath: string,
@@ -171,14 +203,24 @@ export class ClaudeHarnessManager {
 			this.inflightWarmups.set(absolutePath, p);
 		}
 
-		return this.drainPendingSystemReminder();
+		const nestedFiles = this.stateTracker.discoverNestedInstructionsOnRead(
+			absolutePath,
+			workspaceCwd,
+			loadInstructionFileFromDir,
+		);
+		const nestedReminder = formatNestedInstructionsReminder(nestedFiles);
+		return `${nestedReminder}${this.drainPendingSystemReminder()}`;
 	}
 
 	/**
-	 * Verify Read-Before-Edit & mtime staleness guard before modifying an existing file.
+	 * Verify Read-Before-Edit, mtime staleness & content equality guard before modifying an existing file.
 	 */
-	assertCanModifyExistingFile(absolutePath: string, currentMtimeMs: number | undefined): void {
-		this.stateTracker.assertCanModifyExistingFile(absolutePath, currentMtimeMs);
+	assertCanModifyExistingFile(
+		absolutePath: string,
+		currentMtimeMs: number | undefined,
+		currentContent?: string,
+	): void {
+		this.stateTracker.assertCanModifyExistingFile(absolutePath, currentMtimeMs, currentContent);
 	}
 
 	/**

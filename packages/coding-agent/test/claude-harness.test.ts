@@ -655,4 +655,55 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		const lsRes = await lsTool.execute("ls-fast", {});
 		expect(getText(lsRes)).toContain("fast.txt");
 	});
+
+	it("discovers nested CLAUDE.md and AGENTS.md files on read once per session and checks content staleness", async () => {
+		const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
+		const readTool = createReadTool(testDir, { harness });
+		const editTool = createEditTool(testDir, {
+			harness,
+			enforceReadBeforeEdit: true,
+			enableDiagnostics: false,
+		});
+
+		// Root CLAUDE.md (already loaded at startup -> must NOT be re-attached on read)
+		writeFileSync(join(testDir, "CLAUDE.md"), "# Root rules\n", "utf-8");
+
+		// Nested directory with its own CLAUDE.md and source files
+		const subDir = join(testDir, "packages", "kernels");
+		mkdirSync(subDir, { recursive: true });
+		const nestedClaudeMd = join(subDir, "CLAUDE.md");
+		writeFileSync(nestedClaudeMd, "Always use __launch_bounds__(256) in this package.\n", "utf-8");
+
+		const fileA = join(subDir, "matmul.hip");
+		const fileB = join(subDir, "softmax.hip");
+		writeFileSync(fileA, "__global__ void matmul() {}\n", "utf-8");
+		writeFileSync(fileB, "__global__ void softmax() {}\n", "utf-8");
+
+		// 1st read in packages/kernels attaches nested CLAUDE.md in <system-reminder>, but NOT root CLAUDE.md
+		const readA = await readTool.execute("r-nested-1", { path: "packages/kernels/matmul.hip" });
+		const textA = getText(readA);
+		expect(textA).toContain("<system-reminder>");
+		expect(textA).toContain(`Contents of ${nestedClaudeMd}:`);
+		expect(textA).toContain("Always use __launch_bounds__(256) in this package.");
+		expect(textA).not.toContain("# Root rules");
+
+		// 2nd read in the same subdirectory must NOT re-attach the already-delivered nested CLAUDE.md
+		const readB = await readTool.execute("r-nested-2", { path: "packages/kernels/softmax.hip" });
+		const textB = getText(readB);
+		expect(textB).not.toContain("Always use __launch_bounds__(256) in this package.");
+
+		// Content-equality staleness guard: modify fileB externally while preserving exact mtime
+		const preservedDate = new Date();
+		utimesSync(fileB, preservedDate, preservedDate);
+		await readTool.execute("r-nested-3", { path: "packages/kernels/softmax.hip" });
+		writeFileSync(fileB, "__global__ void softmax() { /* external sub-ms edit */ }\n", "utf-8");
+		utimesSync(fileB, preservedDate, preservedDate);
+
+		await expect(
+			editTool.execute("e-content-stale", {
+				path: "packages/kernels/softmax.hip",
+				edits: [{ oldText: "__global__ void softmax()", newText: "__global__ void softmax_v2()" }],
+			}),
+		).rejects.toThrow(/File has been modified since it was last read/);
+	});
 });

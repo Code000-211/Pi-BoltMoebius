@@ -196,20 +196,20 @@ export function createEditToolDefinition(
 				}
 				throwIfAborted();
 
-				if (enforceReadBeforeEdit) {
-					if (!harness.stateTracker.hasBeenRead(absolutePath)) {
-						harness.assertCanModifyExistingFile(absolutePath, undefined);
-					}
-					const beforeStat =
-						ops === defaultEditOperations ? await fsStat(absolutePath).catch(() => undefined) : undefined;
-					harness.assertCanModifyExistingFile(absolutePath, beforeStat?.mtimeMs);
-					throwIfAborted();
-				}
-
 				// Read the file.
 				const buffer = await ops.readFile(absolutePath);
 				const rawContent = buffer.toString("utf-8");
 				throwIfAborted();
+
+				if (enforceReadBeforeEdit) {
+					if (!harness.stateTracker.hasBeenRead(absolutePath)) {
+						harness.assertCanModifyExistingFile(absolutePath, undefined, rawContent);
+					}
+					const beforeStat =
+						ops === defaultEditOperations ? await fsStat(absolutePath).catch(() => undefined) : undefined;
+					harness.assertCanModifyExistingFile(absolutePath, beforeStat?.mtimeMs, rawContent);
+					throwIfAborted();
+				}
 
 				// Strip BOM before matching. The model will not include an invisible BOM in oldText.
 				const { bom, text: content } = splitBom(rawContent);

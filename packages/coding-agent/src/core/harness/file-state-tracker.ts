@@ -52,11 +52,98 @@ const LOCAL_INCLUDE_REGEX = /^\s*#\s*include\s*"([^"]+)"/gm;
 export class FileStateTracker {
 	private readonly files = new Map<string, TrackedFileState>();
 	private readonly headerToHostSource = new Map<string, string>();
+	private readonly dirInstructionCache = new Map<string, { path: string; content: string } | null>();
+	private readonly sentNestedInstructions = new Set<string>();
 	private lastActiveCppHipSource: string | undefined;
 
 	private normalizeKey(filePath: string): string {
 		const norm = normalize(resolve(filePath));
 		return process.platform === "win32" ? norm.toLowerCase() : norm;
+	}
+
+	/**
+	 * Verify that an existing file was previously read in this session and has not been modified
+	 * externally since the last read/edit (checks both mtimeMs and exact content when provided).
+	 */
+	assertCanModifyExistingFile(
+		absolutePath: string,
+		currentMtimeMs: number | undefined,
+		currentContent?: string,
+	): void {
+		const key = this.normalizeKey(absolutePath);
+		const state = this.files.get(key);
+		if (!state) {
+			throw new Error("File has not been read yet. Read it first before writing to it.");
+		}
+		// Allow a 10ms tolerance for filesystem timestamp quantization across platforms
+		if (currentMtimeMs !== undefined && currentMtimeMs > state.lastReadMtimeMs + 10) {
+			throw new Error(
+				"File has been modified since it was last read (either by the user or an external tool). Read the file again before editing it.",
+			);
+		}
+		// Also guard against sub-millisecond external modifications where mtimeMs did not advance
+		// (Claude Code v2.1.295 parity: compare exact content when available).
+		if (currentContent !== undefined && state.content.length > 0 && currentContent !== state.content) {
+			throw new Error(
+				"File has been modified since it was last read (either by the user or an external tool). Read the file again before editing it.",
+			);
+		}
+	}
+
+	/**
+	 * Discover any unseen nested `CLAUDE.md` / `AGENTS.md` files in directories strictly below
+	 * `workspaceCwd` up to `dirname(readAbsolutePath)` (matching Claude Code's `mods/agents-md`
+	 * on-read hook). Each nested instruction file is returned at most once per session.
+	 */
+	discoverNestedInstructionsOnRead(
+		readAbsolutePath: string,
+		workspaceCwd: string,
+		findInstructionInDir: (dir: string) => { path: string; content: string } | null,
+	): Array<{ path: string; content: string }> {
+		const rootNorm = normalize(resolve(workspaceCwd));
+		const rootKey = this.normalizeKey(rootNorm);
+		const readNorm = normalize(resolve(readAbsolutePath));
+		const readKey = this.normalizeKey(readNorm);
+		const sep = process.platform === "win32" ? "\\" : "/";
+		const rootPrefix = rootKey.endsWith(sep) ? rootKey : `${rootKey}${sep}`;
+		if (!readKey.startsWith(rootPrefix)) {
+			return [];
+		}
+
+		// Collect ancestor directories between rootNorm (exclusive) and dirname(readNorm) (inclusive), root-first.
+		const dirs: string[] = [];
+		let currentDir = dirname(readNorm);
+		while (true) {
+			const currentKey = this.normalizeKey(currentDir);
+			if (currentKey === rootKey || !currentKey.startsWith(rootPrefix)) break;
+			dirs.push(currentDir);
+			const parentDir = dirname(currentDir);
+			if (parentDir === currentDir) break;
+			currentDir = parentDir;
+		}
+		if (dirs.length === 0) return [];
+		dirs.reverse();
+
+		const attached: Array<{ path: string; content: string }> = [];
+		for (const dir of dirs) {
+			const dirKey = this.normalizeKey(dir);
+			let cached = this.dirInstructionCache.get(dirKey);
+			if (cached === undefined) {
+				cached = findInstructionInDir(dir);
+				this.dirInstructionCache.set(dirKey, cached);
+			}
+			if (!cached) continue;
+			const fileKey = this.normalizeKey(cached.path);
+			// If the user explicitly called Read on the instruction file itself, mark it as seen without duplicating it
+			if (fileKey === readKey) {
+				this.sentNestedInstructions.add(fileKey);
+				continue;
+			}
+			if (this.sentNestedInstructions.has(fileKey)) continue;
+			this.sentNestedInstructions.add(fileKey);
+			attached.push(cached);
+		}
+		return attached;
 	}
 
 	/**
@@ -137,24 +224,6 @@ export class FileStateTracker {
 		return diagnostics.filter((diag) => !baseline.has(diagnosticFingerprint(diag)));
 	}
 
-	/**
-	 * Verify that an existing file was previously read in this session and has not been modified
-	 * externally since the last read/edit.
-	 */
-	assertCanModifyExistingFile(absolutePath: string, currentMtimeMs: number | undefined): void {
-		const key = this.normalizeKey(absolutePath);
-		const state = this.files.get(key);
-		if (!state) {
-			throw new Error("File has not been read yet. Read it first before writing to it.");
-		}
-		// Allow a 10ms tolerance for filesystem timestamp quantization across platforms
-		if (currentMtimeMs !== undefined && currentMtimeMs > state.lastReadMtimeMs + 10) {
-			throw new Error(
-				"File has been modified since it was last read (either by the user or an external tool). Read the file again before editing it.",
-			);
-		}
-	}
-
 	hasBeenRead(absolutePath: string): boolean {
 		return this.files.has(this.normalizeKey(absolutePath));
 	}
@@ -201,6 +270,8 @@ export class FileStateTracker {
 	clear(): void {
 		this.files.clear();
 		this.headerToHostSource.clear();
+		this.dirInstructionCache.clear();
+		this.sentNestedInstructions.clear();
 		this.lastActiveCppHipSource = undefined;
 	}
 }
