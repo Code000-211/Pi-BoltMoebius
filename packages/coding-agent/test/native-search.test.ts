@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
@@ -9,10 +9,12 @@ import { createGrepTool } from "../src/core/tools/grep.ts";
 import {
 	clearNativeSearchCache,
 	compileGlob,
+	contentCacheStats,
 	expandBraces,
 	globMatch,
 	nativeFind,
 	nativeGrep,
+	notifySearchExternalChange,
 	notifySearchFileTouched,
 	requiredLiteral,
 	translatePattern,
@@ -419,6 +421,36 @@ describe("the cached tree", () => {
 			});
 			expect(await grepped()).toEqual(["a.txt:needle new", "b.txt:needle b"]);
 			expect(await nativeFind({ root: project, pattern: "*.txt", limit: 10 })).toEqual(["a.txt", "b.txt"]);
+		} finally {
+			rmSync(project, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("the content cache", () => {
+	test("counts what it holds when files change, and stays within its pool", async () => {
+		const project = mkdtempSync(join(tmpdir(), "pi-content-cache-"));
+		const file = join(project, "a.txt");
+		try {
+			clearNativeSearchCache();
+			for (let i = 0; i < 20; i++) {
+				writeFileSync(file, `needle ${"x".repeat(1000 + i)}\n`);
+				utimesSync(file, new Date(Date.now() + i * 1000), new Date(Date.now() + i * 1000));
+				notifySearchExternalChange();
+				await nativeGrep({ root: project, isDirectory: true, pattern: "needle", limit: 10, keepChars: 50 });
+			}
+			const stats = contentCacheStats();
+			expect(stats.files).toBe(1);
+			expect(stats.counted).toBe(stats.held);
+			expect(stats.held).toBe(1000 + 19 + 8);
+
+			// 140 files of 500 KB: more than the 64 MB pool, the first ones dropped.
+			const big = `needle ${"y".repeat(500 * 1024 - 8)}\n`;
+			for (let i = 0; i < 140; i++) notifySearchFileTouched(join(project, `big${i}.txt`), big, Date.now());
+			const full = contentCacheStats();
+			expect(full.counted).toBe(full.held);
+			expect(full.held).toBeLessThanOrEqual(64 * 1024 * 1024);
+			expect(full.files).toBeLessThan(141);
 		} finally {
 			rmSync(project, { recursive: true, force: true });
 		}

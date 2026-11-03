@@ -38,7 +38,9 @@ names and 60 words, each searched 5 times, medians; two runs agreed within 0.4 m
 - `grep` with a glob uses the cached tree too (it walked the folders again on every call): the walk keeps the files ignore
   files leave out aside, for globs, which take them as ripgrep's `--glob` does. Measured on the same project, p50 of 24
   searches: `*.cpp` 3.8 → 2.2 ms, `*.{h,hpp}` 2.7 → 1.4 ms, `src/**/*.hip` 1.4 → 0.08 ms.
-- Contents cached up to 64 MB in all and 512 KB per file; within 1.5 s of a check, a file is not stat'ed again.
+- Contents cached up to 64 MB in all and 512 KB per file; within 1.5 s of a check, a file is not stat'ed again. When the
+  pool is full, the files stored longest ago go first. (Before, a changed file's old bytes stayed counted, so after
+  64 MB of changes nothing new was cached, and files read or written were added past the limit.)
 - A file read or written that the cached tree does not know makes it walk again only when the file is in its folder and
   not below a folder an ignore file leaves out (before: every cached tree, for any such file, such as a read in `build/`).
 - A `find` glob that matches nothing returns the closest paths by fuzzy match instead.

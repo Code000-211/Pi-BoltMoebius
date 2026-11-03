@@ -659,11 +659,43 @@ interface CachedFileBuffer {
 	buffer: Buffer | null; // null means binary file (has NUL byte)
 }
 
+/** In the order stored (a file stored again moves to the end): the first are dropped when the pool is full. */
 const contentCache = new Map<string, CachedFileBuffer>();
 let contentCacheBytes = 0;
 const MAX_CONTENT_CACHE_BYTES = 64 * 1024 * 1024; // 64 MB hot buffer pool
 const MAX_CACHED_FILE_BYTES = 512 * 1024; // Cache individual source files up to 512 KB
 const CONTENT_CACHE_STAT_FREE_MS = 1500;
+
+/** Stores a file's content (`buffer` null for a binary file), dropping the files stored longest ago past the pool's size. */
+function storeContent(key: string, mtimeMs: number, buffer: Buffer): void {
+	const previous = contentCache.get(key);
+	if (previous) {
+		if (previous.buffer) contentCacheBytes -= previous.buffer.length;
+		contentCache.delete(key);
+	}
+	if (buffer.length > MAX_CACHED_FILE_BYTES) return;
+	const binary = buffer.indexOf(0) !== -1;
+	contentCache.set(key, {
+		mtimeMs,
+		size: buffer.length,
+		verifiedAt: performance.now(),
+		buffer: binary ? null : buffer,
+	});
+	if (binary) return;
+	contentCacheBytes += buffer.length;
+	for (const [oldKey, old] of contentCache) {
+		if (contentCacheBytes <= MAX_CONTENT_CACHE_BYTES) break;
+		if (old.buffer) contentCacheBytes -= old.buffer.length;
+		contentCache.delete(oldKey);
+	}
+}
+
+/** For tests: the bytes the content cache holds, by its count and by its entries. */
+export function contentCacheStats(): { counted: number; held: number; files: number } {
+	let held = 0;
+	for (const entry of contentCache.values()) held += entry.buffer?.length ?? 0;
+	return { counted: contentCacheBytes, held, files: contentCache.size };
+}
 
 const frecencyScores = new Map<string, number>();
 
@@ -678,19 +710,7 @@ export function notifySearchFileTouched(filePath: string, content?: string | Buf
 	frecencyScores.set(key, (frecencyScores.get(key) ?? 0) + 10);
 
 	if (content !== undefined && mtimeMs !== undefined) {
-		const buf = typeof content === "string" ? Buffer.from(content, "utf8") : content;
-		if (buf.length <= MAX_CACHED_FILE_BYTES) {
-			const prev = contentCache.get(key);
-			if (prev?.buffer) contentCacheBytes -= prev.buffer.length;
-			const isBin = buf.indexOf(0) !== -1;
-			contentCache.set(key, {
-				mtimeMs,
-				size: buf.length,
-				verifiedAt: performance.now(),
-				buffer: isBin ? null : buf,
-			});
-			if (!isBin) contentCacheBytes += buf.length;
-		}
+		storeContent(key, mtimeMs, typeof content === "string" ? Buffer.from(content, "utf8") : content);
 	}
 
 	// A tree is walked again only when the file belongs in it and it does not know the file (one the agent created): not for
@@ -1546,19 +1566,7 @@ export async function nativeGrep(
 						}
 						return readFile(file)
 							.then((buf) => {
-								if (
-									buf.length <= MAX_CACHED_FILE_BYTES &&
-									contentCacheBytes + buf.length <= MAX_CONTENT_CACHE_BYTES
-								) {
-									const isBin = buf.indexOf(0) !== -1;
-									contentCache.set(cacheKey, {
-										mtimeMs: stats.mtimeMs,
-										size: stats.size,
-										verifiedAt: performance.now(),
-										buffer: isBin ? null : buf,
-									});
-									if (!isBin) contentCacheBytes += buf.length;
-								}
+								storeContent(cacheKey, stats.mtimeMs, buf);
 								return buf;
 							})
 							.catch(skip);
