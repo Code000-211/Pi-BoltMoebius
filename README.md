@@ -180,7 +180,12 @@ Melious lists that are not built in are added. Without a connection, the built-i
 
 ## Tests
 
-- `packages/coding-agent/test/claude-harness.test.ts`: 18 cases, with mock clangd and rust-analyzer, for the diagnostics,
+- `packages/coding-agent/test/claude-harness.test.ts`: 26 cases, with mock clangd and rust-analyzer, for the diagnostics,
   read before edit, nested instruction files, the search caches, the bash fast paths and the edit fallback.
+- `packages/coding-agent/test/cpp-hip-engine.test.ts`: 3 cases against real libclang (skipped when the bridge is not
+  built): flags changed or kept per unit, the 8 units kept, a header checked in the source that includes it.
+- `packages/coding-agent/test/tool-result-pruning.test.ts`: 5 cases for clearing old tool results.
+- `packages/coding-agent/test/native-search.test.ts` and `tools.test.ts`: the fork's cases for the search caches (globs,
+  invalidation, bash changes, the content pool), the bash tool's output and the edit tool's closest-text hint.
 - `packages/ai/test/melious-models.test.ts`: 3 cases for the Melious catalog.
-- `packages/docsearch`: 11 Rust tests, and test sets that measure a change query by query (`eval/`).
+- `packages/docsearch`: 17 Rust tests, and test sets that measure a change query by query (`eval/`).
