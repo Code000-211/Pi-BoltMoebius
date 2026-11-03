@@ -18,11 +18,16 @@ function summaryMaxTokens(options: TSchemaOptions = {}) {
 	return Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER, ...options });
 }
 
+function maxContextTokens(options: TSchemaOptions = {}) {
+	return Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER, ...options });
+}
+
 const CompactionModelOverrideSchema = Type.Object({
 	reserveTokens: Type.Optional(nonNegativeSafeInteger()),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger()),
 	thresholdPercent: Type.Optional(compactionThresholdPercent()),
 	summaryMaxTokens: Type.Optional(summaryMaxTokens()),
+	maxContextTokens: Type.Optional(maxContextTokens()),
 });
 
 const CompactionSettingsSchema = Type.Object({
@@ -52,6 +57,13 @@ const CompactionSettingsSchema = Type.Object({
 		summaryMaxTokens({
 			description:
 				"Output cap of a compaction summary; a split turn's prefix summary gets half. Unset: the largest of 80% of reserveTokens, 4096 and (while reserveTokens is unset) 3.2% of the context window, capped by the model's output limit.",
+		}),
+	),
+	maxContextTokens: Type.Optional(
+		maxContextTokens({
+			description:
+				"Compact once the context exceeds this many tokens, however large the context window. Every later turn re-reads the whole context, so a long session on a 1M-token model slows down well before 90% of the window. The context-window shares of keepRecentTokens and the summary cap are taken of the window capped at this size.",
+			default: SETTINGS_DEFAULTS.compaction.maxContextTokens,
 		}),
 	),
 	modelOverrides: Type.Optional(

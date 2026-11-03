@@ -131,6 +131,13 @@
           "maximum": 9007199254740991,
           "description": "Output cap of a compaction summary; a split turn's prefix summary gets half. Unset: the largest of 80% of reserveTokens, 4096 and (while reserveTokens is unset) 3.2% of the context window, capped by the model's output limit."
         },
+        "maxContextTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "Compact once the context exceeds this many tokens, however large the context window. Every later turn re-reads the whole context, so a long session on a 1M-token model slows down well before 90% of the window. The context-window shares of keepRecentTokens and the summary cap are taken of the window capped at this size.",
+          "default": 128000
+        },
         "modelOverrides": {
           "type": "object",
           "patternProperties": {
@@ -153,6 +160,11 @@
                   "maximum": 100
                 },
                 "summaryMaxTokens": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "maxContextTokens": {
                   "type": "integer",
                   "minimum": 1,
                   "maximum": 9007199254740991

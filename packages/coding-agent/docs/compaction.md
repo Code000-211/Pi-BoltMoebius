@@ -29,10 +29,10 @@ Both use closely related structured formats and track file operations cumulative
 Auto-compaction triggers when:
 
 ```
-contextTokens > min(contextWindow - reserveTokens, floor(contextWindow * thresholdPercent / 100))
+contextTokens > min(contextWindow - reserveTokens, floor(contextWindow * thresholdPercent / 100), maxContextTokens)
 ```
 
-By default, `reserveTokens` is 16384 tokens and `thresholdPercent` is 90 (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`). The reserve leaves room for the LLM's response; the percentage keeps headroom on large context windows, where 16384 tokens is a small share. Up to a 163840-token window the reserve is the lower limit, so the threshold is `contextWindow - reserveTokens`.
+By default, `reserveTokens` is 16384 tokens, `thresholdPercent` is 90 and `maxContextTokens` is 128000 (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`). The reserve leaves room for the LLM's response; the percentage keeps headroom on large context windows, where 16384 tokens is a small share. `maxContextTokens` keeps sessions on large windows fast: each turn re-reads the whole context, so past about 128000 tokens every turn pays for history the model rarely needs. Up to a 142222-token window the reserve or the percentage is the lower limit; above it, `maxContextTokens` is.
 
 A compaction summary may produce at most the largest of 80% of `reserveTokens`, 4096 tokens and 3.2% of the summarizer's context window, capped by the model's output limit. A split turn's prefix summary gets half the shares: 50% of `reserveTokens`, 4096 tokens or 1.6% of the window. If reasoning uses that whole limit, the summary is requested again without reasoning.
 
@@ -41,8 +41,10 @@ The defaults scale with the context window only while the matching setting is un
 | Context window | Threshold | `keepRecentTokens` | Summary cap (split-turn prefix) |
 |---|---|---|---|
 | 128K (128000) | 111616 (`contextWindow - reserveTokens`) | 20000 | 13107 (8192) |
-| 200K (200000) | 180000 (90%) | 20000 | 13107 (8192) |
-| 1M (1000000) | 900000 (90%) | 50000 (5%) | 32000 (16000) |
+| 200K (200000) | 128000 (`maxContextTokens`) | 20000 | 13107 (8192) |
+| 1M (1000000) | 128000 (`maxContextTokens`) | 20000 | 13107 (8192) |
+
+The window shares (5% kept, 3.2% summary cap) are taken of the window capped at `maxContextTokens`; with `"maxContextTokens": 1000000`, a 1M window compacts at 900000, keeps 50000 and caps the summary at 32000 (16000). Setting `reserveTokens` or `thresholdPercent` turns off the `maxContextTokens` default, as `reserveTokens` turns off the `thresholdPercent` default.
 
 Summary caps are also capped by the model's output limit. Setting `reserveTokens` (globally or in a model override) restores `contextWindow - reserveTokens` as the threshold and 80% of `reserveTokens` (at least 4096) as the summary cap, unless `thresholdPercent` or `summaryMaxTokens` is set too. Setting `keepRecentTokens` keeps that many tokens on every window. Setting `summaryMaxTokens` fixes the summary cap (half of it for a split turn's prefix).
 
@@ -457,6 +459,7 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 | `keepRecentTokens` | larger of `20000` and 5% of the context window | Recent tokens to keep (not summarized) |
 | `thresholdPercent` | `90` while `reserveTokens` is unset | Also compact above this percentage of the context window, when that is below `contextWindow - reserveTokens`. An integer from 1 to 100 |
 | `summaryMaxTokens` | see [When It Triggers](#when-it-triggers) | Output cap of a summary; a split turn's prefix gets half. Capped by the model's output limit |
+| `maxContextTokens` | `128000` while `reserveTokens` and `thresholdPercent` are unset | Also compact above this many tokens, whatever the window. A positive integer |
 
 Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`.
 
