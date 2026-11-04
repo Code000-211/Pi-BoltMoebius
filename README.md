@@ -16,6 +16,7 @@ The executable is still called `pi-bolt`, and Pi-Bolt's commands (`pi-bolt compi
 | [Editing](#compiler-diagnostics-after-every-edit) | The compiler's new errors come back with every `edit`/`write` (C, C++, HIP, Rust) | Rust edit without errors 401 → **104 ms** |
 | [Editing](#fewer-refused-edits) | An exact edit applies even to a file seen only through bash | 21% of real edits were refused before |
 | [Editing](#edit-matching) | Edits that miss by indentation still apply; a miss shows the closest lines | |
+| [Editing](#no-edits-behind-the-edit-tools-back) | `sed -i` and text redirected into files are sent to `edit`/`write`, which check what they change | 65 of 2,615 real commands |
 | [Commands](#background-jobs-instead-of-sleep) | Long commands become background jobs that wake the agent; a `wait` tool; no fixed `sleep` | 97 real `sleep` calls had waited 3.2 h |
 | [Commands](#job-hub) | A job hub (`alt+j`): every background job, its live output, stop with `x` | |
 | [Commands](#bash-output-and-speed) | Output keeps the first error *and* the summary; read-only commands start while the model still writes | |
@@ -27,7 +28,8 @@ The executable is still called `pi-bolt`, and Pi-Bolt's commands (`pi-bolt compi
 - [Install](#install)
 - [Finding code](#finding-code) · [project_search](#project_search)
 - [Editing](#editing): [diagnostics](#compiler-diagnostics-after-every-edit) ·
-  [fewer refused edits](#fewer-refused-edits) · [edit matching](#edit-matching)
+  [fewer refused edits](#fewer-refused-edits) · [edit matching](#edit-matching) ·
+  [no edits behind the edit tool's back](#no-edits-behind-the-edit-tools-back)
 - [Running commands](#running-commands): [background jobs](#background-jobs-instead-of-sleep) ·
   [job hub](#job-hub) · [output and speed](#bash-output-and-speed)
 - [Context and compaction](#context-and-compaction)
@@ -199,6 +201,20 @@ sessions (23 Oct – 1 Nov 2026) that was **21% of all edits** (49 of 232), 3.7 
 - When the agent reads a file, the `AGENTS.override.md`, `AGENTS.md` or `CLAUDE.md` of each folder between the project
   root and that file is added to the result, once per session (as Claude Code does).
 
+### No edits behind the edit tool's back
+
+Models often change files through bash instead: Claude Opus changed files with bash 155 times and with `edit` 25 times
+in real sessions. Those changes skip everything above. While the `edit` tool is there, the bash tool refuses a command
+that changes a file as `edit` or `write` would and says to use them:
+
+- `sed -i` and `perl -i` on a file;
+- text the command spells out (`echo`, `printf`, a heredoc through `cat` or `tee`) written into a file.
+
+Appends (`>>`, `tee -a`), files under `/tmp` (also after `cd /tmp`), a program's output redirected into a file
+(`make > build.log`) and anything inside quotes, such as a command run over `ssh`, still run. Of the 2,615 bash commands
+in Pi's sessions (20 Oct – 4 Nov 2026), it would have refused 65 (42 `sed -i`, 33 redirections). Scripts that rewrite
+files (`python3 - <<EOF … open(p, "w")`) are not caught; bash's guidelines ask for `edit` and `write` instead.
+
 ## Running commands
 
 ### Background jobs instead of sleep
@@ -308,6 +324,7 @@ Everything above is on by default.
 | `PI_BASH_AUTO_BACKGROUND=off` | Keep commands in the foreground unless the call asks for `background: true` |
 | `PI_BASH_SLEEP_GUARD=off` | Run fixed sleeps over 10 s |
 | `PI_EARLY_BASH=off` | Start read-only commands only after the model's message |
+| `PI_BASH_EDIT_GUARD=off` | Run `sed -i` and text redirected into files |
 | `PI_RUST_ANALYZER_TARGET_DIR` | `shared` to let cargo check use `target/`, or a folder |
 | `LIBCLANG_PATH`, `CLANGD_PATH`, `RUST_ANALYZER_PATH` | Where the diagnostics tools are |
 | `HCC_AMDGPU_TARGET`, `HIP_OFFLOAD_ARCH` | GPU target for HIP diagnostics (default `gfx1100`) |
@@ -322,6 +339,7 @@ Pi-Lightspeed's own tests, in `packages/coding-agent` unless noted:
 - `test/cpp-hip-engine.test.ts`: against real libclang (skipped when the bridge is not built).
 - `test/background-jobs.test.ts`, `test/suite/agent-session-bash-background.test.ts`, `test/job-hub.test.ts`: jobs,
   their reports and wake-ups, `wait`, the sleep guard and the hub.
+- `test/bash-file-writes.test.ts`: which commands count as changing files, and the bash tool refusing them.
 - `test/suite/request-prefix.test.ts`: every request starts with the previous one; a snapshot of the built-in tool
   schemas.
 - `test/tool-result-pruning.test.ts`, `test/native-search.test.ts`, `test/tools.test.ts`, and

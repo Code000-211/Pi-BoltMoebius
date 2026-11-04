@@ -4081,6 +4081,7 @@ export class AgentSession {
 						commandPrefix: shellCommandPrefix,
 						shellPath,
 						backgroundJobs: this.backgroundJobs,
+						editToolActive: () => this.agent.state.tools.some((tool) => tool.name === "edit"),
 					},
 					wait: { backgroundJobs: this.backgroundJobs },
 				});
