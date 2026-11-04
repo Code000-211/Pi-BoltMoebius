@@ -209,6 +209,12 @@ and that file is added to the result, once per session (as Claude Code does). Th
   then does not come again as a message. With no job running it returns at once. A wait with nothing ending returns
   after 5 s, the next one right after it after 10 s, then 30 s, 60 s and 5 min; from the second one on, it tells the
   model to go on with other work. A message from the user ends a wait.
+- A command that sleeps a fixed time over 10 s outside a loop (`sleep 295; tail build.log`) is not run: the error tells
+  the model to call `wait` for a background job, or to wait for the thing itself in a loop (`until curl -sf ...; do
+  sleep 2; done`, or over ssh for a job on another machine), which ends as soon as it holds and goes to the background
+  after a minute. Sleeps inside a loop's body, of up to 10 s, or in a command started with `background: true` run. Of
+  the 97 `sleep` calls in Pi's sessions (20 Oct – 4 Nov 2026), it would have refused 28. `PI_BASH_SLEEP_GUARD=off`
+  turns it off.
 - Commands that only read (`git status/log/diff/show`, `cat`, `rg`, `grep`, `find` without `-exec`/`-delete`, ...,
   joined by pipes, `&&`, `||`, `;`; no redirections or substitutions) start while the model's message still streams, as
   read and grep do. Measured: a faux model at 100–1000 tokens/s with three such calls gets their results when the

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type BackgroundJob, BackgroundJobs, formatJobReport } from "../src/core/background-jobs.ts";
-import { createBashTool } from "../src/core/tools/bash.ts";
+import { createBashTool, fixedSleepSeconds } from "../src/core/tools/bash.ts";
 import { createWaitTool, WAIT_LADDER_MS } from "../src/core/tools/wait.ts";
 
 function getText(result: { content?: Array<{ type: string; text?: string }> }): string {
@@ -191,5 +191,44 @@ describe("wait tool", () => {
 		expect(texts[0]).toMatch(/^No background job ended within 5 s\. Running: bg1 \(`slow`, running [\d.]+ s\)\.$/);
 		expect(texts[1]).toContain("Nothing ended after 15 s of back-to-back waits. Waiting is not progress");
 		expect(texts[2]).toContain("Nothing ended after 45 s of back-to-back waits.");
+	});
+});
+
+describe("fixed sleeps", () => {
+	it("finds the longest fixed sleep outside a loop", () => {
+		expect(fixedSleepSeconds("sleep 295; tail -1 build.log")).toBe(295);
+		expect(fixedSleepSeconds("cd x && sleep 2m && make")).toBe(120);
+		expect(fixedSleepSeconds("sleep 3; curl localhost:8000 && sleep 25")).toBe(25);
+		expect(fixedSleepSeconds("ssh host 'cd /w && nohup ./run.sh & sleep 30'")).toBe(30);
+		expect(fixedSleepSeconds("until grep -q EXIT log; do sleep 30; done")).toBe(0);
+		expect(fixedSleepSeconds("while ! curl -sf x; do sleep 60; done")).toBe(0);
+		expect(fixedSleepSeconds("for i in 1 2; do sleep 20; for j in a; do sleep 30; done; done; echo")).toBe(0);
+		expect(fixedSleepSeconds("sleep 20; for i in 1 2 3; do curl x; done")).toBe(20);
+		expect(fixedSleepSeconds("sleep 20; python3 -c 'for x in y: print(x)'")).toBe(20);
+		expect(fixedSleepSeconds("grep -r sleeping src; echo nosleep 50")).toBe(0);
+		expect(fixedSleepSeconds("time.sleep(30)")).toBe(0);
+	});
+
+	it("does not run a command that sleeps a fixed time longer than 10 s, unless in the background", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-sleep-"));
+		try {
+			const jobs = new BackgroundJobs();
+			const bash = createBashTool(dir, { backgroundJobs: jobs });
+			const start = performance.now();
+			await expect(bash.execute("s1", { command: "sleep 30; echo checked" })).rejects.toThrow(
+				/^Not run: the command sleeps 30 seconds, a fixed time\. To wait for a background job, call wait/,
+			);
+			expect(performance.now() - start).toBeLessThan(500);
+			expect(getText(await bash.execute("s2", { command: "sleep 0.1; echo short" }))).toBe("short\n");
+			expect(getText(await bash.execute("s3", { command: "sleep 30", background: true }))).toMatch(
+				/^Started in the background/,
+			);
+			// Without jobs (no wait, no background), the tool runs what it gets.
+			const plain = createBashTool(dir);
+			expect(getText(await plain.execute("s4", { command: "sleep 11 & echo ran" }))).toContain("ran");
+			jobs.killAll();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });

@@ -170,6 +170,38 @@ function backgroundAfterMs(
 	return autoBackgroundSeconds * 1000;
 }
 
+/** A fixed `sleep` up to this long runs: waiting a moment for a server or a file is fine. */
+export const MAX_FIXED_SLEEP_SECONDS = 10;
+const SLEEP_UNIT_SECONDS: Record<string, number> = { "": 1, s: 1, m: 60, h: 3600, d: 86400 };
+
+/**
+ * The longest fixed `sleep` in a command, in seconds, outside a loop (a loop waits on a condition, which is what to do);
+ * 0 when there is none.
+ */
+export function fixedSleepSeconds(command: string): number {
+	// The body of a loop (`do ... done`, innermost first) is left out.
+	let outside = command;
+	for (let previous = ""; previous !== outside; ) {
+		previous = outside;
+		outside = outside.replace(/\bdo\b(?:(?!\bdo\b)[\s\S])*?\bdone\b/, " ");
+	}
+	let longest = 0;
+	for (const match of outside.matchAll(/(?:^|[\s;&|('"])sleep\s+(\d+(?:\.\d+)?)([smhd]?)(?=$|[\s;&|)'"])/g)) {
+		longest = Math.max(longest, Number(match[1]) * SLEEP_UNIT_SECONDS[match[2]!]!);
+	}
+	return longest;
+}
+
+/** Why a command with a long fixed sleep was not run, and what to do instead. */
+function fixedSleepRefusal(seconds: number): string {
+	return (
+		`Not run: the command sleeps ${seconds} seconds, a fixed time. To wait for a background job, call wait: it returns when the job ends. ` +
+		"To wait for something else, wait for the thing itself in a loop, such as `until curl -sf localhost:8000; do sleep 2; done`, " +
+		"or `until ssh host 'grep -q EXIT build.log'; do sleep 10; done` for a job on another machine: the loop ends as soon as the condition holds, " +
+		`and goes on in the background after a minute. A sleep of up to ${MAX_FIXED_SLEEP_SECONDS} seconds runs.`
+	);
+}
+
 /** How much of a background job's output its report carries. */
 const BACKGROUND_DONE_TAIL_CHARS = 2048;
 
@@ -745,6 +777,11 @@ export function createShellToolDefinition(
 			const startedAtEpoch = Date.now();
 
 			const backgroundAfter = backgroundAfterMs(jobs, background, timeout, autoBackgroundSeconds);
+			if (jobs && !background && process.env.PI_BASH_SLEEP_GUARD !== "off") {
+				const sleep = fixedSleepSeconds(command);
+				// From oh-my-pi's "NEVER poll". Of the 97 sleep calls in Pi's sessions, 28 slept more than 10 s outside a loop.
+				if (sleep > MAX_FIXED_SLEEP_SECONDS) throw new Error(fixedSleepRefusal(sleep));
+			}
 			// The command's own abort: the tool call's, until the command goes to the background.
 			const commandAbort = new AbortController();
 			const forwardAbort = () => commandAbort.abort();
