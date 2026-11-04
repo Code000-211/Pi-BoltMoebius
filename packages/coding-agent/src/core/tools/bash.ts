@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { constants, existsSync } from "node:fs";
-import { access as fsAccess } from "node:fs/promises";
+import { access as fsAccess, readFile as readFileAsync, stat as statAsync } from "node:fs/promises";
 import { constants as osConstants } from "node:os";
+import { resolve as resolvePath } from "node:path";
 import type { Writable } from "node:stream";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type ChildProcess, spawn } from "child_process";
@@ -21,7 +22,8 @@ import {
 } from "../../utils/shell.ts";
 import type { BackgroundJobs } from "../background-jobs.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
-import { type FileWrite, fileWritesInCommand } from "./bash-file-writes.ts";
+import type { ClaudeHarnessManager } from "../harness/index.ts";
+import { type FileWrite, filesShownByCat, fileWritesInCommand } from "./bash-file-writes.ts";
 import { notifySearchExternalChange } from "./native-search.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
@@ -629,6 +631,8 @@ export interface BashToolOptions {
 	 * into a file) is refused, see bash-file-writes.ts.
 	 */
 	editToolActive?: () => boolean;
+	/** Given, files a command printed whole with `cat` count as read for read-before-edit, as after the read tool. */
+	harness?: ClaudeHarnessManager;
 }
 
 export type BashRenderState = {
@@ -924,6 +928,18 @@ export function createShellToolDefinition(
 						structuredContent,
 						isError: true,
 					};
+				}
+				if (options?.harness && !snapshot.truncation.truncated) {
+					// The model saw these files whole: editing or rewriting them needs no extra read.
+					const shown = filesShownByCat(command);
+					const base = resolvePath(spawnContext.cwd, shown.dir);
+					for (const file of shown.files) {
+						const path = resolvePath(base, file);
+						try {
+							const [content, info] = await Promise.all([readFileAsync(path, "utf-8"), statAsync(path)]);
+							options.harness.onFileRead(path, content, info.mtimeMs, spawnContext.cwd);
+						} catch {}
+					}
 				}
 				return { content: [{ type: "text", text: outputText }], details, structuredContent };
 			} finally {

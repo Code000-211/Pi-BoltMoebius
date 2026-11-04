@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createBashTool } from "../src/core/tools/bash.ts";
-import { fileWritesInCommand } from "../src/core/tools/bash-file-writes.ts";
+import { filesShownByCat, fileWritesInCommand } from "../src/core/tools/bash-file-writes.ts";
 
 describe("commands that change files as edit and write would", () => {
 	it.each([
@@ -58,6 +58,14 @@ describe("commands that change files as edit and write would", () => {
 			expect(readFileSync(join(dir, "a.txt"), "utf-8")).toBe("new\nlog\n");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("finds files a command prints whole with cat", () => {
+		expect(filesShownByCat("cat a.py b.py")).toEqual({ dir: "", files: ["a.py", "b.py"] });
+		expect(filesShownByCat("cd src && cat -n x.c")).toEqual({ dir: "src", files: ["x.c"] });
+		for (const partial of ["cat a.py | head", "cat a.py > b", "cat *.py", "cat $F", "head a.py", "cat a; rm b"]) {
+			expect(filesShownByCat(partial).files).toEqual([]);
 		}
 	});
 });

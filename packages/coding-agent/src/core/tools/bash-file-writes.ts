@@ -227,3 +227,30 @@ export function fileWritesInCommand(command: string): FileWrite[] {
 	return writes;
 }
 
+/**
+ * Files a command prints whole with `cat` (`cat a.py b.py`, also after `cd dir &&`): the model has seen them as a read
+ * would show them. Paths as written, with the folder a leading `cd` moved to; empty for anything else (pipes,
+ * redirections, globs, variables, options other than -n).
+ */
+export function filesShownByCat(command: string): { dir: string; files: string[] } {
+	const none = { dir: "", files: [] };
+	if (/[|<>$`*?[\n]|\(|\)/.test(command)) return none;
+	let dir = "";
+	const files: string[] = [];
+	for (const pipeline of parse(command)) {
+		const segment = pipeline[0]!;
+		if (pipeline.length !== 1 || segment.redirects.length > 0 || segment.heredoc) return none;
+		const { name, args } = commandName(segment.words);
+		if (name === "cd" && args.length === 1 && files.length === 0) {
+			dir = args[0]!;
+			continue;
+		}
+		if (name !== "cat") return none;
+		for (const arg of args) {
+			if (arg === "-n") continue;
+			if (arg.startsWith("-")) return none;
+			files.push(arg);
+		}
+	}
+	return { dir, files };
+}
