@@ -310,8 +310,11 @@ export function createRemoteBashOperations(ssh: SshConnection, dir: () => string
 					}, SSH_STOP_GRACE_MS);
 					killTimer.unref?.();
 				};
-				const timer =
-					timeout && timeout > 0 ? setTimeout(() => ((timedOut = true), stop()), timeout * 1000) : undefined;
+				const onTimeout = () => {
+					timedOut = true;
+					stop();
+				};
+				const timer = timeout && timeout > 0 ? setTimeout(onTimeout, timeout * 1000) : undefined;
 				const onAbort = () => stop();
 				signal?.addEventListener("abort", onAbort, { once: true });
 				child.stdout?.on("data", onData);
