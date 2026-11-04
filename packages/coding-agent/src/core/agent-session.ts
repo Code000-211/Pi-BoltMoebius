@@ -4007,7 +4007,17 @@ export class AgentSession {
 						enforceReadBeforeEdit: true,
 						enableDiagnostics: true,
 					},
-					bash: { commandPrefix: shellCommandPrefix, shellPath },
+					bash: {
+						commandPrefix: shellCommandPrefix,
+						shellPath,
+						// A command a timeout moved to the background reports here when it ends: after the current run, or
+						// as a new turn when the agent is idle.
+						onBackgroundDone: (message) =>
+							void this.sendCustomMessage(
+								{ customType: "bash-background-job", content: message, display: true },
+								{ triggerTurn: true, deliverAs: "followUp" },
+							).catch(() => {}),
+					},
 				});
 
 		this._baseToolDefinitions = new Map(

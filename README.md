@@ -190,6 +190,18 @@ and that file is added to the result, once per session (as Claude Code does). Th
   after `\r` only as it was last written), and commands run with `NO_COLOR=1` unless `NO_COLOR` or `FORCE_COLOR` is set.
 - Output over 2000 lines or 32 KB (was 50 KB, the end only) keeps its first 40 lines (up to 4 KB) and its end, so the
   first compiler error and the summary are both there. The full output is still saved to a file.
+- A command still running when its timeout ends goes on in the background instead of being ended: the call returns its
+  output so far, the job's pid and its output file, and when the command ends a message reports its exit code and the
+  last 2 KB of its output, after the current run or as a new turn when the agent is idle (as deepseek-harness does).
+  Jobs end with Pi and do not keep `pi -p` running. In Pi's sessions (23 Oct – 1 Nov 2026), 17 timeouts had ended 1.6 h
+  of running commands, one after 90 min. `PI_BASH_BACKGROUND_ON_TIMEOUT=off` ends them as before.
+- Commands that only read (`git status/log/diff/show`, `cat`, `rg`, `grep`, `find` without `-exec`/`-delete`, ...,
+  joined by pipes, `&&`, `||`, `;`; no redirections or substitutions) start while the model's message still streams, as
+  read and grep do. Measured: a faux model at 100–1000 tokens/s with three such calls gets their results when the
+  message ends instead of 5.4–5.9 ms after it; in pibench (melious/glm-5.3-flash, 4 tasks, 5 runs each) the difference
+  was within the noise (13.4 vs 13.8 s), as bash commands took 12 ms median. `PI_EARLY_BASH=off` turns it off.
+- After a command ran through the pre-started bash, `pi -p` and `pi --mode json` exited again (the waiting shell's pipes
+  held the event loop, so they never exited).
 
 ## Melious provider
 
