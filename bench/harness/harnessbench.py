@@ -15,6 +15,7 @@ Runs go round-robin over repetitions, tasks and harnesses, so provider latency d
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import shlex
@@ -808,8 +809,26 @@ def make_agent_dir(base: Path, models_json: Path, provider: str) -> Path:
     return base
 
 
+def error_kind(tool: str, text: str) -> str:
+    """Why a tool call failed: the harness refused it (`guard`), an edit did not apply (`edit`), a command exited with
+    an error (`command`, often a test run that is expected to fail), or something else."""
+    if text.startswith("Not run:"):
+        return "guard"
+    if tool in ("edit", "write"):
+        return "edit"
+    if tool == "bash":
+        return "command"
+    return "other"
+
+
+def tool_suites() -> dict[str, list[Task]]:
+    from hard_tasks import HARD_TASKS  # noqa: PLC0415 - hard_tasks imports this module
+
+    return {"easy": list(TASKS.values()), "hard": HARD_TASKS, "all": list(TASKS.values()) + HARD_TASKS}
+
+
 def parse_events(stdout: str) -> dict:
-    stats = {"turns": 0, "tool_calls": 0, "tool_errors": 0, "tools": {}, "input": 0, "cache_read": 0,
+    stats = {"turns": 0, "tool_calls": 0, "tool_errors": 0, "error_kinds": {}, "tools": {}, "input": 0, "cache_read": 0,
              "cache_write": 0, "output": 0, "cost": 0.0, "stop": None, "error": None, "final_text": ""}
     for line in stdout.splitlines():
         try:
@@ -840,12 +859,16 @@ def parse_events(stdout: str) -> dict:
                     stats["tools"][c["name"]] = stats["tools"].get(c["name"], 0) + 1
         elif role == "toolResult" and message.get("isError"):
             stats["tool_errors"] += 1
+            text = "".join(c.get("text", "") for c in message.get("content", []) if isinstance(c, dict))
+            kind = error_kind(message.get("toolName", ""), text.strip())
+            stats["error_kinds"][kind] = stats["error_kinds"].get(kind, 0) + 1
     return stats
 
 
 def run_one(task: Task, harness: str, cmd: list[str], agent_dir: Path, model: str, work: Path, events_dir: Path,
             rep: int) -> dict:
     root = Path(tempfile.mkdtemp(prefix=f"hb-{task.name}-{harness}-", dir=work))
+    events_name = f"{task.name}-{harness}-{model.replace('/', '_')}-{rep}"
     task.setup(root)
     env = dict(os.environ, PI_CODING_AGENT_DIR=str(agent_dir), CARGO_TARGET_DIR=str(root / "target"))
     args = cmd + ["--mode", "json", "--no-session", "-ne", "-ns", "-np", "-nc", "--no-mcp", "--model", model, task.prompt]
@@ -859,9 +882,9 @@ def run_one(task: Task, harness: str, cmd: list[str], agent_dir: Path, model: st
         stderr = (e.stderr or b"").decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
         timed_out = True
     wall = time.monotonic() - start
-    (events_dir / f"{task.name}-{harness}-{rep}.jsonl").write_text(stdout)
+    (events_dir / f"{events_name}.jsonl").write_text(stdout)
     if stderr.strip():
-        (events_dir / f"{task.name}-{harness}-{rep}.stderr").write_text(stderr[-20000:])
+        (events_dir / f"{events_name}.stderr").write_text(stderr[-20000:])
     stats = parse_events(stdout)
     try:
         solved, detail = task.verify(root)
@@ -877,30 +900,47 @@ def cmd_run(a: argparse.Namespace) -> None:
     for spec in a.harness:
         name, _, command = spec.partition("=")
         harnesses[name] = shlex.split(command)
-    tasks = [TASKS[t] for t in (a.task or TASKS)]
-    provider = a.model.split("/")[0]
+    suite = tool_suites()[a.suite]
+    tasks = [t for t in suite if not a.task or t.name in a.task]
+    models: list[str] = a.model
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out_dir = Path(a.out or RESULTS / stamp)
     events_dir = out_dir / "events"
     events_dir.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="harnessbench-"))
-    agent_dirs = {h: make_agent_dir(work / f"agent-{h}", Path(a.models_json).expanduser(), provider) for h in harnesses}
-    (out_dir / "config.json").write_text(json.dumps({"harnesses": harnesses, "model": a.model, "reps": a.reps,
-                                                     "tasks": [t.name for t in tasks]}, indent=2))
+    providers = sorted({m.split("/")[0] for m in models})
+    agent_dirs = {}
+    for h in harnesses:
+        base = make_agent_dir(work / f"agent-{h}", Path(a.models_json).expanduser(), providers[0])
+        if len(providers) > 1:
+            all_models = json.loads(Path(a.models_json).expanduser().read_text()).get("providers", {})
+            (base / "models.json").write_text(json.dumps({"providers": {p: all_models[p] for p in providers if p in all_models}}))
+        agent_dirs[h] = base
+    (out_dir / "config.json").write_text(json.dumps({"harnesses": harnesses, "models": models, "reps": a.reps,
+                                                     "suite": a.suite, "tasks": [t.name for t in tasks]}, indent=2))
     runs_file = out_dir / "runs.jsonl"
-    total = a.reps * len(tasks) * len(harnesses)
-    n = 0
+    jobs = []
     for rep in range(a.reps):
-        for task in tasks:
-            order = list(harnesses) if rep % 2 == 0 else list(reversed(harnesses))
-            for h in order:
-                n += 1
-                result = run_one(task, h, harnesses[h], agent_dirs[h], a.model, work, events_dir, rep)
-                with runs_file.open("a") as f:
-                    f.write(json.dumps(result) + "\n")
-                mark = "solved" if result["solved"] else "FAILED"
-                print(f"[{n}/{total}] {task.name:16} {h:12} {mark:6} {result['wall']:7.1f} s  {result['turns']:3} turns  "
-                      f"{result['tool_errors']} tool errors  ${result['cost']:.4f}", flush=True)
+        for model in models:
+            for task in tasks:
+                order = list(harnesses) if rep % 2 == 0 else list(reversed(harnesses))
+                jobs += [(rep, model, task, h) for h in order]
+    done = 0
+
+    def one(job):
+        rep, model, task, h = job
+        return run_one(task, h, harnesses[h], agent_dirs[h], model, work, events_dir, rep)
+
+    # Runs in parallel share the machine: wall times include that load alike for every harness.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=a.parallel) as pool:
+        for result in pool.map(one, jobs):
+            done += 1
+            with runs_file.open("a") as f:
+                f.write(json.dumps(result) + "\n")
+            mark = "solved" if result["solved"] else "FAILED"
+            print(f"[{done}/{len(jobs)}] {result['model']:28} {result['task']:16} {result['harness']:12} {mark:6} "
+                  f"{result['wall']:7.1f} s {result['turns']:3} turns  errors {result['error_kinds'] or '-'}  "
+                  f"${result['cost']:.4f}", flush=True)
     shutil.rmtree(work, ignore_errors=True)
     report(out_dir)
 
@@ -908,27 +948,40 @@ def cmd_run(a: argparse.Namespace) -> None:
 def report(out_dir: Path) -> None:
     runs = [json.loads(l) for l in (out_dir / "runs.jsonl").read_text().splitlines() if l.strip()]
     harnesses = list(dict.fromkeys(r["harness"] for r in runs))
+    models = list(dict.fromkeys(r["model"] for r in runs))
     tasks = list(dict.fromkeys(r["task"] for r in runs))
     med = lambda xs: statistics.median(xs) if xs else float("nan")  # noqa: E731
-    lines = [f"# harnessbench: {out_dir.name}", "", f"Model: {runs[0]['model']}, {len(runs)} runs.", ""]
-    lines.append("| Harness | Solved | Wall time, median | Turns, median | Tool errors | New input tokens | Cached input | Output tokens | Cost |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
-    for h in harnesses:
-        rs = [r for r in runs if r["harness"] == h]
-        lines.append(f"| {h} | {sum(r['solved'] for r in rs)}/{len(rs)} | {med([r['wall'] for r in rs]):.1f} s | "
-                     f"{med([r['turns'] for r in rs]):.0f} | {sum(r['tool_errors'] for r in rs)} | "
-                     f"{sum(r['input'] + r['cache_write'] for r in rs) / 1000:.0f}k | {sum(r['cache_read'] for r in rs) / 1000:.0f}k | "
-                     f"{sum(r['output'] for r in rs) / 1000:.0f}k | ${sum(r['cost'] for r in rs):.2f} |")
-    lines += ["", "Per task (solved, median wall time, median turns, tool errors):", ""]
-    lines.append("| Task | " + " | ".join(harnesses) + " |")
-    lines.append("|---|" + "---|" * len(harnesses))
-    for t in tasks:
-        cells = []
+
+    def kinds(rs: list[dict]) -> str:
+        total: dict[str, int] = {}
+        for r in rs:
+            for k, v in (r.get("error_kinds") or {}).items():
+                total[k] = total.get(k, 0) + v
+        return " ".join(f"{k} {v}" for k, v in sorted(total.items())) or "-"
+
+    lines = [f"# harnessbench: {out_dir.name}", "", f"{len(runs)} runs, models: {', '.join(models)}.", ""]
+    lines.append("| Model | Harness | Solved | Wall time, median | Turns, median | Tool errors (by cause) | New input | Cached input | Output | Cost |")
+    lines.append("|---|---|---:|---:|---:|---|---:|---:|---:|---:|")
+    for m in models + (["all"] if len(models) > 1 else []):
         for h in harnesses:
-            rs = [r for r in runs if r["harness"] == h and r["task"] == t]
-            cells.append(f"{sum(r['solved'] for r in rs)}/{len(rs)}, {med([r['wall'] for r in rs]):.0f} s, "
-                         f"{med([r['turns'] for r in rs]):.0f} turns, {sum(r['tool_errors'] for r in rs)} err")
-        lines.append(f"| {t} | " + " | ".join(cells) + " |")
+            rs = [r for r in runs if r["harness"] == h and (m == "all" or r["model"] == m)]
+            if not rs:
+                continue
+            lines.append(f"| {m} | {h} | {sum(r['solved'] for r in rs)}/{len(rs)} | {med([r['wall'] for r in rs]):.1f} s | "
+                         f"{med([r['turns'] for r in rs]):.0f} | {kinds(rs)} | "
+                         f"{sum(r['input'] + r['cache_write'] for r in rs) / 1000:.0f}k | {sum(r['cache_read'] for r in rs) / 1000:.0f}k | "
+                         f"{sum(r['output'] for r in rs) / 1000:.0f}k | ${sum(r['cost'] for r in rs):.2f} |")
+    for m in models:
+        lines += ["", f"Per task, {m} (solved, median wall time, median turns):", ""]
+        lines.append("| Task | " + " | ".join(harnesses) + " |")
+        lines.append("|---|" + "---|" * len(harnesses))
+        for t in tasks:
+            cells = []
+            for h in harnesses:
+                rs = [r for r in runs if r["harness"] == h and r["task"] == t and r["model"] == m]
+                cells.append(f"{sum(r['solved'] for r in rs)}/{len(rs)}, {med([r['wall'] for r in rs]):.0f} s, "
+                             f"{med([r['turns'] for r in rs]):.0f} turns" if rs else "-")
+            lines.append(f"| {t} | " + " | ".join(cells) + " |")
     lines += ["", "Tool calls by tool:", ""]
     for h in harnesses:
         counts: dict[str, int] = {}
@@ -937,16 +990,19 @@ def report(out_dir: Path) -> None:
                 for k, v in r["tools"].items():
                     counts[k] = counts.get(k, 0) + v
         lines.append(f"- {h}: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items(), key=lambda x: -x[1])))
+    timeouts = [r for r in runs if r.get("timed_out")]
+    if timeouts:
+        lines += ["", "Timed out: " + ", ".join(f"{r['task']}/{r['harness']}/{r['model']}" for r in timeouts)]
     text = "\n".join(lines) + "\n"
     (out_dir / "report.md").write_text(text)
     print(text)
 
 
-def cmd_selftest(_: argparse.Namespace) -> None:
+def cmd_selftest(a: argparse.Namespace) -> None:
     """Each task's verifier must reject the untouched project and accept the reference solution."""
     work = Path(tempfile.mkdtemp(prefix="harnessbench-selftest-"))
     bad = 0
-    for task in TASKS.values():
+    for task in tool_suites()[a.suite]:
         root = work / task.name
         root.mkdir()
         task.setup(root)
@@ -968,16 +1024,19 @@ def main() -> None:
     sub = parser.add_subparsers(dest="command", required=True)
     run = sub.add_parser("run")
     run.add_argument("--harness", action="append", required=True, help="name=command, e.g. pi='node /x/pi'")
-    run.add_argument("--model", required=True)
+    run.add_argument("--model", action="append", required=True, help="repeatable; providers from --models-json")
+    run.add_argument("--suite", choices=["easy", "hard", "all"], default="easy")
+    run.add_argument("--parallel", type=int, default=1)
     run.add_argument("--models-json", default="~/.pi/agent/models.json", help="where the model's provider is defined")
     run.add_argument("--reps", type=int, default=3)
-    run.add_argument("--task", action="append", choices=list(TASKS))
+    run.add_argument("--task", action="append")
     run.add_argument("--out")
     run.set_defaults(func=cmd_run)
     rep = sub.add_parser("report")
     rep.add_argument("dir")
     rep.set_defaults(func=lambda a: report(Path(a.dir)))
     st = sub.add_parser("selftest")
+    st.add_argument("--suite", choices=["easy", "hard", "all"], default="all")
     st.set_defaults(func=cmd_selftest)
     a = parser.parse_args()
     a.func(a)
