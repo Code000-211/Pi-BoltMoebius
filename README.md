@@ -215,6 +215,11 @@ and that file is added to the result, once per session (as Claude Code does). Th
   after a minute. Sleeps inside a loop's body, of up to 10 s, or in a command started with `background: true` run. Of
   the 97 `sleep` calls in Pi's sessions (20 Oct – 4 Nov 2026), it would have refused 28. `PI_BASH_SLEEP_GUARD=off`
   turns it off.
+- A job hub, as oh-my-pi's agent hub but for background jobs only: `alt+j` or `/jobs` lists the session's jobs, newest
+  first, with status, running time and command, and below them the selected job's command, folder, pid, times, output
+  file and the end of its output, updated while it runs. Enter shows its whole output (as kept: the first lines and the
+  end) to scroll through, `x` stops a running job, Escape closes. While jobs run, the status line shows `● 2 jobs
+  running (alt+j)`. The built-in `/jobs` takes the name from an extension's (pi-background-tasks has one).
 - Commands that only read (`git status/log/diff/show`, `cat`, `rg`, `grep`, `find` without `-exec`/`-delete`, ...,
   joined by pipes, `&&`, `||`, `;`; no redirections or substitutions) start while the model's message still streams, as
   read and grep do. Measured: a faux model at 100–1000 tokens/s with three such calls gets their results when the

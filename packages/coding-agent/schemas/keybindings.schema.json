@@ -271,6 +271,10 @@
       "$ref": "#/$defs/KeybindingValue",
       "description": "Open session tree"
     },
+    "app.jobs.hub": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Open background jobs"
+    },
     "app.session.fork": {
       "$ref": "#/$defs/KeybindingValue",
       "description": "Fork current session"
