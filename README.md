@@ -337,9 +337,9 @@ run's time was the model's. So:
   which then planned everything at once), `=off` leaves it out.
 - **An edit and its test in one response.** The calls of a response run in order when one of them is `edit`, `write` or
   `bash`, and the prompt says that all edits for a fix and the command that tests them can go together.
-- **A smaller prompt than Pi's.** 2.2k characters of rules, tool list and docs pointer against Pi's 2.9k: concise answers
-  (finish once running the tests or the program shows the work is done), no `grep`/`find` schemas by default, a two-line
-  docs pointer. The first version of this fork carried 1,000 tokens more per request than Pi and was slower.
+- **A smaller prompt than Pi's.** 2.2k characters of rules, tool list and docs pointer against Pi's 2.9k: "Be concise in
+  your responses" (longer finishing rules made glm-5.3-flash deliberate more and run slower), no `grep`/`find` schemas by
+  default, a two-line docs pointer. The first version of this fork carried 1,000 tokens more per request than Pi and was slower.
 - `cat` in bash counts as reading, so `write` and `edit` do not refuse a file the model has seen.
 
 ## Benchmark
@@ -362,9 +362,8 @@ time in both. Provider latency varies by run: compare within a run, not across.<
 
 ## System prompt
 
-- Rules: Pi's, minus the ones above made redundant, plus: put calls that need no answer in between into one response; be
-  concise and finish once running the tests or the program shows the work is done; commands running over two minutes go
-  to the background, do not sleep or poll.
+- Rules: Pi's, minus the ones above made redundant, plus: put calls that need no answer in between into one response (an
+  edit and the command that tests it); commands running over two minutes go to the background, do not sleep or poll.
 - The docs pointer is two lines instead of seven.
 
 ## Melious provider

@@ -126,7 +126,7 @@ function buildRules(
 		);
 	}
 	addRule(
-		"Be concise in your responses: once running the tests or the program shows the work is done, say so in a sentence or two, without repeating the changes",
+		"Be concise in your responses",
 	);
 	addRule("Show file paths clearly when working with files");
 	return rules.map((rule) => `- ${rule}`).join("\n");
