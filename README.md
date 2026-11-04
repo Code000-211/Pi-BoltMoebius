@@ -221,5 +221,10 @@ Melious lists that are not built in are added. Without a connection, the built-i
 - `packages/coding-agent/test/tool-result-pruning.test.ts`: 5 cases for clearing old tool results.
 - `packages/coding-agent/test/native-search.test.ts` and `tools.test.ts`: the fork's cases for the search caches (globs,
   invalidation, bash changes, the content pool), the bash tool's output and the edit tool's closest-text hint.
+- `packages/coding-agent/test/suite/request-prefix.test.ts`: every request of a session (tool calls, parallel calls, a
+  second prompt) starts with the previous one, in the session's messages and in the payloads the Anthropic and
+  OpenAI-completions providers build from them (cache markers aside), with the same system prompt and tools; and a
+  snapshot of the built-in tool schemas. A change that breaks the prompt cache fails it (checked with an extension that
+  rewrites an old message), as deepseek-harness checks.
 - `packages/ai/test/melious-models.test.ts`: 3 cases for the Melious catalog.
 - `packages/docsearch`: 17 Rust tests, and test sets that measure a change query by query (`eval/`).
