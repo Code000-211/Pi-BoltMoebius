@@ -55,7 +55,11 @@ const bashSchema = Type.Object({
 
 export const bashToolSystemPromptContribution = {
 	snippet: "Execute bash commands (ls, grep, find, etc.)",
-	guidelines: ["You can inspect PI_* environment variables for current model and session details."],
+	guidelines: [
+		"You can inspect PI_* environment variables for current model and session details.",
+		// From deepseek-harness. In Pi's sessions, 80 local `sleep` calls waited 2.8 h for other commands.
+		"Do not wait for a command with sleep or a polling loop: give a long command a timeout, after which it goes on in the background and a message reports when it ends. Meanwhile, go on with work that does not depend on it.",
+	],
 } as const;
 
 export type BashToolInput = Static<typeof bashSchema>;

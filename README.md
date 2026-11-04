@@ -178,6 +178,9 @@ and that file is added to the result, once per session (as Claude Code does). Th
 - Added: keep changes to what was asked: no unrequested features, unrelated refactors, or comments on unchanged code.
 - Added: a `<communication>` section (verify premises first, bottom line first, correct directly, short paragraphs, label
   certainty as verified, likely or unsupported).
+- Added to bash's guidelines: do not wait for a command with `sleep` or a polling loop; give it a timeout (it then goes on
+  in the background and reports when it ends) and go on with other work (from deepseek-harness; in Pi's sessions, 80
+  local `sleep` calls waited 2.8 h). Its effect is not measured.
 - Removed: "Be concise in your responses".
 
 ## bash tool
