@@ -119,9 +119,7 @@ describe("buildSystemPrompt", () => {
 				cwd: process.cwd(),
 			});
 
-			expect(prompt).toContain(
-				"docs/... and examples/... paths are under those folders, not the working folder.",
-			);
+			expect(prompt).toContain("docs/... and examples/... paths are under those folders, not the working folder.");
 		});
 	});
 

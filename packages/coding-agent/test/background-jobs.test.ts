@@ -188,9 +188,9 @@ describe("wait tool", () => {
 		};
 		for (let i = 0; i < 3; i++) texts.push(getText(await wait.execute(`w${i}`, {})));
 		expect(durations).toEqual([WAIT_LADDER_MS[0], WAIT_LADDER_MS[1], WAIT_LADDER_MS[2]]);
-		expect(texts[0]).toMatch(/^No background job ended within 5 s\. Running: bg1 \(`slow`, running [\d.]+ s\)\.$/);
-		expect(texts[1]).toContain("Nothing ended after 15 s of back-to-back waits. Waiting is not progress");
-		expect(texts[2]).toContain("Nothing ended after 45 s of back-to-back waits.");
+		expect(texts[0]).toMatch(/^No background job ended within 120 s\. Running: bg1 \(`slow`, running [\d.]+ s\)\.$/);
+		expect(texts[1]).toContain("Nothing ended after 420 s of back-to-back waits. Waiting is not progress");
+		expect(texts[2]).toContain("Nothing ended after 1020 s of back-to-back waits.");
 	});
 });
 

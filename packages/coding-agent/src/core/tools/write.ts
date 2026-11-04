@@ -69,6 +69,9 @@ export function createWriteToolDefinition(
 		promptSnippet: writeToolSystemPromptContribution.snippet,
 		promptGuidelines: [...writeToolSystemPromptContribution.guidelines],
 		parameters: writeSchema,
+		// A response's calls run in order when one of them changes files or runs a command: an edit and the command that
+		// tests it can come in one response (see the system prompt's rule), which saves a turn.
+		executionMode: "sequential",
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(
 			_toolCallId,

@@ -894,7 +894,7 @@ describe("Coding Agent Tools", () => {
 		it("tells the model about background jobs and not to wait with sleep", () => {
 			const guidelines = createBashToolDefinition(testDir).promptGuidelines ?? [];
 			expect(guidelines).toContain(
-				"Commands still running after a minute continue in the background and report when they end: do other work meanwhile, never sleep or poll.",
+				"Commands still running after two minutes continue in the background and report when they end: do other work meanwhile, never sleep or poll.",
 			);
 		});
 

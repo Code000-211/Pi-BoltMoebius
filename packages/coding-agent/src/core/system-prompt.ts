@@ -120,8 +120,14 @@ function buildRules(
 		for (const rule of toolGuidelines[name] ?? []) addRule(rule);
 	}
 	for (const rule of promptGuidelines) addRule(rule);
-	if (selectedTools.length > 0) addRule("Make independent tool calls together, in one response");
-	addRule("Be concise in your responses");
+	if (selectedTools.length > 0) {
+		addRule(
+			"Put calls that need no answer in between into one response: they run in order, so all edits for a fix and the command that tests them go together",
+		);
+	}
+	addRule(
+		"Be concise in your responses: when the work is done and checked, say so in a sentence or two, without repeating the changes",
+	);
 	addRule("Show file paths clearly when working with files");
 	return rules.map((rule) => `- ${rule}`).join("\n");
 }

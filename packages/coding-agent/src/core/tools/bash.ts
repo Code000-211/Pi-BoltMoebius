@@ -67,7 +67,7 @@ export const bashToolSystemPromptContribution = {
 	guidelines: [
 		"You can inspect PI_* environment variables for current model and session details.",
 		// From deepseek-harness and oh-my-pi. In Pi's sessions, 97 `sleep` calls waited 3.2 h for other commands.
-		"Commands still running after a minute continue in the background and report when they end: do other work meanwhile, never sleep or poll.",
+		"Commands still running after two minutes continue in the background and report when they end: do other work meanwhile, never sleep or poll.",
 	],
 } as const;
 
@@ -153,8 +153,11 @@ function untilBackground<T>(running: Promise<T>, ms: number): Promise<T | typeof
 	]).finally(() => clearTimeout(timer));
 }
 
-/** How long a command runs in the foreground before it goes on in the background, by default (oh-my-pi's value). */
-export const DEFAULT_AUTO_BACKGROUND_SECONDS = 60;
+/**
+ * How long a command runs in the foreground before it goes on in the background, by default. oh-my-pi takes 60 s;
+ * models rarely work on meanwhile, so a test run of 72 s cost two turns of waiting in harnessbench at 60 s.
+ */
+export const DEFAULT_AUTO_BACKGROUND_SECONDS = 120;
 
 /**
  * After how many ms a call's command goes to the background: 0 when asked, undefined when it never does (no jobs, turned
@@ -669,6 +672,9 @@ export function createShellToolDefinition(
 		promptSnippet: config.promptSnippet,
 		promptGuidelines: exposeSessionEnvironment && config.promptGuidelines ? [...config.promptGuidelines] : undefined,
 		parameters: bashSchema,
+		// A response's calls run in order when one of them changes files or runs a command: an edit and the command that
+		// tests it can come in one response (see the system prompt's rule), which saves a turn.
+		executionMode: "sequential",
 		outputSchema: bashOutputSchema,
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(
