@@ -51,7 +51,7 @@ export const editToolSystemPromptContribution = {
 		"Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
 		"Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
 		// The same for every edit tool (an extension's too, which re-registers it): the session's refuses files not read.
-		"Read a file before you first edit it in a session. When it changed on disk since, an edit still applies if every oldText matches it exactly once; otherwise read it again.",
+		"An edit of a file not read in this session, or changed on disk since it was read, applies only when every oldText matches the file exactly once; otherwise read the file first.",
 	],
 } as const;
 
@@ -220,12 +220,25 @@ export function createEditToolDefinition(
 				const normalizedContent = normalizeToLF(content);
 
 				let changedOnDisk = false;
+				let readHere: string | undefined;
 				if (enforceReadBeforeEdit) {
-					if (!harness.stateTracker.hasBeenRead(absolutePath)) {
-						harness.assertCanModifyExistingFile(absolutePath, undefined, rawContent);
-					}
 					const beforeStat =
 						ops === defaultEditOperations ? await fsStat(absolutePath).catch(() => undefined) : undefined;
+					if (!harness.stateTracker.hasBeenRead(absolutePath)) {
+						// Not read in this session, but seen another way (cat or grep in bash, a search): an edit whose every
+						// oldText is there exactly once changes only those places, so the file counts as read now, which also
+						// takes the diagnostics it has before the edit. Otherwise it has to be read first.
+						if (!editsMatchExactlyOnce(normalizedContent, edits)) {
+							harness.assertCanModifyExistingFile(absolutePath, undefined, rawContent);
+						}
+						readHere = harness.onFileRead(
+							absolutePath,
+							rawContent,
+							beforeStat?.mtimeMs ?? Date.now(),
+							workspaceCwd,
+							buffer,
+						);
+					}
 					try {
 						harness.assertCanModifyExistingFile(absolutePath, beforeStat?.mtimeMs, rawContent);
 					} catch (error) {
@@ -276,7 +289,7 @@ export function createEditToolDefinition(
 					content: [
 						{
 							type: "text",
-							text: `Successfully replaced ${edits.length} block(s) in ${path}.${changedOnDisk ? " The file had changed on disk since it was last read; the edit was applied to its current content." : ""}${suffix}`,
+							text: `Successfully replaced ${edits.length} block(s) in ${path}.${readHere !== undefined ? " The file had not been read in this session; every oldText matched it exactly once." : ""}${changedOnDisk ? " The file had changed on disk since it was last read; the edit was applied to its current content." : ""}${suffix}${readHere ?? ""}`,
 						},
 					],
 					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },

@@ -1385,6 +1385,120 @@ export async function compact(
 	};
 }
 
+// ============================================================================
+// Compaction on the session's cached prefix
+// ============================================================================
+
+/** How much of the first kept message the instruction quotes, so the model knows where its summary ends. */
+const KEPT_QUOTE_CHARS = 300;
+
+/** The start of `message` as the summary instruction quotes it: how the model saw it, cut to a few lines. */
+export function describeKeptMessage(message: AgentMessage): string {
+	const text = serializeConversation(convertToLlm([message])).trim();
+	return text.length > KEPT_QUOTE_CHARS ? `${text.slice(0, KEPT_QUOTE_CHARS)}...` : text;
+}
+
+function cachedPrefixInstruction(
+	keptQuote: string | undefined,
+	isSplitTurn: boolean,
+	hasPreviousSummary: boolean,
+	customInstructions: string | undefined,
+): string {
+	const parts = [
+		keptQuote
+			? "The conversation above is being compacted to free context: your summary replaces everything above up to the message quoted below, and the conversation then continues from that message on, unchanged."
+			: "The conversation above is being compacted to free context: your summary replaces all of it.",
+	];
+	if (hasPreviousSummary)
+		parts.push("It begins with a summary of earlier history: carry that content forward into yours.");
+	if (keptQuote && isSplitTurn) {
+		parts.push("That message is in the middle of a turn: include what that turn was doing up to it.");
+	}
+	if (keptQuote) parts.push(`First message kept:\n<kept>\n${keptQuote}\n</kept>`);
+	parts.push("Do not call any tool. Answer with the summary only, in the format below.");
+	parts.push(SUMMARIZATION_PROMPT);
+	if (customInstructions) parts.push(`Additional focus: ${customInstructions}`);
+	return parts.join("\n\n");
+}
+
+/** The session's own request, which the summary request continues: the same messages, model and options. */
+export interface CachedPrefixRequest {
+	/** The provider-visible messages of the session's next request (system messages with the tools included). */
+	messages: Message[];
+	model: Model<any>;
+	/** The session's request options (reasoning, routing session id, thinking budgets, transport), with its auth. */
+	options: SimpleStreamOptions;
+	streamFn?: StreamFn;
+	retry?: RetryPolicy;
+	callbacks?: RetryCallbacks;
+}
+
+/**
+ * Compaction as a continuation of the session's cached prefix: the session's next request with the summary instruction
+ * as its last message, so the provider reads all of it from its prompt cache and only the instruction and the summary
+ * are new (deepseek-harness does the same). A standalone summary request has its own system prompt and the conversation
+ * as text, so none of it is cached: in Pi's sessions, 26k to 508k input tokens each time.
+ *
+ * Returns undefined when the response is not a usable summary (an error, a tool call, a cut-off answer), for the
+ * caller to fall back to {@link compact}.
+ */
+export async function compactOnCachedPrefix(
+	preparation: CompactionPreparation,
+	request: CachedPrefixRequest,
+	keptQuote: string | undefined,
+	customInstructions?: string,
+): Promise<CompactionResult | undefined> {
+	const { firstKeptEntryId, isSplitTurn, previousSummary, fileOps } = preparation;
+	if (!firstKeptEntryId) return undefined;
+	const instruction: Message = {
+		role: "user",
+		content: [
+			{
+				type: "text",
+				text: cachedPrefixInstruction(keptQuote, isSplitTurn, previousSummary !== undefined, customInstructions),
+			},
+		],
+		timestamp: Date.now(),
+	};
+	const context = normalizeContext({ messages: [...request.messages, instruction] });
+	// The output cap of a summary. (Anthropic's thinking budget stays the level's while the cap is above it, so the
+	// cached messages still match.)
+	const options = { ...request.options, maxTokens: getSummaryMaxTokens(request.model, preparation.settings) };
+	const produce = async (): Promise<AssistantMessage> =>
+		request.streamFn
+			? (await request.streamFn(request.model, context, options)).result()
+			: completeSimple(request.model, context, options);
+	const response = await retryAssistantCall(produce, request.retry, options.signal, request.callbacks);
+	// An error the standalone request would meet too (no quota, a failed connection after the retries) fails the
+	// compaction as it would have, without a second request, and so does an answer cut off without reasoning. What that
+	// request can avoid falls back to it: an overflow (it splits the history), an answer cut off with reasoning (it asks
+	// again without) or a tool call.
+	if (
+		(response.stopReason === "error" && !isContextOverflow(response)) ||
+		(response.stopReason === "length" && !options.reasoning)
+	) {
+		throw new Error(getSummarizationFailure(response, "Summarization"));
+	}
+	if (
+		response.stopReason === "aborted" ||
+		getSummarizationFailure(response, "Summarization") ||
+		response.content.some((block) => block.type === "toolCall")
+	) {
+		return undefined;
+	}
+	let summary = contentText(response.content).trim();
+	if (!summary) return undefined;
+	const { readFiles, modifiedFiles, omittedReadFiles, omittedModifiedFiles } = computeFileLists(fileOps);
+	summary += formatFileOperations(readFiles, modifiedFiles, omittedReadFiles, omittedModifiedFiles);
+	return {
+		summary,
+		firstKeptEntryId,
+		tokensBefore: preparation.tokensBefore,
+		usage: response.usage,
+		details: { readFiles, modifiedFiles } as CompactionDetails,
+	};
+}
+
 /**
  * Generate a summary for a turn prefix (when splitting a turn).
  */

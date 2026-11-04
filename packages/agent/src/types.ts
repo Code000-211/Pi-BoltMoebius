@@ -361,6 +361,10 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
  * usual. Early runs that are not used (an error, an abort, a truncated message, a blocked call) are aborted and
  * their results dropped. Updates an early run reports are passed on once the loop reaches the call.
  *
+ * It is asked twice: once when the call's name is known, with empty arguments (a decision by the tool alone; return
+ * undefined there for a tool that never starts early), and again with the complete arguments when the call would
+ * start (a decision by what it is asked to do).
+ *
  * Only return a function for tools without side effects, whose result may be dropped.
  */
 export type EarlyToolExecution = (toolCall: AgentToolCall, tool: AgentTool<any>) => (() => boolean) | undefined;

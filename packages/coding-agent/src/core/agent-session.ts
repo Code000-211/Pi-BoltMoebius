@@ -24,6 +24,7 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	type AgentToolCall,
 	type AgentToolCallOutcome,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
@@ -72,6 +73,8 @@ import {
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	compactOnCachedPrefix,
+	describeKeptMessage,
 	estimateContextTokens,
 	estimateProjectedContextTokens,
 	estimateTokens,
@@ -149,6 +152,7 @@ import {
 	normalizeBuildSystemPromptOptions,
 } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
+import { isReadOnlyCommand } from "./tools/bash-read-only.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
@@ -209,6 +213,12 @@ const EARLY_TOOL_NAMES: ReadonlySet<string> = new Set(PIBOLT ? ["read", "ls", "g
  * extension's handler waits only for MCP servers that the called tool reaches (MCP tools, codemode, tool_search); ACP
  * mode's blocks only tools that read-only mode does not keep, and it keeps these.
  */
+/**
+ * The same for early bash calls: only MCP's handler, which waits only for the MCP servers a call reaches. ACP's read-only
+ * mode blocks bash, so its handler must see a bash call before it runs.
+ */
+const EARLY_BASH_TOOL_CALL_PASSTHROUGH_EXTENSIONS: ReadonlySet<string> = new Set([`${BUILTIN_PATH_PREFIX}mcp`]);
+
 const EARLY_TOOL_CALL_PASSTHROUGH_EXTENSIONS: ReadonlySet<string> = new Set([
 	`${BUILTIN_PATH_PREFIX}mcp`,
 	`${BUILTIN_PATH_PREFIX}acp`,
@@ -529,6 +539,8 @@ export class AgentSession {
 	private _toolRegistry: Map<string, AgentTool> = new Map();
 	/** `execute` of the registered built-in tools whose calls may start before the model's message ends. */
 	private _earlyToolExecutes = new WeakSet<AgentTool["execute"]>();
+	/** The built-in bash tool's execute, whose calls start early when their command only reads. */
+	private _earlyBashExecutes = new WeakSet<AgentTool["execute"]>();
 	/** Created on the first `ctx.executeTool()` call. */
 	private _nestedToolCalls: NestedToolCallRunner | undefined;
 	/** Declared tools whose declarations requests leave out, from `prepareLoadout` hooks. */
@@ -711,7 +723,7 @@ export class AgentSession {
 	private _installAgentToolHooks(): void {
 		this.agent.beforeToolCall = (context) => this._beforeToolCall(context);
 		this.agent.afterToolCall = (context) => this._afterToolCall(context);
-		this.agent.earlyToolExecution = (_toolCall, tool) => this._earlyToolExecution(tool);
+		this.agent.earlyToolExecution = (toolCall, tool) => this._earlyToolExecution(toolCall, tool);
 	}
 
 	/**
@@ -719,13 +731,27 @@ export class AgentSession {
 	 * the model's message is still streaming. Only while no `tool_call` handler could block or change them: a call an
 	 * extension blocks must not run at all. Their result depends on the model (read's image handling) and the
 	 * extension runner (cwd), so it is used only if both are still the same when the call is reached.
+	 *
+	 * So may calls of the built-in bash tool whose command only reads (`isReadOnlyCommand`: `git diff`, `rg`, `cat`,
+	 * ...), without a shell command prefix (it could do anything). `PI_EARLY_BASH=off` turns that off.
 	 */
-	private _earlyToolExecution(tool: AgentTool): (() => boolean) | undefined {
+	private _earlyToolExecution(toolCall: AgentToolCall, tool: AgentTool): (() => boolean) | undefined {
 		const runner = this._extensionRunner;
 		const model = this.model;
+		const bash = this._earlyBashExecutes.has(tool.execute);
+		if (bash) {
+			const command = (toolCall.arguments as { command?: unknown }).command;
+			// No command yet: asked by the tool alone, before the arguments are complete.
+			if (command !== undefined && (typeof command !== "string" || !isReadOnlyCommand(command))) return undefined;
+		}
 		const allowed = () =>
-			this._earlyToolExecutes.has(tool.execute) &&
-			!runner.hasHandlersOutside("tool_call", EARLY_TOOL_CALL_PASSTHROUGH_EXTENSIONS);
+			(bash
+				? process.env.PI_EARLY_BASH !== "off" && !this.settingsManager.getShellCommandPrefix()
+				: this._earlyToolExecutes.has(tool.execute)) &&
+			!runner.hasHandlersOutside(
+				"tool_call",
+				bash ? EARLY_BASH_TOOL_CALL_PASSTHROUGH_EXTENSIONS : EARLY_TOOL_CALL_PASSTHROUGH_EXTENSIONS,
+			);
 		if (!allowed()) return undefined;
 		return () => this._extensionRunner === runner && this.model === model && allowed();
 	}
@@ -2938,6 +2964,11 @@ export class AgentSession {
 	): Promise<CompactionResult> {
 		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
 		const request = await this._getSummarizationRequestAuth(model, signal);
+		if (reason !== "overflow" && process.env.PI_COMPACTION_CACHED_PREFIX !== "off") {
+			const cached = await this._compactOnCachedPrefix(preparation, request, customInstructions, signal, reason);
+			if (cached) return cached;
+			if (signal.aborted) throw new Error("Compaction cancelled");
+		}
 		return compact(
 			preparation,
 			request.model,
@@ -2951,6 +2982,60 @@ export class AgentSession {
 			this.settingsManager.getRetrySettings(),
 			this._summarizationRetryCallbacks({ source: "compaction", reason }),
 			undefined, // sessionId
+		);
+	}
+
+	/**
+	 * The summary as the continuation of the session's own request, read from the provider's prompt cache (see
+	 * `compactOnCachedPrefix`). Only when the summary is asked of the session's own model and thinking level (another
+	 * model has no cache of this conversation), and not on an overflow, whose request did not fit. Undefined to fall
+	 * back to the standalone summary request. `PI_COMPACTION_CACHED_PREFIX=off` turns it off.
+	 */
+	private async _compactOnCachedPrefix(
+		preparation: CompactionPreparation,
+		request: Awaited<ReturnType<AgentSession["_getSummarizationRequestAuth"]>>,
+		customInstructions: string | undefined,
+		signal: AbortSignal,
+		reason: "manual" | "threshold",
+	): Promise<CompactionResult | undefined> {
+		const sessionModel = this.agent.state.model;
+		const thinkingLevel = this.agent.state.thinkingLevel;
+		if (
+			request.model.provider !== sessionModel.provider ||
+			request.model.id !== sessionModel.id ||
+			request.thinkingLevel !== thinkingLevel
+		) {
+			return undefined;
+		}
+		// The messages the session's next request would send (see _installAgentRequestProjection and agent-loop).
+		let messages: AgentMessage[] = this.sessionManager.buildSessionProjection().messages;
+		if (this.agent.transformContext) messages = await this.agent.transformContext(messages, signal);
+		const llmMessages = await this.agent.convertToLlm(messages);
+		const kept = preparation.firstKeptEntryId
+			? this.sessionManager.getEntry(preparation.firstKeptEntryId)
+			: undefined;
+		const keptMessage = kept?.type === "message" ? kept.message : undefined;
+		return compactOnCachedPrefix(
+			preparation,
+			{
+				messages: llmMessages,
+				model: request.model,
+				options: {
+					apiKey: request.apiKey,
+					headers: request.headers,
+					env: request.env,
+					signal,
+					reasoning: thinkingLevel === "off" ? undefined : thinkingLevel,
+					sessionId: this.agent.sessionId,
+					transport: this.agent.transport,
+					thinkingBudgets: this.agent.thinkingBudgets,
+				},
+				streamFn: this.agent.streamFunction,
+				retry: this.settingsManager.getRetrySettings(),
+				callbacks: this._summarizationRetryCallbacks({ source: "compaction", reason }),
+			},
+			keptMessage ? describeKeptMessage(keptMessage) : undefined,
+			customInstructions,
 		);
 	}
 
@@ -3843,13 +3928,16 @@ export class AgentSession {
 		}
 		this._toolRegistry = toolRegistry;
 		const earlyToolExecutes = new WeakSet<AgentTool["execute"]>();
+		const earlyBashExecutes = new WeakSet<AgentTool["execute"]>();
 		if (!this._baseToolsOverride) {
 			for (const tool of wrappedBuiltInTools) {
-				if (EARLY_TOOL_NAMES.has(tool.name) && toolRegistry.get(tool.name) === tool)
-					earlyToolExecutes.add(tool.execute);
+				if (toolRegistry.get(tool.name) !== tool) continue;
+				if (EARLY_TOOL_NAMES.has(tool.name)) earlyToolExecutes.add(tool.execute);
+				else if (tool.name === "bash") earlyBashExecutes.add(tool.execute);
 			}
 		}
 		this._earlyToolExecutes = earlyToolExecutes;
+		this._earlyBashExecutes = earlyBashExecutes;
 
 		const nextActiveToolNames = (
 			options?.activeToolNames ? [...options.activeToolNames] : [...previousActiveToolNames]
@@ -3919,7 +4007,17 @@ export class AgentSession {
 						enforceReadBeforeEdit: true,
 						enableDiagnostics: true,
 					},
-					bash: { commandPrefix: shellCommandPrefix, shellPath },
+					bash: {
+						commandPrefix: shellCommandPrefix,
+						shellPath,
+						// A command a timeout moved to the background reports here when it ends: after the current run, or
+						// as a new turn when the agent is idle.
+						onBackgroundDone: (message) =>
+							void this.sendCustomMessage(
+								{ customType: "bash-background-job", content: message, display: true },
+								{ triggerTurn: true, deliverAs: "followUp" },
+							).catch(() => {}),
+					},
 				});
 
 		this._baseToolDefinitions = new Map(

@@ -10,7 +10,7 @@ import {
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
 	type CompactionDetails,
 	computeFileLists,
@@ -104,6 +104,14 @@ function summaryRequestText(context: TranscriptContext): string {
 }
 
 describe("compaction bounds", () => {
+	// The standalone summary request's bounds; the request on the cached prefix is in agent-session-compaction.test.ts.
+	beforeAll(() => {
+		process.env.PI_COMPACTION_CACHED_PREFIX = "off";
+	});
+	afterAll(() => {
+		delete process.env.PI_COMPACTION_CACHED_PREFIX;
+	});
+
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {

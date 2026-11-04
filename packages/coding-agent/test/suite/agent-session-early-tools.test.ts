@@ -51,6 +51,43 @@ async function readResult(
 describe("AgentSession early tool execution", () => {
 	const harnesses: Harness[] = [];
 
+	/** The model runs `command` with bash, then streams text while an extension changes notes.txt. */
+	async function bashResult(command: string): Promise<string> {
+		const harness = await createHarness({
+			initialActiveToolNames: ["read", "bash"],
+			extensionFactories: [changeFileDuringText()],
+		});
+		harnesses.push(harness);
+		writeFileSync(join(harness.tempDir, "notes.txt"), "old content\n");
+		await harness.session.bindExtensions({});
+		harness.setResponses([
+			fauxAssistantMessage(
+				[fauxToolCall("bash", { command }, { id: "call-bash" }), fauxText("Reading the notes file now.")],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("Done."),
+		]);
+		await harness.session.prompt("read the notes");
+		return (getToolResult(harness, "bash").content[0] as { text: string }).text;
+	}
+
+	it("starts a bash call that only reads while the rest of the message streams", async () => {
+		expect(await bashResult("cat notes.txt")).toBe("old content\n");
+	});
+
+	it("starts other bash calls after the message", async () => {
+		expect(await bashResult("cat notes.txt | tee copy.txt")).toBe("new content\n");
+	});
+
+	it("starts no bash call early with PI_EARLY_BASH=off", async () => {
+		process.env.PI_EARLY_BASH = "off";
+		try {
+			expect(await bashResult("cat notes.txt")).toBe("new content\n");
+		} finally {
+			delete process.env.PI_EARLY_BASH;
+		}
+	});
+
 	afterEach(() => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
 	});

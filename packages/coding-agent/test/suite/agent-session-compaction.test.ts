@@ -11,8 +11,8 @@ import {
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { estimateTokens } from "../../src/core/compaction/index.ts";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { DEFAULT_COMPACTION_SETTINGS, estimateTokens, getSummaryMaxTokens } from "../../src/core/compaction/index.ts";
 import { createHarness, getUserTexts, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
@@ -339,6 +339,10 @@ describe("AgentSession compaction characterization", () => {
 	});
 
 	it("uses the standalone compaction request context", async () => {
+		process.env.PI_COMPACTION_CACHED_PREFIX = "off";
+		onTestFinished(() => {
+			delete process.env.PI_COMPACTION_CACHED_PREFIX;
+		});
 		const harness = await createHarness({ settings: { compaction: { keepRecentTokens: 1 } } });
 		harnesses.push(harness);
 		seedCompactableSession(harness);
@@ -365,6 +369,64 @@ describe("AgentSession compaction characterization", () => {
 		expect(requestOptions).toMatchObject({ cacheRetention: "none" });
 		expect(requestOptions?.sessionId).not.toBe("active-routing-session");
 		expect(requestOptions?.transport).toBeUndefined();
+	});
+
+	// As deepseek-harness compacts: the provider reads everything but the instruction from its prompt cache.
+	it("sends the compaction request as the session's last request plus the instruction", async () => {
+		const harness = await createHarness({ settings: { compaction: { keepRecentTokens: 1 } } });
+		harnesses.push(harness);
+		const contexts: TranscriptContext[] = [];
+		const options: (SimpleStreamOptions | undefined)[] = [];
+		const stream = harness.session.agent.streamFunction;
+		harness.session.agent.streamFunction = (model, context, opts) => {
+			contexts.push(structuredClone(context));
+			options.push(opts);
+			return stream(model, context, opts);
+		};
+		harness.setResponses([
+			fauxAssistantMessage("first answer"),
+			fauxAssistantMessage("second answer"),
+			fauxAssistantMessage("## Goal\nThe summary."),
+		]);
+		await harness.session.prompt("first question");
+		await harness.session.prompt("second question");
+		const result = await harness.session.compact();
+
+		expect(contexts).toHaveLength(3);
+		const [, previous, summary] = contexts;
+		// The second request, then the second answer, then the instruction.
+		expect(summary.messages.slice(0, previous.messages.length)).toEqual(previous.messages);
+		expect(summary.messages).toHaveLength(previous.messages.length + 2);
+		const instruction = JSON.stringify(summary.messages.at(-1));
+		expect(instruction).toContain("Do not call any tool");
+		// Where the summary ends: the first message kept, quoted.
+		expect(instruction).toContain("<kept>\\n[Assistant]: second answer\\n</kept>");
+		expect(options[2]?.cacheRetention).toBeUndefined();
+		// The summary's output cap, as the standalone request has it.
+		expect(options[2]?.maxTokens).toBe(getSummaryMaxTokens(harness.getModel(), DEFAULT_COMPACTION_SETTINGS));
+		expect(options[2]?.sessionId).toBe(options[1]?.sessionId);
+		expect(result.summary).toContain("The summary.");
+	});
+
+	it("falls back to the standalone summary request when the cached one calls a tool", async () => {
+		const harness = await createHarness({ settings: { compaction: { keepRecentTokens: 1 } } });
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		const systemPrompts: (string | undefined)[] = [];
+		const stream = harness.session.agent.streamFunction;
+		harness.session.agent.streamFunction = (model, context, opts) => {
+			systemPrompts.push(getCurrentSystemPrompt(context.messages));
+			return stream(model, context, opts);
+		};
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("read", { path: "x" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage("standalone summary"),
+		]);
+		const result = await harness.session.compact();
+		expect(systemPrompts).toHaveLength(2);
+		expect(systemPrompts[0]).toBe(harness.session.agent.state.systemPrompt);
+		expect(systemPrompts[1]).toContain("context summarization assistant");
+		expect(result.summary).toContain("standalone summary");
 	});
 
 	it("persists usage from pi-generated manual compaction", async () => {

@@ -50,7 +50,7 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		rmSync(testDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
-	it("blocks editing an existing file before it has been read, and allows it after read", async () => {
+	it("blocks an edit of an unread file unless every oldText matches it exactly once, and allows it after read", async () => {
 		const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
 		const readTool = createReadTool(testDir, { harness });
 		const editTool = createEditTool(testDir, {
@@ -66,7 +66,7 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		await expect(
 			editTool.execute("call-edit-1", {
 				path: "kernel.hip",
-				edits: [{ oldText: "return 0;", newText: "return 1;" }],
+				edits: [{ oldText: "return 5;", newText: "return 1;" }],
 			}),
 		).rejects.toThrow(/File has not been read yet\. Read it first before writing to it\./);
 
@@ -115,6 +115,34 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 				edits: [{ oldText: "int x = 1;", newText: "int x = 2;" }],
 			}),
 		).rejects.toThrow(/File has been modified since it was last read/);
+	});
+
+	it("applies an edit of a file seen only through bash when every oldText matches it exactly once", async () => {
+		const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
+		const editTool = createEditTool(testDir, { harness, enforceReadBeforeEdit: true, enableDiagnostics: false });
+		const writeTool = createWriteTool(testDir, { harness, enforceReadBeforeEdit: true, enableDiagnostics: false });
+		const filePath = join(testDir, "seen.ts");
+		writeFileSync(filePath, "const a = 1;\nconst b = 2;\nconst b2 = 2;\n", "utf-8");
+
+		const edited = await editTool.execute("e-seen", {
+			path: "seen.ts",
+			edits: [{ oldText: "const a = 1;", newText: "const a = 3;" }],
+		});
+		expect(getText(edited)).toContain(
+			"The file had not been read in this session; every oldText matched it exactly once.",
+		);
+		expect(readFileSync(filePath, "utf-8")).toBe("const a = 3;\nconst b = 2;\nconst b2 = 2;\n");
+		// Now it counts as read: the next edit needs no note.
+		expect(harness.stateTracker.hasBeenRead(filePath)).toBe(true);
+
+		// An oldText that is not there exactly once still asks for a read; write still refuses an unread file.
+		writeFileSync(join(testDir, "other.ts"), "x = 2;\nx = 2;\n", "utf-8");
+		await expect(
+			editTool.execute("e-other", { path: "other.ts", edits: [{ oldText: "x = 2;", newText: "y" }] }),
+		).rejects.toThrow(/File has not been read yet/);
+		await expect(writeTool.execute("w-other", { path: "other.ts", content: "z\n" })).rejects.toThrow(
+			/File has not been read yet/,
+		);
 	});
 
 	it("allows edit and write after a newer modification time with the same content (touch)", async () => {
@@ -177,7 +205,7 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 	it("tells the model to read before editing, the same for every edit tool", () => {
 		const guidelines = (enforce: boolean) =>
 			createEditToolDefinition(testDir, { enforceReadBeforeEdit: enforce }).promptGuidelines ?? [];
-		expect(guidelines(true).some((line) => line.startsWith("Read a file before you first edit it"))).toBe(true);
+		expect(guidelines(true).some((line) => line.startsWith("An edit of a file not read in this session"))).toBe(true);
 		// An extension re-registering the tool must not change the system prompt.
 		expect(guidelines(false)).toEqual(guidelines(true));
 	});
@@ -496,14 +524,15 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		writeFileSync(hipFile, "__global__ void vecAdd() {\n    int i = 0;\n}\n", "utf-8");
 
 		sessionHarness.setResponses([
-			// Turn 1: Model tries to edit vec_add.hip WITHOUT reading it first -> blocked!
+			// Turn 1: Model tries to edit vec_add.hip WITHOUT reading it first, with an inexact oldText -> blocked!
 			fauxAssistantMessage(
 				[
 					fauxToolCall(
 						"edit",
 						{
 							path: "vec_add.hip",
-							edits: [{ oldText: "int i = 0;", newText: "int i = threadIdx.x;" }],
+							// Not in the file as written: an exact unique match would apply without a read.
+							edits: [{ oldText: "int i=0;", newText: "int i = threadIdx.x;" }],
 						},
 						{ id: "call-blind-edit" },
 					),
@@ -731,6 +760,46 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		// 4. Single-syscall ls
 		const lsRes = await lsTool.execute("ls-fast", {});
 		expect(getText(lsRes)).toContain("fast.txt");
+	});
+
+	it("moves a command still running at its timeout to the background and reports when it ends", async () => {
+		let done: (message: string) => void = () => {};
+		const message = new Promise<string>((resolve) => {
+			done = resolve;
+		});
+		const bash = createBashTool(testDir, { onBackgroundDone: (text) => done(text) });
+		const start = performance.now();
+		const result = await bash.execute("bg-1", { command: "echo started; sleep 0.6; echo finished", timeout: 0.2 });
+		expect(performance.now() - start).toBeLessThan(500);
+		const text = getText(result);
+		expect(text).toContain("started");
+		expect(text).toMatch(/Command still running after 0\.2 seconds: moved to the background as job bg\d+/);
+		const report = await message;
+		expect(report).toMatch(
+			/Background job bg\d+ \(`echo started; sleep 0\.6; echo finished`\) ended with exit code 0/,
+		);
+		expect(report).toContain("finished");
+		const file = report.match(/\[Full output: ([^\]]+)\]/)?.[1];
+		expect(file && readFileSync(file, "utf-8")).toBe("started\nfinished\n");
+	});
+
+	it("ends a background job with Pi, and does not keep Pi running for it", () => {
+		const script = join(testDir, "exit-with-job.ts");
+		const bashModule = join(import.meta.dirname, "..", "src", "core", "tools", "bash.ts");
+		writeFileSync(
+			script,
+			`import { createBashTool } from ${JSON.stringify(bashModule)};\n` +
+				`const tool = createBashTool(${JSON.stringify(testDir)}, { onBackgroundDone: () => {} });\n` +
+				`const r = await tool.execute("x", { command: "sleep 30; echo late", timeout: 0.2 });\n` +
+				`console.log(r.content[0].text.match(/pid (\\d+)/)[1]);\n`,
+		);
+		const start = performance.now();
+		const result = spawnSync(process.execPath, [script], { timeout: 15_000, encoding: "utf-8" });
+		expect(result.status).toBe(0);
+		expect(performance.now() - start).toBeLessThan(10_000);
+		const pid = Number(result.stdout.trim());
+		expect(pid).toBeGreaterThan(0);
+		expect(() => process.kill(pid, 0)).toThrow();
 	});
 
 	it("lets the process exit after a command ran through the warm bash worker", () => {

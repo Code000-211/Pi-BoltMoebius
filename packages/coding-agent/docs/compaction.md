@@ -36,6 +36,10 @@ By default, `reserveTokens` is 16384 tokens, `thresholdPercent` is 90 and `maxCo
 
 A compaction summary may produce at most the largest of 80% of `reserveTokens`, 4096 tokens and 3.2% of the summarizer's context window, capped by the model's output limit. A split turn's prefix summary gets half the shares: 50% of `reserveTokens`, 4096 tokens or 1.6% of the window. If reasoning uses that whole limit, the summary is requested again without reasoning.
 
+### The summary request
+
+A threshold or manual compaction first asks for the summary as a continuation of the session's own request: the messages the next request would send (system prompt, tools, conversation, with old tool results cleared as there), then one user message that asks for the summary and quotes the first message kept. The provider reads all but that message from its prompt cache. This needs the summary to come from the session's model at its thinking level; when the compaction uses another model, the summary calls a tool, fails or is cut off, and on an overflow (whose request did not fit), the standalone request below is sent instead: its own summarization system prompt and the conversation as text, which nothing has cached. `PI_COMPACTION_CACHED_PREFIX=off` always sends the standalone request.
+
 The defaults scale with the context window only while the matching setting is unset:
 
 | Context window | Threshold | `keepRecentTokens` | Summary cap (split-turn prefix) |

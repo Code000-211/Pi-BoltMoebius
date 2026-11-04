@@ -222,6 +222,12 @@ export class OutputAccumulator {
 		};
 	}
 
+	/** The full output file, created now if the output did not need one yet (a command that goes on in the background). */
+	ensureFullOutputFile(): string | undefined {
+		this.ensureTempFile();
+		return this.tempFilePath;
+	}
+
 	/** Close the full output file. Throws the error of a failed write to it. */
 	closeTempFile(): void {
 		const file = this.tempFile;

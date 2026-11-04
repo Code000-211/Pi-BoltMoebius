@@ -9,6 +9,7 @@ are marked as such; the others are limits the code sets.
 - [Read before edit](#read-before-edit)
 - [Edit tool: indentation-tolerant matching](#edit-tool-indentation-tolerant-matching)
 - [Nested AGENTS.md and CLAUDE.md](#nested-agentsmd-and-claudemd)
+- [Context and compaction](#context-and-compaction)
 - [System prompt](#system-prompt)
 - [bash tool](#bash-tool)
 - [Melious provider](#melious-provider)
@@ -124,14 +125,18 @@ is read.
 
 ## Read before edit
 
-- `edit` and `write` refuse to change an existing file the agent has not read in this session.
+- `write` refuses to change an existing file the agent has not read in this session; `edit` too, unless every `oldText`
+  matches the file exactly once (the file was seen another way, with `cat` or `grep` in bash): then the file counts as
+  read, its diagnostics before the edit are taken, and the result says so. In Pi's sessions (23 Oct – 1 Nov 2026), 21% of
+  the edits (49 of 232) went to files seen only through bash, each of which the guard turned into a refusal, a read and
+  a second edit (an extra step, 3.7 s median). deepseek-harness turned its guard off altogether.
 - They refuse a file that changed since it was read: its content differs from what was last read or written. A newer
   modification time (more than 10 ms) with the same content, such as after `touch` or a formatter that changed nothing,
   is not a change.
 - `edit` still applies to a file that changed on disk when every `oldText` matches the current content exactly once,
   and says so in its result; the agent does not have to read the file again. `write` replaces the whole file, so it
   keeps refusing.
-- The edit tool's guidelines tell the model to read a file before its first edit.
+- The edit tool's guidelines say when an edit of an unread or changed file applies.
 - Files of 1 MB or more read in pieces can still be edited. Files with CRLF line endings or a BOM keep them across edits.
 - After an edit, the result shows the changed lines with 3 lines of context.
 
@@ -153,12 +158,33 @@ lines equal to one of `oldText`'s lines, else the lines most like its first line
 When the agent reads a file, the `AGENTS.override.md`, `AGENTS.md` or `CLAUDE.md` of each folder between the project root
 and that file is added to the result, once per session (as Claude Code does). The root's own file is not repeated.
 
+## Context and compaction
+
+- Compaction starts at 128,000 tokens at most, whatever the context window (`compaction.maxContextTokens`): every turn
+  re-reads the context, and on a 1M window it used to wait until 900,000.
+- Once the context passes 40,000 tokens, tool results older than the latest 8 with at least 2,000 characters (or an
+  image) go to the model as a one-line note; the session keeps them. The boundary moves in steps of 8 results, so the
+  prompt cache is rebuilt once per step (`toolResultPruning`).
+- The compaction summary is asked for as a continuation of the session's own request (the next request's messages plus
+  the instruction), so the provider reads it from its prompt cache, as deepseek-harness does. Measured in Pi's sessions
+  before (23 Oct – 1 Nov 2026): all 4 compactions read nothing from the cache, 26k to 508k input tokens each, 14 to 95 s.
+  Falls back to the standalone request for another compaction model, on an overflow, a tool call or an answer cut off
+  with reasoning on; other errors fail the compaction as before, without a second request.
+  Measured with melious/deepseek-v4.1-flash, 4 runs each (manual compaction over RPC): after ten long answers (76k–119k
+  tokens), 8.4k instead of 54k new input tokens (median; 70k–110k read from the cache); after reading six files (82k),
+  0.4k–0.7k new and 82k cached instead of 4.2k, because the standalone request cuts every tool result to 2,000
+  characters (its summary sees less). The time is the same (4.4 vs 4.5 s, 1.2 s with the files): it follows the
+  summary's length.
+
 ## System prompt
 
 - Added: make independent tool calls in parallel in one response.
 - Added: keep changes to what was asked: no unrequested features, unrelated refactors, or comments on unchanged code.
 - Added: a `<communication>` section (verify premises first, bottom line first, correct directly, short paragraphs, label
   certainty as verified, likely or unsupported).
+- Added to bash's guidelines: do not wait for a command with `sleep` or a polling loop; give it a timeout (it then goes on
+  in the background and reports when it ends) and go on with other work (from deepseek-harness; in Pi's sessions, 80
+  local `sleep` calls waited 2.8 h). Its effect is not measured.
 - Removed: "Be concise in your responses".
 
 ## bash tool
@@ -171,6 +197,18 @@ and that file is added to the result, once per session (as Claude Code does). Th
   after `\r` only as it was last written), and commands run with `NO_COLOR=1` unless `NO_COLOR` or `FORCE_COLOR` is set.
 - Output over 2000 lines or 32 KB (was 50 KB, the end only) keeps its first 40 lines (up to 4 KB) and its end, so the
   first compiler error and the summary are both there. The full output is still saved to a file.
+- A command still running when its timeout ends goes on in the background instead of being ended: the call returns its
+  output so far, the job's pid and its output file, and when the command ends a message reports its exit code and the
+  last 2 KB of its output, after the current run or as a new turn when the agent is idle (as deepseek-harness does).
+  Jobs end with Pi and do not keep `pi -p` running. In Pi's sessions (23 Oct – 1 Nov 2026), 17 timeouts had ended 1.6 h
+  of running commands, one after 90 min. `PI_BASH_BACKGROUND_ON_TIMEOUT=off` ends them as before.
+- Commands that only read (`git status/log/diff/show`, `cat`, `rg`, `grep`, `find` without `-exec`/`-delete`, ...,
+  joined by pipes, `&&`, `||`, `;`; no redirections or substitutions) start while the model's message still streams, as
+  read and grep do. Measured: a faux model at 100–1000 tokens/s with three such calls gets their results when the
+  message ends instead of 5.4–5.9 ms after it; in pibench (melious/glm-5.3-flash, 4 tasks, 5 runs each) the difference
+  was within the noise (13.4 vs 13.8 s), as bash commands took 12 ms median. `PI_EARLY_BASH=off` turns it off.
+- After a command ran through the pre-started bash, `pi -p` and `pi --mode json` exited again (the waiting shell's pipes
+  held the event loop, so they never exited).
 
 ## Melious provider
 
@@ -187,5 +225,10 @@ Melious lists that are not built in are added. Without a connection, the built-i
 - `packages/coding-agent/test/tool-result-pruning.test.ts`: 5 cases for clearing old tool results.
 - `packages/coding-agent/test/native-search.test.ts` and `tools.test.ts`: the fork's cases for the search caches (globs,
   invalidation, bash changes, the content pool), the bash tool's output and the edit tool's closest-text hint.
+- `packages/coding-agent/test/suite/request-prefix.test.ts`: every request of a session (tool calls, parallel calls, a
+  second prompt) starts with the previous one, in the session's messages and in the payloads the Anthropic and
+  OpenAI-completions providers build from them (cache markers aside), with the same system prompt and tools; and a
+  snapshot of the built-in tool schemas. A change that breaks the prompt cache fails it (checked with an extension that
+  rewrites an old message), as deepseek-harness checks.
 - `packages/ai/test/melious-models.test.ts`: 3 cases for the Melious catalog.
 - `packages/docsearch`: 17 Rust tests, and test sets that measure a change query by query (`eval/`).

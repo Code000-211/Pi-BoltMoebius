@@ -891,6 +891,11 @@ describe("Coding Agent Tools", () => {
 			expect(getTextOutput(result)).toBe("step 3");
 		});
 
+		it("tells the model not to wait for commands with sleep", () => {
+			const guidelines = createBashToolDefinition(testDir).promptGuidelines ?? [];
+			expect(guidelines.some((line) => line.startsWith("Do not wait for a command with sleep"))).toBe(true);
+		});
+
 		it("runs commands with NO_COLOR unless colors were asked for", () => {
 			const saved = { NO_COLOR: process.env.NO_COLOR, FORCE_COLOR: process.env.FORCE_COLOR };
 			try {
