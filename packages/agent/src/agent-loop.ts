@@ -1166,7 +1166,8 @@ class EarlyToolCalls {
 		if (!this.candidates.has(index)) {
 			// A call that cannot start early means no later call may, so stop following the message.
 			const tool = this.tools.find((t) => t.name === block.name);
-			if (!tool || !this.decide(block, tool)) {
+			// Asked by the tool alone: the arguments are not complete yet. `start` asks again with them.
+			if (!tool || !this.decide({ ...block, arguments: {} }, tool)) {
 				this.close();
 				return;
 			}

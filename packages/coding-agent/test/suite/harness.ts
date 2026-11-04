@@ -122,6 +122,8 @@ export interface HarnessOptions {
 	modelsJson?: Record<string, unknown>;
 	/** Session to continue, for example to test a resume. Default: a new in-memory session. */
 	sessionManager?: SessionManager;
+	/** How fast the faux model streams; default: at once. */
+	tokensPerSecond?: number;
 }
 
 export interface Harness {
@@ -153,6 +155,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const fauxProvider: FauxProviderRegistration = registerFauxProvider({
 		provider: options.provider,
 		models: options.models,
+		tokensPerSecond: options.tokensPerSecond,
 	});
 	fauxProvider.setResponses([]);
 	const model = fauxProvider.getModel();
