@@ -170,7 +170,11 @@ and that file is added to the result, once per session (as Claude Code does). Th
   before (23 Oct – 1 Nov 2026): all 4 compactions read nothing from the cache, 26k to 508k input tokens each, 14 to 95 s.
   Falls back to the standalone request for another compaction model, on an overflow, a tool call or an answer cut off
   with reasoning on; other errors fail the compaction as before, without a second request.
-  The cache hits themselves are not measured yet.
+  Measured with melious/deepseek-v4.1-flash, 4 runs each (manual compaction over RPC): after ten long answers (76k–119k
+  tokens), 8.4k instead of 54k new input tokens (median; 70k–110k read from the cache); after reading six files (82k),
+  0.4k–0.7k new and 82k cached instead of 4.2k, because the standalone request cuts every tool result to 2,000
+  characters (its summary sees less). The time is the same (4.4 vs 4.5 s, 1.2 s with the files): it follows the
+  summary's length.
 
 ## System prompt
 
