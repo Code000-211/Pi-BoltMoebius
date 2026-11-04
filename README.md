@@ -1,26 +1,67 @@
-# Pi-Bolt fork
+# Pi-Lightspeed
 
-A fork of [Pi-Bolt](https://github.com/opensec-git/Pi-Bolt). This page covers only what it changes. Measured numbers
-are marked as such; the others are limits the code sets.
+**A Pi-Bolt fork whose agent wastes less time.** [Pi-Bolt](https://github.com/opensec-git/Pi-Bolt) is Pi, the coding agent,
+compiled ahead of time to one native executable. Pi-Lightspeed keeps all of that and works on the agent itself: how fast
+it finds code, what it learns from each edit, how it runs long commands, and how much context it sends again. Measured
+numbers say how they were measured; anything not measured says so.
 
-- [Faster grep and find](#faster-grep-and-find)
-- [project_search](#project_search)
-- [Diagnostics after every edit](#diagnostics-after-every-edit)
-- [Read before edit](#read-before-edit)
-- [Edit tool: indentation-tolerant matching](#edit-tool-indentation-tolerant-matching)
-- [Nested AGENTS.md and CLAUDE.md](#nested-agentsmd-and-claudemd)
+The executable is still called `pi-bolt`, and Pi-Bolt's commands (`pi-bolt compile`, `pi-bolt update`) work as before.
+
+## At a glance
+
+| Area | What Pi-Lightspeed does better | Measured |
+|---|---|---|
+| [Search](#finding-code) | `grep`/`find` keep the file tree and contents in memory and match with SIMD | `grep` 1.7–6× faster, `find` 7.5× (p50) |
+| [Search](#project_search) | `project_search`: code and docs search that finds a function's definition first | definition first 55% → **83%**; doc answer in top 3 40% → **83%** |
+| [Editing](#compiler-diagnostics-after-every-edit) | The compiler's new errors come back with every `edit`/`write` (C, C++, HIP, Rust) | Rust edit without errors 401 → **104 ms** |
+| [Editing](#fewer-refused-edits) | An exact edit applies even to a file seen only through bash | 21% of real edits were refused before |
+| [Editing](#edit-matching) | Edits that miss by indentation still apply; a miss shows the closest lines | |
+| [Commands](#background-jobs-instead-of-sleep) | Long commands become background jobs that wake the agent; a `wait` tool; no fixed `sleep` | 97 real `sleep` calls had waited 3.2 h |
+| [Commands](#job-hub) | A job hub (`alt+j`): every background job, its live output, stop with `x` | |
+| [Commands](#bash-output-and-speed) | Output keeps the first error *and* the summary; read-only commands start while the model still writes | |
+| [Context](#context-and-compaction) | Compaction at 128k at most, old tool results shortened, summaries from the prompt cache | compaction input 54k → **8.4k** new tokens |
+| [Provider](#melious-provider) | Melious built in, with live context windows and prices | |
+
+## Contents
+
+- [Install](#install)
+- [Finding code](#finding-code) · [project_search](#project_search)
+- [Editing](#editing): [diagnostics](#compiler-diagnostics-after-every-edit) ·
+  [fewer refused edits](#fewer-refused-edits) · [edit matching](#edit-matching)
+- [Running commands](#running-commands): [background jobs](#background-jobs-instead-of-sleep) ·
+  [job hub](#job-hub) · [output and speed](#bash-output-and-speed)
 - [Context and compaction](#context-and-compaction)
-- [System prompt](#system-prompt)
-- [bash tool](#bash-tool)
-- [Melious provider](#melious-provider)
-- [Tests](#tests)
+- [System prompt](#system-prompt) · [Melious provider](#melious-provider)
+- [Switches](#switches) · [Tests](#tests) · [Credits](#credits)
 
-## Faster grep and find
+## Install
 
-The in-process `grep` and `find` keep the project's file tree and file contents in memory between calls, and match
-literal patterns with a native SIMD search (AVX2 on x86-64, NEON on ARM64).
+There are no releases of Pi-Lightspeed yet; it is built from source with Pi-Bolt's own scripts. Needs git, Python 3 and Node.js
+22.19 or later. Tested on Linux x86-64.
 
-| Measured | Pi-Bolt | This fork | |
+```bash
+git clone https://github.com/Code000-211/Pi-Lightspeed.git && cd Pi-Lightspeed
+scripts/fetch-runtime.sh             # Pi-Bolt's runtime from its latest signed release -> .work/runtime/bun
+scripts/prepare-pi.sh                # builds Pi from this repository
+scripts/build-pi.sh --kit .work/kit  # -> out/pi-bolt/pi, and the kit for compiling extensions in
+out/pi-bolt/pi --version
+```
+
+To replace an installed Pi-Bolt, put `out/pi-bolt` where its installer put the build (on Linux x86-64
+`~/.pi-bolt/pi-bolt-linux-x64`; keep the old folder to go back), then compile your extensions in again:
+
+```bash
+pi-bolt compile --kit .work/kit --runtime .work/runtime/bun
+```
+
+[docsearch](packages/docsearch) (`project_search`) is installed with `packages/docsearch/install.sh` before that compile.
+
+## Finding code
+
+`grep` and `find` keep the project's file tree and file contents in memory between calls, and match literal patterns with
+a native SIMD search (AVX2 on x86-64, NEON on ARM64).
+
+| Measured | Pi-Bolt | Pi-Lightspeed | |
 |---|---:|---:|---:|
 | `grep` a function name (case-sensitive), p50 | 12.8 ms | **7.5 ms** | 1.7× |
 | `grep` a word, ignoring case, p50 | 11.3 ms | **1.9 ms** | 6× |
@@ -31,29 +72,33 @@ literal patterns with a native SIMD search (AVX2 on x86-64, NEON on ARM64).
 <sub>Measured: both implementations in Bun on a 1,400-file C++/HIP project, Linux x86-64 (Ryzen 7 5800X3D); 60 function
 names and 60 words, each searched 5 times, medians; two runs agreed within 0.4 ms.</sub>
 
-- File tree reused for 2 s without checks, then revalidated against the modification times of up to 4096 folders
-  (measured: 0.2 ms for 137 folders, 0.43 ms for 296).
-- After every `bash` command (the agent's or a `!` command) the next `grep` or `find` checks the tree and the files'
-  times at once, so files a command created or changed (`sed -i`, a code generator) are found without waiting out
-  those 2 s and 1.5 s. A tree of more than 4096 folders is walked again then.
-- `grep` with a glob uses the cached tree too (it walked the folders again on every call): the walk keeps the files ignore
-  files leave out aside, for globs, which take them as ripgrep's `--glob` does. Measured on the same project, p50 of 24
-  searches: `*.cpp` 3.8 → 2.2 ms, `*.{h,hpp}` 2.7 → 1.4 ms, `src/**/*.hip` 1.4 → 0.08 ms.
-- Contents cached up to 64 MB in all and 512 KB per file; within 1.5 s of a check, a file is not stat'ed again. When the
-  pool is full, the files stored longest ago go first. (Before, a changed file's old bytes stayed counted, so after
-  64 MB of changes nothing new was cached, and files read or written were added past the limit.)
+**Never stale.** After every `bash` command (the agent's or a `!` command) the next search checks the tree and the files'
+times at once, so files a command created or changed (`sed -i`, a code generator) are found right away.
+
+<details>
+<summary>How the caches work</summary>
+
+- The file tree is reused for 2 s without checks, then revalidated against the modification times of up to 4096 folders
+  (measured: 0.2 ms for 137 folders, 0.43 ms for 296). A larger tree is walked again.
+- `grep` with a glob uses the cached tree too (it walked the folders on every call). Measured on the same project, p50 of
+  24 searches: `*.cpp` 3.8 → 2.2 ms, `*.{h,hpp}` 2.7 → 1.4 ms, `src/**/*.hip` 1.4 → 0.08 ms. The files ignore files leave
+  out are kept aside for globs, which take them as ripgrep's `--glob` does.
+- Contents are cached up to 64 MB in all and 512 KB per file; within 1.5 s of a check, a file is not stat'ed again. When
+  the pool is full, the files stored longest ago go first. (Before, a changed file's old bytes stayed counted, so after
+  64 MB of changes nothing new was cached.)
 - A file read or written that the cached tree does not know makes it walk again only when the file is in its folder and
   not below a folder an ignore file leaves out (before: every cached tree, for any such file, such as a read in `build/`).
 - A `find` glob that matches nothing returns the closest paths by fuzzy match instead.
 - Without a C compiler to build the native search, the caches still work and matching falls back to TypeScript.
 
-## project_search
+</details>
 
-[docsearch](packages/docsearch): a search over the project's code and documentation, in Rust, compiled into Pi-Bolt with
-`pi-bolt compile`. The agent gets the tool `project_search`, matching doc sections are added to a typed prompt, and `/docs`
-searches by hand. No model runs at search time: BM25 over sections and a graph of sections and the names they mention. Code
-is split at its definitions (C/C++/HIP, Rust, Python, TypeScript/JavaScript, Go, shell), so a function's name finds its
-definition first.
+### project_search
+
+[docsearch](packages/docsearch) searches the project's code and documentation, in Rust, compiled into Pi-Bolt. The agent
+gets the tool `project_search`, matching doc sections are added to a typed prompt, and `/docs` searches by hand. No model
+runs at search time: BM25 over sections plus a graph of sections and the names they mention. Code is split at its
+definitions (C/C++/HIP, Rust, Python, TypeScript/JavaScript, Go, shell), so a function's name finds its definition first.
 
 | Measured | `grep` | `project_search` |
 |---|---:|---:|
@@ -64,9 +109,10 @@ definition first.
 | Time per search, function by name | 6.4 ms | **0.05 ms** |
 
 <sub>Both in one Bun process on the same snapshot of the same project; 60 doc questions and 60 function names with known
-answers. grep was given each question's rarest word, which favours it: an agent does not know the counts before it searches.</sub>
+answers. grep was given each question's rarest word, which favours it: an agent does not know the counts before it
+searches.</sub>
 
-| Measured in pibench (`melious/glm-5.3-flash`, median of 5 runs) | Without | With |
+| In pibench (`melious/glm-5.3-flash`, median of 5 runs) | Without | With |
 |---|---:|---:|
 | Look up a setting in the docs | 1.4 s, 2 turns | **0.6 s, 1 turn** |
 | Find a function by what it does | 6.5 s, 8 turns | **5.6 s, 6 turns** |
@@ -75,178 +121,218 @@ answers. grep was given each question's rarest word, which favours it: an agent 
 <sub>Tasks that did not use it moved by up to 30% either way between runs, the noise at 5 runs; every run gave the right
 answer.</sub>
 
-- TypeScript, JavaScript, Go and shell files are split at their definitions too (they were split like plain text):
-  measured on 60 function and type names in Pi-Bolt's own sources, the definition first 53% → 98%, among the first 3
-  83% → 100%.
+<details>
+<summary>Index, memory and updates</summary>
+
+- TypeScript, JavaScript, Go and shell files are split at their definitions (they were split like plain text). Measured
+  on 60 function and type names in Pi-Bolt's own sources: the definition first 53% → 98%, among the first 3 83% → 100%.
 - The index is a mapped file: the first process builds it (0.9 s for 1,400 files), every later one is ready in 0.3 ms
-  (measured: 12.4 ms before; the contents of a version of the file are checked once, by the first process that maps it,
-  and a stamp beside it lets the others skip reading every page; their first search takes 1.4–1.7 ms, as before).
+  (12.4 ms before). The first process to map a version checks its contents once; a stamp beside it lets the others skip
+  reading every page.
 - About 32 MB per process, plus 110 MB of index shared by every process on the project (about 460 MB each without).
-- A changed file is searchable within a second (51 ms in the test) without rewriting the index; the index is rebuilt once
-  nothing has changed for 30 s and the overlay holds 20 files or is 10 minutes old (before: after any 30 s without
-  changes, so an agent editing a file a minute rebuilt it, about 0.9 s of CPU and a new mapping in every process).
-- While the first build runs, a search waits for it on a worker thread (`await whenReady`), so Pi's screen and Escape keep
-  working; before, the search blocked the event loop for up to 5 s (measured: a 985 ms build, 911 timer ticks meanwhile
-  instead of none). `grep` stays the tool for exact text across all files, such as every call site.
+- A changed file is searchable within a second (51 ms in the test) without rewriting the index. The index is rebuilt once
+  nothing has changed for 30 s and 20 files changed or 10 minutes passed (before: after any 30 s without changes, about
+  0.9 s of CPU and a new mapping in every process).
+- While the first build runs, a search waits on a worker thread, so the screen and Escape keep working (before, it
+  blocked the event loop for up to 5 s).
+- `grep` stays the tool for exact text across all files, such as every call site.
 
-Install: `packages/docsearch/install.sh`, then `pi-bolt compile` ([details](packages/docsearch)).
+</details>
 
-## Diagnostics after every edit
+## Editing
 
-After `edit` or `write` on C, C++, HIP or Rust, the tool result lists the compiler diagnostics the edit introduced, as a
-`<new-diagnostics>` block. The ones that were there before are left out: they are collected in the background when the file
-is read.
+### Compiler diagnostics after every edit
+
+After `edit` or `write` on C, C++, HIP or Rust, the tool result lists the compiler diagnostics **the edit introduced**, as
+a `<new-diagnostics>` block. Errors that were there before are left out: they are collected in the background when the
+file is read. The model sees its mistake in the same step instead of at the next build.
+
+- **C, C++, HIP**: libclang in process when a libclang library is found (`LIBCLANG_PATH`, ROCm's, or the system's), else
+  clangd (`CLANGD_PATH`, `/opt/rocm/llvm/bin/clangd`, or on `PATH`). Flags come from `compile_commands.json` in the
+  project or up to 5 parent folders (also `build/`, `out/`, `cmake-build-*`). A header is checked inside a source that
+  includes it, also through `-I` folders.
+- **Rust**: rust-analyzer with cargo check on save. The wait ends when the check of the saved file ends. Measured on a
+  400-function crate: an edit without errors 401 → **104 ms**. cargo check runs in `target/rust-analyzer`, so it does not
+  hold the lock of the agent's own `cargo build` and `cargo test`.
+- Without these tools the edit goes through as before, with no diagnostics.
+
+<details>
+<summary>Limits and details</summary>
 
 | Limit | |
 |---|---:|
 | Diagnostics listed per edit | 15, then "and N more" |
 | C/C++/HIP, clangd: wait for an edit / for the baseline on read | 350 ms / 1.5 s |
-| Rust, rust-analyzer: wait for an edit / for the baseline on read, at most | 400 ms / 0.8 s |
+| Rust: wait for an edit / for the baseline on read, at most | 400 ms / 0.8 s |
 | Rust: cargo check results that arrive later | settled 0.3 s after the check ends, or after 2 s without news; then added to the next tool result (up to 10 per file) |
 | Error limit passed to the compiler | 20 |
+| libclang translation units kept | the 8 used last (before: all, for the whole session) |
 
-- **C, C++, HIP** (`.c .cc .cpp .cxx .cu .hip` and headers): through libclang in process when a libclang library is found
-  (`LIBCLANG_PATH`, ROCm's, or the system's), else clangd (`CLANGD_PATH`, `/opt/rocm/llvm/bin/clangd`, or on `PATH`).
-  Flags come from `compile_commands.json` in the project or one of up to 5 parent folders (also in `build/`, `out/`,
-  `cmake-build-*`), cleaned of GCC-only flags; HIP gets one `--offload-arch` (`HCC_AMDGPU_TARGET`, `HIP_OFFLOAD_ARCH`, else
-  `gfx1100`). A header is checked inside a source read in the session that includes it, relative to its own folder or
-  through one of its `-I` folders; without one, on its own with the flags of a source near it (before, the source read
-  last stood in, and a header it did not include got no diagnostics).
-- libclang keeps the 8 translation units used last (before: every one, for the whole session; one with the ROCm
-  headers' preamble holds tens to hundreds of MB). A unit is parsed again when its flags change (a new
-  `compile_commands.json`), and a failed reparse parses with the unit's own flags (before: with none).
-- **Rust:** rust-analyzer (`RUST_ANALYZER_PATH` or on `PATH`) with cargo check on save. The wait for an edit ends when
-  the cargo check of the saved file ends: rust-analyzer 1.99 reports nothing else after an edit, so an edit without
-  errors used to wait the whole 400 ms. Measured on a 400-function crate: an edit without errors 401 → 104 ms, with an
-  error 104 ms as before. cargo check runs in its own folder (`target/rust-analyzer`), so it does not hold the lock of
-  the agent's `cargo build` and `cargo test` (`PI_RUST_ANALYZER_TARGET_DIR=shared` to share `target/`, or a folder).
-- Without these tools the edit goes through as before, with no diagnostics. A diagnostic that was fixed and comes back is
-  reported again; a second copy of an existing one counts as new.
+- GCC-only flags are removed; HIP gets one `--offload-arch` (`HCC_AMDGPU_TARGET`, `HIP_OFFLOAD_ARCH`, else `gfx1100`).
+- A unit is parsed again when its flags change; a failed reparse uses the unit's own flags (before: none).
+- A header no source read in the session includes is checked on its own with the flags of a source near it (before, the
+  source read last stood in).
+- A diagnostic that was fixed and comes back is reported again; a second copy of an existing one counts as new.
 
-## Read before edit
+</details>
 
-- `write` refuses to change an existing file the agent has not read in this session; `edit` too, unless every `oldText`
-  matches the file exactly once (the file was seen another way, with `cat` or `grep` in bash): then the file counts as
-  read, its diagnostics before the edit are taken, and the result says so. In Pi's sessions (23 Oct – 1 Nov 2026), 21% of
-  the edits (49 of 232) went to files seen only through bash, each of which the guard turned into a refusal, a read and
-  a second edit (an extra step, 3.7 s median). deepseek-harness turned its guard off altogether.
-- They refuse a file that changed since it was read: its content differs from what was last read or written. A newer
-  modification time (more than 10 ms) with the same content, such as after `touch` or a formatter that changed nothing,
-  is not a change.
-- `edit` still applies to a file that changed on disk when every `oldText` matches the current content exactly once,
-  and says so in its result; the agent does not have to read the file again. `write` replaces the whole file, so it
-  keeps refusing.
-- The edit tool's guidelines say when an edit of an unread or changed file applies.
-- Files of 1 MB or more read in pieces can still be edited. Files with CRLF line endings or a BOM keep them across edits.
+### Fewer refused edits
+
+Pi refuses to edit a file the agent has not read, so it never overwrites what it did not see. That guard also turned
+every edit of a file the agent had seen through `cat` or `grep` into a refusal, a read and a second edit: in real
+sessions (23 Oct – 1 Nov 2026) that was **21% of all edits** (49 of 232), 3.7 s each (median).
+
+- `edit` applies to an unread file when **every `oldText` matches it exactly once**: the file then counts as read, its
+  diagnostics before the edit are taken, and the result says so. Inexact edits and `write` still refuse.
+- The same holds for a file that changed on disk since it was read: an exact, unique match applies without a re-read.
+- `touch`, or a formatter that changed nothing, is not a change (same content, newer time).
+- Files of 1 MB or more read in pieces can still be edited; CRLF line endings and a BOM are kept.
+
+### Edit matching
+
+- When `oldText` matches neither exactly nor by the existing fuzzy match, lines are compared ignoring leading and trailing
+  whitespace (Codex's `seek_sequence`), and `newText` is re-indented to the file's indentation: the model's spaces become
+  the file's tabs, also for lines nested deeper than any line of `oldText`. More than one match is still refused.
+- When `oldText` matches nowhere, the error shows **the closest text in the file** with line numbers (up to 20 lines) and
+  the first line that differs, so the model fixes the edit without reading the file again (9–48 ms on 50,000 lines).
 - After an edit, the result shows the changed lines with 3 lines of context.
+- When the agent reads a file, the `AGENTS.override.md`, `AGENTS.md` or `CLAUDE.md` of each folder between the project
+  root and that file is added to the result, once per session (as Claude Code does).
 
-## Edit tool: indentation-tolerant matching
+## Running commands
 
-When `oldText` matches neither exactly nor by the existing fuzzy match, the edit tool compares line by line ignoring
-leading and trailing whitespace (Codex's `seek_sequence`), and re-indents `newText` to the file's indentation, for example
-when the model sends spaces and the file uses tabs. More than one match is still refused. Lines `newText` adds deeper
-than any line of `oldText` are counted in the model's unit of indentation (4 spaces, say) and written in the file's (a
-tab, 2 spaces): before, only the first line's indentation was swapped, so such a line came out as a tab and 4 spaces.
+### Background jobs instead of sleep
 
-When `oldText` matches nowhere, the error shows the closest text in the file with its line numbers (up to 20 lines)
-and the first line that differs, so the model can correct the edit without reading the file again. Candidates are the
-lines equal to one of `oldText`'s lines, else the lines most like its first line (character-pair similarity of at least
-0.5). Measured on 50,000 near-identical lines: 9 ms when one line of `oldText` is in the file, 48 ms when none is.
+In real sessions, models waited for builds and tests with commands like `sleep 295; tail build.log`: 97 such calls waited
+3.2 hours, either past the moment the job had ended or not long enough, which cost another turn. Pi-Lightspeed gives the agent
+a way to wait that ends exactly when the job does (as [oh-my-pi](https://github.com/can1357/oh-my-pi) does).
 
-## Nested AGENTS.md and CLAUDE.md
+- **Automatic background.** A command still running after 60 s goes on in the background as a job (`bg1`, `bg2`, …);
+  `background: true` starts it there right away. The call returns the output so far, the pid and the output file. A
+  `timeout` still ends the command, in the background too.
+- **The agent is woken.** When a job ends, the agent gets its exit code and the last 2 KB of its output: before its next
+  request while it works, or as a new turn when it is idle. Jobs that end within 1.5 s come in one report.
+- **`wait` tool.** Blocks until one of the session's jobs ends and returns its report; with nothing running it returns
+  at once. Empty waits back off (5 s, 10 s, 30 s, 60 s, 5 min) and from the second one on tell the model to do other
+  work. A message from the user ends a wait.
+- **No fixed sleeps.** A command that sleeps more than 10 s outside a loop is not run; the error tells the model to call
+  `wait`, or to loop on the condition itself (`until curl -sf …; do sleep 2; done`, also over ssh for a job on another
+  machine). Short sleeps, sleeps inside a loop and commands started in the background run. Of the 97 real `sleep` calls,
+  it would have refused 28.
+- Jobs end with Pi and never keep `pi -p` running; `pi -p` waits for running jobs and gives their reports a turn first.
 
-When the agent reads a file, the `AGENTS.override.md`, `AGENTS.md` or `CLAUDE.md` of each folder between the project root
-and that file is added to the result, once per session (as Claude Code does). The root's own file is not repeated.
+Not measured yet: how much time this saves with real models.
+
+### Job hub
+
+`alt+j` or `/jobs` opens every background job of the session (like oh-my-pi's agent hub, without subagents). Example:
+
+```text
+Jobs  1 running · 1 ended
+› ● bg2   running        2m 5s  cargo build --release
+  ✗ bg1   exit 101         10s  cargo test
+command cargo build --release
+output  /tmp/pi-bash-….log
+   Compiling …                      ← the end of its output, live
+↑↓ select · enter output · x stop · escape close
+```
+
+Enter shows a job's whole output to scroll through, `x` stops it. While jobs run, the status line shows
+`● 2 jobs running (alt+j)`.
+
+### bash output and speed
+
+- **Both ends of long output.** Output over 2000 lines or 32 KB keeps its first 40 lines and its end (was 50 KB, the end
+  only), so the first compiler error and the summary both reach the model. The full output is saved to a file.
+- **Clean output.** Escape sequences, control characters and progress-bar redraws are removed, and commands run with
+  `NO_COLOR=1` unless `NO_COLOR` or `FORCE_COLOR` is set.
+- **Early start.** Commands that only read (`git status/log/diff/show`, `cat`, `rg`, `grep`, `find` without
+  `-exec`/`-delete`, …, without redirections or substitutions) start while the model's message still streams, as `read`
+  and `grep` do. With a fast faux model, results are ready when the message ends instead of 5.4–5.9 ms after. In pibench
+  the difference was within the noise (13.4 vs 13.8 s), as real bash commands took 12 ms median.
+- **No shell where none is needed.** A command without shell syntax runs its program directly; others run in a bash
+  started ahead of time and kept ready.
+- `pi -p` and `pi --mode json` exit again after a command ran through that pre-started bash (its pipes held the event
+  loop).
 
 ## Context and compaction
 
-- Compaction starts at 128,000 tokens at most, whatever the context window (`compaction.maxContextTokens`): every turn
-  re-reads the context, and on a 1M window it used to wait until 900,000.
-- Once the context passes 40,000 tokens, tool results older than the latest 8 with at least 2,000 characters (or an
-  image) go to the model as a one-line note; the session keeps them. The boundary moves in steps of 8 results, so the
-  prompt cache is rebuilt once per step (`toolResultPruning`).
-- The compaction summary is asked for as a continuation of the session's own request (the next request's messages plus
-  the instruction), so the provider reads it from its prompt cache, as deepseek-harness does. Measured in Pi's sessions
-  before (23 Oct – 1 Nov 2026): all 4 compactions read nothing from the cache, 26k to 508k input tokens each, 14 to 95 s.
-  Falls back to the standalone request for another compaction model, on an overflow, a tool call or an answer cut off
-  with reasoning on; other errors fail the compaction as before, without a second request.
-  Measured with melious/deepseek-v4.1-flash, 4 runs each (manual compaction over RPC): after ten long answers (76k–119k
-  tokens), 8.4k instead of 54k new input tokens (median; 70k–110k read from the cache); after reading six files (82k),
-  0.4k–0.7k new and 82k cached instead of 4.2k, because the standalone request cuts every tool result to 2,000
-  characters (its summary sees less). The time is the same (4.4 vs 4.5 s, 1.2 s with the files): it follows the
-  summary's length.
+- **Compaction at 128,000 tokens at most**, whatever the window (`compaction.maxContextTokens`). Every turn re-reads the
+  context; on a 1M window it used to wait until 900,000.
+- **Old tool results shortened.** Once the context passes 40,000 tokens, tool results older than the latest 8 with 2,000
+  characters or more (or an image) go to the model as a one-line note; the session keeps them. The boundary moves in steps
+  of 8, so the prompt cache is rebuilt once per step (`toolResultPruning`).
+- **Summaries from the prompt cache.** The compaction summary is asked for as a continuation of the session's own
+  request, so the provider reads the conversation from its cache (as deepseek-harness does). Before, all 4 compactions in
+  real sessions read nothing from the cache (26k to 508k input tokens, 14 to 95 s each).
+
+| Measured: `melious/deepseek-v4.1-flash`, manual compaction, 4 runs each | Before | Pi-Lightspeed |
+|---|---:|---:|
+| After ten long answers (76k–119k tokens): new input tokens, median | 54k | **8.4k** (+70k–110k from cache) |
+| After reading six large files (82k tokens): new input tokens | 4.2k | 0.4k–0.7k (+82k from cache) |
+| Time, median | 4.5 s | 4.4 s |
+
+<sub>The time follows the summary's length, not the input. With large files the standalone request sent less because it
+cuts every tool result to 2,000 characters, so its summary also saw less. Falls back to the standalone request for
+another compaction model, an overflow, a tool call, or an answer cut off with reasoning on. Measured with DeepSeek
+only.</sub>
+
+A test checks that every request of a session starts with the previous one, as sent to Anthropic and OpenAI-compatible
+providers, so a change that would break the prompt cache fails it.
 
 ## System prompt
 
 - Added: make independent tool calls in parallel in one response.
-- Added: keep changes to what was asked: no unrequested features, unrelated refactors, or comments on unchanged code.
+- Added: keep changes to what was asked (no unrequested features, unrelated refactors, or comments on unchanged code).
 - Added: a `<communication>` section (verify premises first, bottom line first, correct directly, short paragraphs, label
   certainty as verified, likely or unsupported).
-- Added to bash's guidelines: a command still running after a minute goes on in the background as a job, and a message
-  reports when it ends; go on with other work, call `wait` only when nothing else is left, and do not wait with `sleep`
-  or poll (from deepseek-harness and oh-my-pi; in Pi's sessions, 97 `sleep` calls waited 3.2 h). Its effect is not
-  measured.
+- Added to bash's guidelines: long commands go to the background and report when they end; go on with other work, call
+  `wait` only when nothing else is left, do not `sleep` or poll. Effect not measured.
 - Removed: "Be concise in your responses".
-
-## bash tool
-
-- A command without shell syntax (no pipes, redirection, variables, quotes or globs) runs its program directly, without
-  starting a shell.
-- Other commands run in a bash started ahead of time and kept ready, when the shell and folder match.
-- Shell lookups on Windows are cached. Not measured.
-- The model gets the output without escape sequences, control characters or progress-bar redraws (a line rewritten
-  after `\r` only as it was last written), and commands run with `NO_COLOR=1` unless `NO_COLOR` or `FORCE_COLOR` is set.
-- Output over 2000 lines or 32 KB (was 50 KB, the end only) keeps its first 40 lines (up to 4 KB) and its end, so the
-  first compiler error and the summary are both there. The full output is still saved to a file.
-- Background jobs, as in oh-my-pi: a command still running after 60 s goes on in the background as a job (`bg1`, `bg2`,
-  ...), and one called with `background: true` starts there. The call returns its output so far, the job's pid and its
-  output file. A `timeout` still ends the command, in the background too; one that ends it within 60 s keeps it in the
-  foreground. When a job ends, the agent gets its exit code and the last 2 KB of its output: before its next request
-  when it is working, as a new turn when it is idle. Jobs that end within 1.5 s of each other come in one report. Jobs
-  end with Pi and do not keep `pi -p` running; `pi -p` waits for running jobs and gives their reports a turn before it
-  exits. `PI_BASH_AUTO_BACKGROUND=off` keeps commands in the foreground unless the call asks.
-- A `wait` tool (from oh-my-pi) blocks until one of the session's background jobs ends and returns its report, which
-  then does not come again as a message. With no job running it returns at once. A wait with nothing ending returns
-  after 5 s, the next one right after it after 10 s, then 30 s, 60 s and 5 min; from the second one on, it tells the
-  model to go on with other work. A message from the user ends a wait.
-- A command that sleeps a fixed time over 10 s outside a loop (`sleep 295; tail build.log`) is not run: the error tells
-  the model to call `wait` for a background job, or to wait for the thing itself in a loop (`until curl -sf ...; do
-  sleep 2; done`, or over ssh for a job on another machine), which ends as soon as it holds and goes to the background
-  after a minute. Sleeps inside a loop's body, of up to 10 s, or in a command started with `background: true` run. Of
-  the 97 `sleep` calls in Pi's sessions (20 Oct – 4 Nov 2026), it would have refused 28. `PI_BASH_SLEEP_GUARD=off`
-  turns it off.
-- A job hub, as oh-my-pi's agent hub but for background jobs only: `alt+j` or `/jobs` lists the session's jobs, newest
-  first, with status, running time and command, and below them the selected job's command, folder, pid, times, output
-  file and the end of its output, updated while it runs. Enter shows its whole output (as kept: the first lines and the
-  end) to scroll through, `x` stops a running job, Escape closes. While jobs run, the status line shows `● 2 jobs
-  running (alt+j)`. The built-in `/jobs` takes the name from an extension's (pi-background-tasks has one).
-- Commands that only read (`git status/log/diff/show`, `cat`, `rg`, `grep`, `find` without `-exec`/`-delete`, ...,
-  joined by pipes, `&&`, `||`, `;`; no redirections or substitutions) start while the model's message still streams, as
-  read and grep do. Measured: a faux model at 100–1000 tokens/s with three such calls gets their results when the
-  message ends instead of 5.4–5.9 ms after it; in pibench (melious/glm-5.3-flash, 4 tasks, 5 runs each) the difference
-  was within the noise (13.4 vs 13.8 s), as bash commands took 12 ms median. `PI_EARLY_BASH=off` turns it off.
-- After a command ran through the pre-started bash, `pi -p` and `pi --mode json` exited again (the waiting shell's pipes
-  held the event loop, so they never exited).
 
 ## Melious provider
 
-Provider `melious` (`MELIOUS_API_KEY`, `https://api.melious.ai/v1`), with 18 models built in and default model `glm-5.3`.
-With a key, context windows and prices are fetched from Melious when the model list is loaded (15 s timeout), and models
-Melious lists that are not built in are added. Without a connection, the built-in list is used.
+Provider `melious` (`MELIOUS_API_KEY`, `https://api.melious.ai/v1`), with 18 models built in and default model
+`glm-5.3`. With a key, context windows and prices are fetched from Melious when the model list is loaded (15 s timeout),
+and models Melious lists that are not built in are added. Without a connection, the built-in list is used.
+
+## Switches
+
+Everything above is on by default.
+
+| Setting or variable | Effect |
+|---|---|
+| `compaction.maxContextTokens` | Cap for the compaction threshold (default 128000) |
+| `toolResultPruning` | Shortening old tool results: `enabled`, `triggerTokens` (40000), `keepRecent` (8), `minChars` (2000) |
+| `PI_COMPACTION_CACHED_PREFIX=off` | Ask for compaction summaries as a standalone request |
+| `PI_BASH_AUTO_BACKGROUND=off` | Keep commands in the foreground unless the call asks for `background: true` |
+| `PI_BASH_SLEEP_GUARD=off` | Run fixed sleeps over 10 s |
+| `PI_EARLY_BASH=off` | Start read-only commands only after the model's message |
+| `PI_RUST_ANALYZER_TARGET_DIR` | `shared` to let cargo check use `target/`, or a folder |
+| `LIBCLANG_PATH`, `CLANGD_PATH`, `RUST_ANALYZER_PATH` | Where the diagnostics tools are |
+| `HCC_AMDGPU_TARGET`, `HIP_OFFLOAD_ARCH` | GPU target for HIP diagnostics (default `gfx1100`) |
+| `app.jobs.hub` keybinding | Opens the job hub (default `alt+j`) |
 
 ## Tests
 
-- `packages/coding-agent/test/claude-harness.test.ts`: 26 cases, with mock clangd and rust-analyzer, for the diagnostics,
-  read before edit, nested instruction files, the search caches, the bash fast paths and the edit fallback.
-- `packages/coding-agent/test/cpp-hip-engine.test.ts`: 3 cases against real libclang (skipped when the bridge is not
-  built): flags changed or kept per unit, the 8 units kept, a header checked in the source that includes it.
-- `packages/coding-agent/test/tool-result-pruning.test.ts`: 5 cases for clearing old tool results.
-- `packages/coding-agent/test/native-search.test.ts` and `tools.test.ts`: the fork's cases for the search caches (globs,
-  invalidation, bash changes, the content pool), the bash tool's output and the edit tool's closest-text hint.
-- `packages/coding-agent/test/suite/request-prefix.test.ts`: every request of a session (tool calls, parallel calls, a
-  second prompt) starts with the previous one, in the session's messages and in the payloads the Anthropic and
-  OpenAI-completions providers build from them (cache markers aside), with the same system prompt and tools; and a
-  snapshot of the built-in tool schemas. A change that breaks the prompt cache fails it (checked with an extension that
-  rewrites an old message), as deepseek-harness checks.
-- `packages/ai/test/melious-models.test.ts`: 3 cases for the Melious catalog.
-- `packages/docsearch`: 17 Rust tests, and test sets that measure a change query by query (`eval/`).
+Pi-Lightspeed's own tests, in `packages/coding-agent` unless noted:
+
+- `test/claude-harness.test.ts`: diagnostics with mock clangd and rust-analyzer, read before edit, nested instruction
+  files, the search caches, the bash fast paths and the edit fallback.
+- `test/cpp-hip-engine.test.ts`: against real libclang (skipped when the bridge is not built).
+- `test/background-jobs.test.ts`, `test/suite/agent-session-bash-background.test.ts`, `test/job-hub.test.ts`: jobs,
+  their reports and wake-ups, `wait`, the sleep guard and the hub.
+- `test/suite/request-prefix.test.ts`: every request starts with the previous one; a snapshot of the built-in tool
+  schemas.
+- `test/tool-result-pruning.test.ts`, `test/native-search.test.ts`, `test/tools.test.ts`, and
+  `packages/ai/test/melious-models.test.ts`.
+- `packages/docsearch`: 17 Rust tests, and test sets that measure a ranking change query by query (`eval/`).
+
+Run them with `bun x --bun vitest run` in `packages/coding-agent`.
+
+## Credits
+
+Ideas taken from [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) (compaction on the cached prefix,
+moving commands to the background, no sleep polling, the request-prefix test), [oh-my-pi](https://github.com/can1357/oh-my-pi)
+(background jobs, `wait`, the hub), Codex (`seek_sequence`) and Claude Code (nested instruction files). Built on
+[Pi-Bolt](https://github.com/opensec-git/Pi-Bolt) and [Pi](https://github.com/earendil-works/pi).
