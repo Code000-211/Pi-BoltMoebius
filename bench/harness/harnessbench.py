@@ -24,6 +24,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -829,13 +830,37 @@ def tool_suites() -> dict[str, list[Task]]:
 
 def parse_events(stdout: str) -> dict:
     stats = {"turns": 0, "tool_calls": 0, "tool_errors": 0, "error_kinds": {}, "tools": {}, "input": 0, "cache_read": 0,
+             "t_model": 0.0, "t_tools": 0.0, "t_first_event": None, "t_last_event": None,
              "cache_write": 0, "output": 0, "cost": 0.0, "stop": None, "error": None, "final_text": ""}
+    turn_start = None
+    tool_spans: dict[str, float] = {}
+    turn_tools: list[tuple[float, float]] = []
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if event.get("type") != "message_end":
+        t = event.get("_t")
+        kind = event.get("type")
+        if t is not None:
+            if stats["t_first_event"] is None:
+                stats["t_first_event"] = t
+            stats["t_last_event"] = t
+            if kind == "turn_start":
+                turn_start = t
+            elif kind == "message_end" and (event.get("message") or {}).get("role") == "assistant" and turn_start is not None:
+                # From the turn's start to the end of the model's message: request preparation, waiting, generation.
+                stats["t_model"] += t - turn_start
+                turn_start = None
+            elif kind == "tool_execution_start":
+                tool_spans[event.get("toolCallId", "")] = t
+            elif kind == "tool_execution_end" and event.get("toolCallId", "") in tool_spans:
+                turn_tools.append((tool_spans.pop(event.get("toolCallId", "")), t))
+            elif kind == "turn_end" and turn_tools:
+                # Tools of one turn may overlap: count the span they cover.
+                stats["t_tools"] += max(e for _, e in turn_tools) - min(s for s, _ in turn_tools)
+                turn_tools = []
+        if kind != "message_end":
             continue
         message = event.get("message") or {}
         role = message.get("role")
@@ -873,15 +898,37 @@ def run_one(task: Task, harness: str, cmd: list[str], agent_dir: Path, model: st
     env = dict(os.environ, PI_CODING_AGENT_DIR=str(agent_dir), CARGO_TARGET_DIR=str(root / "target"))
     args = cmd + ["--mode", "json", "--no-session", "-ne", "-ns", "-np", "-nc", "--no-mcp", "--model", model, task.prompt]
     start = time.monotonic()
+    # Each event line is stamped when it arrives (`_t`, seconds since the start), for the time split in parse_events.
+    p = subprocess.Popen(args, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         stdin=subprocess.DEVNULL)
+    stamped: list[str] = []
+    err_chunks: list[str] = []
+    reader = threading.Thread(target=lambda: err_chunks.append(p.stderr.read()), daemon=True)
+    reader.start()
+
+    def read_stdout() -> None:
+        for line in p.stdout:
+            t = round(time.monotonic() - start, 3)
+            try:
+                event = json.loads(line)
+                event["_t"] = t
+                stamped.append(json.dumps(event))
+            except json.JSONDecodeError:
+                stamped.append(line.rstrip("\n"))
+
+    out_reader = threading.Thread(target=read_stdout, daemon=True)
+    out_reader.start()
     try:
-        p = subprocess.run(args, cwd=root, env=env, capture_output=True, text=True, timeout=RUN_TIMEOUT_S,
-                           stdin=subprocess.DEVNULL)
-        stdout, stderr, timed_out = p.stdout, p.stderr, False
-    except subprocess.TimeoutExpired as e:
-        stdout = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
-        stderr = (e.stderr or b"").decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
+        p.wait(timeout=RUN_TIMEOUT_S)
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        p.kill()
+        p.wait()
         timed_out = True
+    out_reader.join(timeout=10)
+    reader.join(timeout=10)
     wall = time.monotonic() - start
+    stdout, stderr = "\n".join(stamped), "".join(err_chunks)
     (events_dir / f"{events_name}.jsonl").write_text(stdout)
     if stderr.strip():
         (events_dir / f"{events_name}.stderr").write_text(stderr[-20000:])
@@ -960,14 +1007,18 @@ def report(out_dir: Path) -> None:
         return " ".join(f"{k} {v}" for k, v in sorted(total.items())) or "-"
 
     lines = [f"# harnessbench: {out_dir.name}", "", f"{len(runs)} runs, models: {', '.join(models)}.", ""]
-    lines.append("| Model | Harness | Solved | Wall time, median | Turns, median | Tool errors (by cause) | New input | Cached input | Output | Cost |")
-    lines.append("|---|---|---:|---:|---:|---|---:|---:|---:|---:|")
+    lines.append("| Model | Harness | Solved | Wall time, median | Wall time, sum | Model / tools / rest, sum | Turns, median | Tool errors (by cause) | New input | Cached input | Output | Cost |")
+    lines.append("|---|---|---:|---:|---:|---|---:|---|---:|---:|---:|---:|")
     for m in models + (["all"] if len(models) > 1 else []):
         for h in harnesses:
             rs = [r for r in runs if r["harness"] == h and (m == "all" or r["model"] == m)]
             if not rs:
                 continue
+            model_s = sum(r.get("t_model", 0) for r in rs)
+            tools_s = sum(r.get("t_tools", 0) for r in rs)
+            wall_s = sum(r["wall"] for r in rs)
             lines.append(f"| {m} | {h} | {sum(r['solved'] for r in rs)}/{len(rs)} | {med([r['wall'] for r in rs]):.1f} s | "
+                         f"{wall_s:.0f} s | {model_s:.0f} / {tools_s:.0f} / {wall_s - model_s - tools_s:.0f} s | "
                          f"{med([r['turns'] for r in rs]):.0f} | {kinds(rs)} | "
                          f"{sum(r['input'] + r['cache_write'] for r in rs) / 1000:.0f}k | {sum(r['cache_read'] for r in rs) / 1000:.0f}k | "
                          f"{sum(r['output'] for r in rs) / 1000:.0f}k | ${sum(r['cost'] for r in rs):.2f} |")
