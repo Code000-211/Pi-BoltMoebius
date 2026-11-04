@@ -125,14 +125,18 @@ is read.
 
 ## Read before edit
 
-- `edit` and `write` refuse to change an existing file the agent has not read in this session.
+- `write` refuses to change an existing file the agent has not read in this session; `edit` too, unless every `oldText`
+  matches the file exactly once (the file was seen another way, with `cat` or `grep` in bash): then the file counts as
+  read, its diagnostics before the edit are taken, and the result says so. In Pi's sessions (23 Oct – 1 Nov 2026), 21% of
+  the edits (49 of 232) went to files seen only through bash, each of which the guard turned into a refusal, a read and
+  a second edit (an extra step, 3.7 s median). deepseek-harness turned its guard off altogether.
 - They refuse a file that changed since it was read: its content differs from what was last read or written. A newer
   modification time (more than 10 ms) with the same content, such as after `touch` or a formatter that changed nothing,
   is not a change.
 - `edit` still applies to a file that changed on disk when every `oldText` matches the current content exactly once,
   and says so in its result; the agent does not have to read the file again. `write` replaces the whole file, so it
   keeps refusing.
-- The edit tool's guidelines tell the model to read a file before its first edit.
+- The edit tool's guidelines say when an edit of an unread or changed file applies.
 - Files of 1 MB or more read in pieces can still be edited. Files with CRLF line endings or a BOM keep them across edits.
 - After an edit, the result shows the changed lines with 3 lines of context.
 

@@ -50,7 +50,7 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		rmSync(testDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 	});
 
-	it("blocks editing an existing file before it has been read, and allows it after read", async () => {
+	it("blocks an edit of an unread file unless every oldText matches it exactly once, and allows it after read", async () => {
 		const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
 		const readTool = createReadTool(testDir, { harness });
 		const editTool = createEditTool(testDir, {
@@ -66,7 +66,7 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		await expect(
 			editTool.execute("call-edit-1", {
 				path: "kernel.hip",
-				edits: [{ oldText: "return 0;", newText: "return 1;" }],
+				edits: [{ oldText: "return 5;", newText: "return 1;" }],
 			}),
 		).rejects.toThrow(/File has not been read yet\. Read it first before writing to it\./);
 
@@ -115,6 +115,34 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 				edits: [{ oldText: "int x = 1;", newText: "int x = 2;" }],
 			}),
 		).rejects.toThrow(/File has been modified since it was last read/);
+	});
+
+	it("applies an edit of a file seen only through bash when every oldText matches it exactly once", async () => {
+		const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
+		const editTool = createEditTool(testDir, { harness, enforceReadBeforeEdit: true, enableDiagnostics: false });
+		const writeTool = createWriteTool(testDir, { harness, enforceReadBeforeEdit: true, enableDiagnostics: false });
+		const filePath = join(testDir, "seen.ts");
+		writeFileSync(filePath, "const a = 1;\nconst b = 2;\nconst b2 = 2;\n", "utf-8");
+
+		const edited = await editTool.execute("e-seen", {
+			path: "seen.ts",
+			edits: [{ oldText: "const a = 1;", newText: "const a = 3;" }],
+		});
+		expect(getText(edited)).toContain(
+			"The file had not been read in this session; every oldText matched it exactly once.",
+		);
+		expect(readFileSync(filePath, "utf-8")).toBe("const a = 3;\nconst b = 2;\nconst b2 = 2;\n");
+		// Now it counts as read: the next edit needs no note.
+		expect(harness.stateTracker.hasBeenRead(filePath)).toBe(true);
+
+		// An oldText that is not there exactly once still asks for a read; write still refuses an unread file.
+		writeFileSync(join(testDir, "other.ts"), "x = 2;\nx = 2;\n", "utf-8");
+		await expect(
+			editTool.execute("e-other", { path: "other.ts", edits: [{ oldText: "x = 2;", newText: "y" }] }),
+		).rejects.toThrow(/File has not been read yet/);
+		await expect(writeTool.execute("w-other", { path: "other.ts", content: "z\n" })).rejects.toThrow(
+			/File has not been read yet/,
+		);
 	});
 
 	it("allows edit and write after a newer modification time with the same content (touch)", async () => {
@@ -177,7 +205,7 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 	it("tells the model to read before editing, the same for every edit tool", () => {
 		const guidelines = (enforce: boolean) =>
 			createEditToolDefinition(testDir, { enforceReadBeforeEdit: enforce }).promptGuidelines ?? [];
-		expect(guidelines(true).some((line) => line.startsWith("Read a file before you first edit it"))).toBe(true);
+		expect(guidelines(true).some((line) => line.startsWith("An edit of a file not read in this session"))).toBe(true);
 		// An extension re-registering the tool must not change the system prompt.
 		expect(guidelines(false)).toEqual(guidelines(true));
 	});
@@ -496,14 +524,15 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		writeFileSync(hipFile, "__global__ void vecAdd() {\n    int i = 0;\n}\n", "utf-8");
 
 		sessionHarness.setResponses([
-			// Turn 1: Model tries to edit vec_add.hip WITHOUT reading it first -> blocked!
+			// Turn 1: Model tries to edit vec_add.hip WITHOUT reading it first, with an inexact oldText -> blocked!
 			fauxAssistantMessage(
 				[
 					fauxToolCall(
 						"edit",
 						{
 							path: "vec_add.hip",
-							edits: [{ oldText: "int i = 0;", newText: "int i = threadIdx.x;" }],
+							// Not in the file as written: an exact unique match would apply without a read.
+							edits: [{ oldText: "int i=0;", newText: "int i = threadIdx.x;" }],
 						},
 						{ id: "call-blind-edit" },
 					),
