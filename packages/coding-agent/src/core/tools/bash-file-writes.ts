@@ -17,6 +17,8 @@ export interface FileWrite {
 	how: string;
 	/** The file, as written in the command. */
 	target: string;
+	/** The folder a leading `cd` moved to, which a relative target is in; "" for the command's own. */
+	dir: string;
 }
 
 interface Segment {
@@ -197,7 +199,7 @@ export function fileWritesInCommand(command: string): FileWrite[] {
 				// One file is what edit is for. The same replacement over many files (a glob, a list) is sed's job.
 				const target = files[0];
 				if (inPlace && files.length === 1 && target && !/[*?[]/.test(target) && !scratch(target)) {
-					writes.push({ how: `${name} -i`, target });
+					writes.push({ how: `${name} -i`, target, dir });
 				}
 			}
 		}
@@ -214,12 +216,12 @@ export function fileWritesInCommand(command: string): FileWrite[] {
 		for (const segment of pipeline) {
 			const { name, args } = commandName(segment.words);
 			for (const target of segment.redirects) {
-				if (!scratch(target)) writes.push({ how: "a redirection", target });
+				if (!scratch(target)) writes.push({ how: "a redirection", target, dir });
 			}
 			if (name === "tee") {
 				for (const target of args.filter((a) => !a.startsWith("-"))) {
 					if (!scratch(target) && !args.includes("-a") && !args.includes("--append"))
-						writes.push({ how: "tee", target });
+						writes.push({ how: "tee", target, dir });
 				}
 			}
 		}

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants, existsSync } from "node:fs";
 import { access as fsAccess, readFile as readFileAsync, stat as statAsync } from "node:fs/promises";
-import { constants as osConstants } from "node:os";
+import { homedir, constants as osConstants } from "node:os";
 import { resolve as resolvePath } from "node:path";
 import type { Writable } from "node:stream";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
@@ -206,6 +206,10 @@ function fixedSleepRefusal(seconds: number): string {
 		"or `until ssh host 'grep -q EXIT build.log'; do sleep 10; done` for a job on another machine: the loop ends as soon as the condition holds, " +
 		`and goes on in the background after a minute. A sleep of up to ${MAX_FIXED_SLEEP_SECONDS} seconds runs.`
 	);
+}
+
+function expandHome(path: string): string {
+	return path === "~" || path.startsWith("~/") ? `${homedir()}${path.slice(1)}` : path;
 }
 
 /** Why a command that changes files as the edit and write tools would was not run, and what to do instead. */
@@ -809,7 +813,13 @@ export function createShellToolDefinition(
 			}
 			if (options?.editToolActive?.() && process.env.PI_BASH_EDIT_GUARD !== "off") {
 				// From oh-my-pi's bash interceptor. In Pi's sessions, 65 of 2615 commands changed files this way.
-				const writes = fileWritesInCommand(command);
+				// Only files that exist: a new file has nothing to read first and no compiler errors to compare. (On a
+				// remote machine their existence is not known here: every such write is refused.)
+				const writes = fileWritesInCommand(command).filter(
+					(w) =>
+						options.operations !== undefined ||
+						existsSync(resolvePath(spawnContext.cwd, expandHome(w.dir), expandHome(w.target))),
+				);
 				if (writes.length > 0) throw new Error(fileWriteRefusal(writes));
 			}
 			// The command's own abort: the tool call's, until the command goes to the background.

@@ -17,7 +17,7 @@ describe("commands that change files as edit and write would", () => {
 		["tee notes.txt <<EOF\nx\nEOF", "notes.txt", "tee"],
 		["cd src && echo a > b.txt", "b.txt", "a redirection"],
 	])("finds %j", (command, target, how) => {
-		expect(fileWritesInCommand(command)).toEqual([{ how, target }]);
+		expect(fileWritesInCommand(command).map(({ how, target }) => ({ how, target }))).toEqual([{ how, target }]);
 	});
 
 	it.each([
@@ -53,6 +53,9 @@ describe("commands that change files as edit and write would", () => {
 			);
 			expect(readFileSync(join(dir, "a.txt"), "utf-8")).toBe("old\n");
 			await bash.execute("w2", { command: "echo log >> a.txt" });
+			// A new file has nothing to check: it is written.
+			await bash.execute("w2b", { command: "cat > b.txt <<'EOF'\nnew file\nEOF" });
+			expect(readFileSync(join(dir, "b.txt"), "utf-8")).toBe("new file\n");
 			editActive = false;
 			await bash.execute("w3", { command: "sed -i 's/old/new/' a.txt" });
 			expect(readFileSync(join(dir, "a.txt"), "utf-8")).toBe("new\nlog\n");
