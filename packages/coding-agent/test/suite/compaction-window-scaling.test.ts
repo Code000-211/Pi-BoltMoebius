@@ -10,7 +10,7 @@ import {
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { SUMMARIZATION_SYSTEM_PROMPT } from "../../src/core/compaction/index.ts";
 import { createHarness, type Harness, type HarnessOptions } from "./harness.ts";
 
@@ -139,6 +139,14 @@ function recordCompactions(harness: Harness, captured: Captured): void {
 }
 
 describe("compaction scaled with the context window", () => {
+	// The standalone summary request's caps; the request on the cached prefix is in agent-session-compaction.test.ts.
+	beforeAll(() => {
+		process.env.PI_COMPACTION_CACHED_PREFIX = "off";
+	});
+	afterAll(() => {
+		delete process.env.PI_COMPACTION_CACHED_PREFIX;
+	});
+
 	const harnesses: Harness[] = [];
 	afterEach(() => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();

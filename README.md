@@ -9,6 +9,7 @@ are marked as such; the others are limits the code sets.
 - [Read before edit](#read-before-edit)
 - [Edit tool: indentation-tolerant matching](#edit-tool-indentation-tolerant-matching)
 - [Nested AGENTS.md and CLAUDE.md](#nested-agentsmd-and-claudemd)
+- [Context and compaction](#context-and-compaction)
 - [System prompt](#system-prompt)
 - [bash tool](#bash-tool)
 - [Melious provider](#melious-provider)
@@ -152,6 +153,20 @@ lines equal to one of `oldText`'s lines, else the lines most like its first line
 
 When the agent reads a file, the `AGENTS.override.md`, `AGENTS.md` or `CLAUDE.md` of each folder between the project root
 and that file is added to the result, once per session (as Claude Code does). The root's own file is not repeated.
+
+## Context and compaction
+
+- Compaction starts at 128,000 tokens at most, whatever the context window (`compaction.maxContextTokens`): every turn
+  re-reads the context, and on a 1M window it used to wait until 900,000.
+- Once the context passes 40,000 tokens, tool results older than the latest 8 with at least 2,000 characters (or an
+  image) go to the model as a one-line note; the session keeps them. The boundary moves in steps of 8 results, so the
+  prompt cache is rebuilt once per step (`toolResultPruning`).
+- The compaction summary is asked for as a continuation of the session's own request (the next request's messages plus
+  the instruction), so the provider reads it from its prompt cache, as deepseek-harness does. Measured in Pi's sessions
+  before (23 Oct – 1 Nov 2026): all 4 compactions read nothing from the cache, 26k to 508k input tokens each, 14 to 95 s.
+  Falls back to the standalone request for another compaction model, on an overflow, a tool call or an answer cut off
+  with reasoning on; other errors fail the compaction as before, without a second request.
+  The cache hits themselves are not measured yet.
 
 ## System prompt
 

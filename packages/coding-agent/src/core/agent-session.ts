@@ -73,6 +73,8 @@ import {
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
+	compactOnCachedPrefix,
+	describeKeptMessage,
 	estimateContextTokens,
 	estimateProjectedContextTokens,
 	estimateTokens,
@@ -2962,6 +2964,11 @@ export class AgentSession {
 	): Promise<CompactionResult> {
 		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
 		const request = await this._getSummarizationRequestAuth(model, signal);
+		if (reason !== "overflow" && process.env.PI_COMPACTION_CACHED_PREFIX !== "off") {
+			const cached = await this._compactOnCachedPrefix(preparation, request, customInstructions, signal, reason);
+			if (cached) return cached;
+			if (signal.aborted) throw new Error("Compaction cancelled");
+		}
 		return compact(
 			preparation,
 			request.model,
@@ -2975,6 +2982,60 @@ export class AgentSession {
 			this.settingsManager.getRetrySettings(),
 			this._summarizationRetryCallbacks({ source: "compaction", reason }),
 			undefined, // sessionId
+		);
+	}
+
+	/**
+	 * The summary as the continuation of the session's own request, read from the provider's prompt cache (see
+	 * `compactOnCachedPrefix`). Only when the summary is asked of the session's own model and thinking level (another
+	 * model has no cache of this conversation), and not on an overflow, whose request did not fit. Undefined to fall
+	 * back to the standalone summary request. `PI_COMPACTION_CACHED_PREFIX=off` turns it off.
+	 */
+	private async _compactOnCachedPrefix(
+		preparation: CompactionPreparation,
+		request: Awaited<ReturnType<AgentSession["_getSummarizationRequestAuth"]>>,
+		customInstructions: string | undefined,
+		signal: AbortSignal,
+		reason: "manual" | "threshold",
+	): Promise<CompactionResult | undefined> {
+		const sessionModel = this.agent.state.model;
+		const thinkingLevel = this.agent.state.thinkingLevel;
+		if (
+			request.model.provider !== sessionModel.provider ||
+			request.model.id !== sessionModel.id ||
+			request.thinkingLevel !== thinkingLevel
+		) {
+			return undefined;
+		}
+		// The messages the session's next request would send (see _installAgentRequestProjection and agent-loop).
+		let messages: AgentMessage[] = this.sessionManager.buildSessionProjection().messages;
+		if (this.agent.transformContext) messages = await this.agent.transformContext(messages, signal);
+		const llmMessages = await this.agent.convertToLlm(messages);
+		const kept = preparation.firstKeptEntryId
+			? this.sessionManager.getEntry(preparation.firstKeptEntryId)
+			: undefined;
+		const keptMessage = kept?.type === "message" ? kept.message : undefined;
+		return compactOnCachedPrefix(
+			preparation,
+			{
+				messages: llmMessages,
+				model: request.model,
+				options: {
+					apiKey: request.apiKey,
+					headers: request.headers,
+					env: request.env,
+					signal,
+					reasoning: thinkingLevel === "off" ? undefined : thinkingLevel,
+					sessionId: this.agent.sessionId,
+					transport: this.agent.transport,
+					thinkingBudgets: this.agent.thinkingBudgets,
+				},
+				streamFn: this.agent.streamFunction,
+				retry: this.settingsManager.getRetrySettings(),
+				callbacks: this._summarizationRetryCallbacks({ source: "compaction", reason }),
+			},
+			keptMessage ? describeKeptMessage(keptMessage) : undefined,
+			customInstructions,
 		);
 	}
 
