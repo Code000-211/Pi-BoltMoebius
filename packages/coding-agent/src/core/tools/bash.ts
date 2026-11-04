@@ -225,6 +225,21 @@ function warmCommandInput(child: ChildProcess): Writable | undefined {
 	return (WARM_BASH_FD3 ? child.stdio[3] : child.stdin) as Writable | undefined;
 }
 
+/**
+ * Whether a waiting warm shell keeps the process alive: not while it waits (`pi -p` and `--mode json` would never exit
+ * once a command ran through it), again once it runs a command. `unref` on the child alone leaves its pipes holding the
+ * event loop.
+ */
+function holdWarmShell(child: ChildProcess, hold: boolean): void {
+	for (const stream of [child.stdout, child.stderr, warmCommandInput(child)]) {
+		const handle = stream as unknown as { ref?: () => void; unref?: () => void } | null | undefined;
+		if (hold) handle?.ref?.();
+		else handle?.unref?.();
+	}
+	if (hold) child.ref();
+	else child.unref();
+}
+
 function quoteBashSingle(value: string): string {
 	return `'${value.replace(/'/g, "'\\''")}'`;
 }
@@ -280,7 +295,7 @@ function spawnWarmBashCandidate(
 		child.on("exit", () => {
 			if (warmBashProcess?.child === child) warmBashProcess = undefined;
 		});
-		child.unref();
+		holdWarmShell(child, false);
 		return { child, shellExe, cwd, msys };
 	} catch {
 		return undefined;
@@ -351,7 +366,7 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 					warmBashProcess = undefined;
 					child = taken.child;
 					msys = taken.msys;
-					child.ref();
+					holdWarmShell(child, true);
 					const envPrefix = env ? buildEnvDiffScript(defaultShellEnv, shellEnv) : "";
 					const input = warmCommandInput(child);
 					input?.on("error", () => {});

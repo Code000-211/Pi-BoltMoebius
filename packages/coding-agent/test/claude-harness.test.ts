@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -730,6 +731,21 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		// 4. Single-syscall ls
 		const lsRes = await lsTool.execute("ls-fast", {});
 		expect(getText(lsRes)).toContain("fast.txt");
+	});
+
+	it("lets the process exit after a command ran through the warm bash worker", () => {
+		// The worker started for the next command must not hold the event loop (`pi -p` and `--mode json` hung).
+		const script = join(testDir, "exit-after-bash.ts");
+		const bashModule = join(import.meta.dirname, "..", "src", "core", "tools", "bash.ts");
+		writeFileSync(
+			script,
+			`import { createBashTool } from ${JSON.stringify(bashModule)};\n` +
+				`const tool = createBashTool(${JSON.stringify(testDir)});\n` +
+				`for (const command of ["echo a | cat", "echo b | cat"]) await tool.execute("x", { command });\n`,
+		);
+		const result = spawnSync(process.execPath, [script], { timeout: 15_000, encoding: "utf-8" });
+		expect(result.error).toBeUndefined();
+		expect(result.status).toBe(0);
 	});
 
 	it("gives a command run by the warm bash worker an empty stdin, not the rest of its own script", async () => {
