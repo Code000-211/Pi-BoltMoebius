@@ -7,6 +7,10 @@ numbers say how they were measured; anything not measured says so.
 
 The executable is still called `pi-bolt`, and Pi-Bolt's commands (`pi-bolt compile`, `pi-bolt update`) work as before.
 
+**Measured against stock Pi 1.4.0** with [harnessbench](bench/harness) (14 coding tasks with hidden tests, two models, 5
+runs each, 280 runs): the same tasks solved (137/140 vs 138/140) in **17% less time** (1,740 vs 2,099 s; 95% CI of the
+ratio 0.69–0.92), with fewer turns (median 4 vs 5) and 20% lower cost. [Details](#benchmark).
+
 ## At a glance
 
 | Area | What Pi-Lightspeed does better | Measured |
@@ -22,6 +26,7 @@ The executable is still called `pi-bolt`, and Pi-Bolt's commands (`pi-bolt compi
 | [Commands](#bash-output-and-speed) | Output keeps the first error *and* the summary; read-only commands start while the model still writes | |
 | [Remote](#working-on-another-machine) | `/remote host:folder`: read, edit, write and bash work there over ssh, with the same checks | one ssh login, then a round trip per call |
 | [Context](#context-and-compaction) | Compaction at 128k at most, old tool results shortened, summaries from the prompt cache | compaction input 54k → **8.4k** new tokens |
+| [Turns](#fewer-turns) | A listing of the project in the prompt, an edit and its test in one response, a smaller prompt than Pi's | median 4 turns vs 5–6 |
 | [Provider](#melious-provider) | Melious built in, with live context windows and prices | |
 
 ## Contents
@@ -34,7 +39,7 @@ The executable is still called `pi-bolt`, and Pi-Bolt's commands (`pi-bolt compi
 - [Running commands](#running-commands): [background jobs](#background-jobs-instead-of-sleep) ·
   [job hub](#job-hub) · [output and speed](#bash-output-and-speed)
 - [Working on another machine](#working-on-another-machine)
-- [Context and compaction](#context-and-compaction)
+- [Context and compaction](#context-and-compaction) · [Fewer turns](#fewer-turns) · [Benchmark](#benchmark)
 - [System prompt](#system-prompt) · [Melious provider](#melious-provider)
 - [Switches](#switches) · [Tests](#tests) · [Credits](#credits)
 
@@ -63,7 +68,8 @@ pi-bolt compile --kit .work/kit --runtime .work/runtime/bun
 ## Finding code
 
 `grep` and `find` keep the project's file tree and file contents in memory between calls, and match literal patterns with
-a native SIMD search (AVX2 on x86-64, NEON on ARM64).
+a native SIMD search (AVX2 on x86-64, NEON on ARM64). They are not on by default (`--tools +grep,+find` or the
+`defaultTools` setting): their schemas cost every request about 400 tokens, and models search with `rg` in bash anyway.
 
 | Measured | Pi-Bolt | Pi-Lightspeed | |
 |---|---:|---:|---:|
@@ -188,6 +194,7 @@ sessions (23 Oct – 1 Nov 2026) that was **21% of all edits** (49 of 232), 3.7 
 
 - `edit` applies to an unread file when **every `oldText` matches it exactly once**: the file then counts as read, its
   diagnostics before the edit are taken, and the result says so. Inexact edits and `write` still refuse.
+- A bash command that prints files whole with `cat` (output not cut) counts as reading them.
 - The same holds for a file that changed on disk since it was read: an exact, unique match applies without a re-read.
 - `touch`, or a formatter that changed nothing, is not a change (same content, newer time).
 - Files of 1 MB or more read in pieces can still be edited; CRLF line endings and a BOM are kept.
@@ -209,13 +216,13 @@ Models often change files through bash instead: Claude Opus changed files with b
 in real sessions. Those changes skip everything above. While the `edit` tool is there, the bash tool refuses a command
 that changes a file as `edit` or `write` would and says to use them:
 
-- `sed -i` and `perl -i` on a file;
-- text the command spells out (`echo`, `printf`, a heredoc through `cat` or `tee`) written into a file.
+- `sed -i` and `perl -i` on one file;
+- text the command spells out (`echo`, `printf`, a heredoc through `cat` or `tee`) written into a file that exists.
 
-Appends (`>>`, `tee -a`), files under `/tmp` (also after `cd /tmp`), a program's output redirected into a file
-(`make > build.log`) and anything inside quotes, such as a command run over `ssh`, still run. Of the 2,615 bash commands
-in Pi's sessions (20 Oct – 4 Nov 2026), it would have refused 65 (42 `sed -i`, 33 redirections). Scripts that rewrite
-files (`python3 - <<EOF … open(p, "w")`) are not caught; bash's guidelines ask for `edit` and `write` instead.
+The same replacement over many files (`sed -i … src/*.py`, `xargs sed -i`) runs: one `sed` beats 20 edits (in
+harnessbench, a rule against it made models 2.8–6× slower on such a task). New files, appends (`>>`, `tee -a`), files under `/tmp` (also after `cd /tmp`), a program's output redirected into a file
+(`make > build.log`) and anything inside quotes, such as a command run over `ssh`, still run. Scripts that rewrite files
+(`python3 - <<EOF … open(p, "w")`) are not caught.
 
 ## Running commands
 
@@ -225,13 +232,13 @@ In real sessions, models waited for builds and tests with commands like `sleep 2
 3.2 hours, either past the moment the job had ended or not long enough, which cost another turn. Pi-Lightspeed gives the agent
 a way to wait that ends exactly when the job does (as [oh-my-pi](https://github.com/can1357/oh-my-pi) does).
 
-- **Automatic background.** A command still running after 60 s goes on in the background as a job (`bg1`, `bg2`, …);
+- **Automatic background.** A command still running after 120 s goes on in the background as a job (`bg1`, `bg2`, …);
   `background: true` starts it there right away. The call returns the output so far, the pid and the output file. A
   `timeout` still ends the command, in the background too.
 - **The agent is woken.** When a job ends, the agent gets its exit code and the last 2 KB of its output: before its next
   request while it works, or as a new turn when it is idle. Jobs that end within 1.5 s come in one report.
 - **`wait` tool.** Blocks until one of the session's jobs ends and returns its report; with nothing running it returns
-  at once. Empty waits back off (5 s, 10 s, 30 s, 60 s, 5 min) and from the second one on tell the model to do other
+  at once. It blocks up to 2 min, then 5 and 10 (oh-my-pi starts at 5 s, which only cost turns), and from the second empty one on tells the model to do other
   work. A message from the user ends a wait.
 - **No fixed sleeps.** A command that sleeps more than 10 s outside a loop is not run; the error tells the model to call
   `wait`, or to loop on the condition itself (`until curl -sf …; do sleep 2; done`, also over ssh for a job on another
@@ -319,15 +326,46 @@ only.</sub>
 A test checks that every request of a session starts with the previous one, as sent to Anthropic and OpenAI-compatible
 providers, so a change that would break the prompt cache fails it.
 
+## Fewer turns
+
+Every turn costs a request (about 0.8 s with these models even when the answer is short), and in harnessbench 95% of a
+run's time was the model's. So:
+
+- **The project is in the prompt.** A `<project>` section, taken once per session, lists the working folder's files (git's,
+  up to 150; a larger project by folders with file counts). Nearly every run used to begin by listing the folder.
+  `PI_PROJECT_SNAPSHOT=full` adds small files' contents (faster with deepseek-v4.1-flash, slower with glm-5.3-flash,
+  which then planned everything at once), `=off` leaves it out.
+- **An edit and its test in one response.** The calls of a response run in order when one of them is `edit`, `write` or
+  `bash`, and the prompt says that all edits for a fix and the command that tests them can go together.
+- **A smaller prompt than Pi's.** 2.2k characters of rules, tool list and docs pointer against Pi's 2.9k: concise answers
+  (finish once running the tests or the program shows the work is done), no `grep`/`find` schemas by default, a two-line
+  docs pointer. The first version of this fork carried 1,000 tokens more per request than Pi and was slower.
+- `cat` in bash counts as reading, so `write` and `edit` do not refuse a file the model has seen.
+
+## Benchmark
+
+[harnessbench](bench/harness): 14 small projects (Python, C, Rust, TypeScript), each with hidden tests that decide
+whether the task is solved; every harness runs with no extensions, skills or instruction files, the same provider config,
+and its own agent folder. Pi 1.4.0 from npm (Node 24) against Pi-Lightspeed, 4 November 2026:
+
+| Model | | Solved | Time, sum | Turns, median | Cost |
+|---|---|---:|---:|---:|---:|
+| glm-5.3-flash | Pi 1.4.0 | 70/70 | 1,211 s | 6 | $0.11 |
+| | Pi-Lightspeed | 69/70 | **1,009 s** | 5 | $0.09 |
+| deepseek-v4.1-flash | Pi 1.4.0 | 68/70 | 888 s | 5 | $0.15 |
+| | Pi-Lightspeed | 68/70 | **731 s** | 4 | $0.12 |
+
+<sub>Time ratio 0.829 (95% CI 0.690–0.923, bootstrap over task/model pairs and runs); geometric mean of the 28 per-pair
+ratios 0.749 (0.657–0.852). Two earlier runs of nearly the same build gave 0.896 (0.780–0.994) and 0.836 (0.680–0.951).
+Failures are the same rounding case for both harnesses, plus one C task. The 72 s test suite of one task takes the same
+time in both. Provider latency varies by run: compare within a run, not across.</sub>
+
 ## System prompt
 
-- Added: make independent tool calls in parallel in one response.
-- Added: keep changes to what was asked (no unrequested features, unrelated refactors, or comments on unchanged code).
-- Added: a `<communication>` section (verify premises first, bottom line first, correct directly, short paragraphs, label
-  certainty as verified, likely or unsupported).
-- Added to bash's guidelines: long commands go to the background and report when they end; go on with other work, call
-  `wait` only when nothing else is left, do not `sleep` or poll. Effect not measured.
-- Removed: "Be concise in your responses".
+- Rules: Pi's, minus the ones above made redundant, plus: put calls that need no answer in between into one response; be
+  concise and finish once running the tests or the program shows the work is done; commands running over two minutes go
+  to the background, do not sleep or poll.
+- The docs pointer is two lines instead of seven.
 
 ## Melious provider
 
@@ -348,6 +386,7 @@ Everything above is on by default.
 | `PI_BASH_SLEEP_GUARD=off` | Run fixed sleeps over 10 s |
 | `PI_EARLY_BASH=off` | Start read-only commands only after the model's message |
 | `PI_BASH_EDIT_GUARD=off` | Run `sed -i` and text redirected into files |
+| `PI_PROJECT_SNAPSHOT=full` / `off` | The project listing with small files' contents / none |
 | `--remote <host>[:<folder>]`, `PI_REMOTE` | Start working on that machine (as `/remote`) |
 | `PI_SSH_COMMAND` | The ssh program (default `ssh`) |
 | `PI_RUST_ANALYZER_TARGET_DIR` | `shared` to let cargo check use `target/`, or a folder |
