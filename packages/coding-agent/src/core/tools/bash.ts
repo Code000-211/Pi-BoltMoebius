@@ -55,8 +55,7 @@ const bashSchema = Type.Object({
 	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
 	background: Type.Optional(
 		Type.Boolean({
-			description:
-				"Start the command in the background right away: the call returns at once, and a message reports when it ends",
+			description: "Start in the background at once; a message reports its end",
 		}),
 	),
 });
@@ -66,8 +65,7 @@ export const bashToolSystemPromptContribution = {
 	guidelines: [
 		"You can inspect PI_* environment variables for current model and session details.",
 		// From deepseek-harness and oh-my-pi. In Pi's sessions, 97 `sleep` calls waited 3.2 h for other commands.
-		"Change files with edit and write, not with sed -i, a shell redirection or a script that rewrites them: those skip the checks edit and write do.",
-		"A command still running after a minute goes on in the background as a job (background: true starts it there right away), and a message reports when it ends. Meanwhile, go on with work that does not depend on it; call wait only when nothing else is left. Do not wait with sleep or poll for it.",
+		"Commands still running after a minute continue in the background and report when they end: do other work meanwhile, never sleep or poll.",
 	],
 } as const;
 
@@ -663,7 +661,7 @@ export function createShellToolDefinition(
 	return {
 		name: config.name,
 		label: config.label,
-		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output longer than ${DEFAULT_MAX_LINES} lines or ${BASH_MAX_BYTES / 1024}KB keeps its first ${BASH_HEAD_LINES} lines and its end; the full output is then saved to a temp file. Colors and progress-bar redraws are removed. Optionally provide a timeout in seconds, after which the command is ended.${jobs && autoBackgroundSeconds > 0 ? ` A command still running after ${autoBackgroundSeconds} seconds goes on in the background as a job, and a message reports when it ends.` : ""}`,
+		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr; long output keeps its first ${BASH_HEAD_LINES} lines and its end, the full output is saved to a file. Optional timeout in seconds.${jobs && autoBackgroundSeconds > 0 ? ` Commands running over ${autoBackgroundSeconds} s continue in the background and report their end.` : ""}`,
 		promptSnippet: config.promptSnippet,
 		promptGuidelines: exposeSessionEnvironment && config.promptGuidelines ? [...config.promptGuidelines] : undefined,
 		parameters: bashSchema,

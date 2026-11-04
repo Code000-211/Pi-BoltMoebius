@@ -120,9 +120,8 @@ describe("buildSystemPrompt", () => {
 			});
 
 			expect(prompt).toContain(
-				"- When reading pi docs or examples, resolve docs/... under Additional docs and examples/... under Examples, not the current working directory",
+				"docs/... and examples/... paths are under those folders, not the working folder.",
 			);
-			expect(prompt).toContain("environment variables (docs/environment-variables.md), MCP servers (docs/mcp.md)");
 		});
 	});
 

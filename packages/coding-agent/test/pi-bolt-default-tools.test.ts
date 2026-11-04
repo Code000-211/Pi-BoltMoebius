@@ -9,8 +9,8 @@ vi.mock("../src/pi-bolt.ts", async (importOriginal) => ({
 }));
 
 describe("Pi-Bolt's default tools", () => {
-	test("grep and find are on by default", () => {
-		expect(DEFAULT_TOOL_NAMES).toEqual(["read", "bash", "edit", "write", "grep", "find", "wait"]);
+	test("grep and find are not on by default, wait is", () => {
+		expect(DEFAULT_TOOL_NAMES).toEqual(["read", "bash", "edit", "write", "wait"]);
 		expect(defaultToolNamesFor(["/home/me/.pi/agent/extensions/word-count.ts"])).toEqual(DEFAULT_TOOL_NAMES);
 	});
 

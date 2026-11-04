@@ -183,10 +183,22 @@ export function fileWritesInCommand(command: string): FileWrite[] {
 				const inPlace = args.some(
 					(a) => a === "--in-place" || a.startsWith("--in-place=") || /^-[a-zA-Z]*i/.test(a),
 				);
-				// The files are the last arguments that are not options or the script.
-				const files = args.filter((a) => !a.startsWith("-"));
-				const target = files.at(-1);
-				if (inPlace && target && files.length >= 2 && !scratch(target)) writes.push({ how: `${name} -i`, target });
+				// The script comes with -e or -f, or else as the first word that is not an option; the rest are files.
+				const positional: string[] = [];
+				let script = false;
+				for (let k = 0; k < args.length; k++) {
+					const a = args[k]!;
+					if (a === "-e" || a === "-f" || a === "--expression" || a === "--file" || /^-[a-zA-Z]*e$/.test(a)) {
+						script = true;
+						k++;
+					} else if (!a.startsWith("-")) positional.push(a);
+				}
+				const files = script ? positional : positional.slice(1);
+				// One file is what edit is for. The same replacement over many files (a glob, a list) is sed's job.
+				const target = files[0];
+				if (inPlace && files.length === 1 && target && !/[*?[]/.test(target) && !scratch(target)) {
+					writes.push({ how: `${name} -i`, target });
+				}
 			}
 		}
 		// Text the command spells out: the pipeline starts with echo or printf, or with cat or tee reading a heredoc
@@ -214,3 +226,4 @@ export function fileWritesInCommand(command: string): FileWrite[] {
 	}
 	return writes;
 }
+

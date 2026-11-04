@@ -50,8 +50,6 @@ export const editToolSystemPromptContribution = {
 		"When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls",
 		"Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.",
 		"Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.",
-		// The same for every edit tool (an extension's too, which re-registers it): the session's refuses files not read.
-		"An edit of a file not read in this session, or changed on disk since it was read, applies only when every oldText matches the file exactly once; otherwise read the file first.",
 	],
 } as const;
 

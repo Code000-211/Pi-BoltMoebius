@@ -9,7 +9,7 @@ describe("commands that change files as edit and write would", () => {
 	it.each([
 		["sed -i 's/a/b/' src/x.ts", "src/x.ts", "sed -i"],
 		["perl -pi -e 's/a/b/' a.c", "a.c", "perl -i"],
-		["sed -i.bak -e 's/x/y/' /tmp/a /etc/hosts", "/etc/hosts", "sed -i"],
+		["sed -i -e 's/a/b/' -e 's/c/d/' src/x.ts", "src/x.ts", "sed -i"],
 		["cat > src/new.py <<'EOF'\nprint(1) > other\nEOF\necho done", "src/new.py", "a redirection"],
 		["cat <<EOF > notes.md\nhi\nEOF", "notes.md", "a redirection"],
 		["echo hello > README.md", "README.md", "a redirection"],
@@ -22,6 +22,10 @@ describe("commands that change files as edit and write would", () => {
 
 	it.each([
 		"cd x && sed -n '1,20p' src/x.ts",
+		"sed -i 's/legacy_hash(/stable_hash(/' src/mod_*.py",
+		"sed -i -e 's/a/b/' src/a.py src/b.py",
+		"grep -rl old src | xargs sed -i 's/old/new/'",
+		"sed -i.bak -e 's/x/y/' /tmp/a /etc/hosts",
 		"echo hello >> /tmp/x.log",
 		"cat >> NOTES.md <<EOF\nx\nEOF",
 		"tee -a log.txt <<EOF\nx\nEOF",

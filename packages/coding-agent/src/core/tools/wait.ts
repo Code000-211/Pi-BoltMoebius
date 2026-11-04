@@ -28,7 +28,7 @@ export const waitToolSystemPromptContribution = {
 } as const;
 
 const DESCRIPTION =
-	"Wait until one of your background jobs ends, and get its report (exit code, end of its output). Call it only when nothing else is left to do: a job's report also comes on its own as a message. Returns at once when no job runs.";
+	"Wait for one of your background jobs to end and get its report. Only when nothing else is left to do.";
 
 export function createWaitToolDefinition(
 	options?: WaitToolOptions,
