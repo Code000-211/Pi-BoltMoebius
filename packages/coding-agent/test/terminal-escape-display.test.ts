@@ -221,6 +221,7 @@ describe("terminal escape sequences from a model, a tool or an MCP server", () =
 				subscribe: vi.fn(() => () => {}),
 				prompt: vi.fn(async () => {}),
 				reload: vi.fn(async () => {}),
+				waitForBackgroundJobs: vi.fn(async () => {}),
 			},
 			newSession: vi.fn(),
 			fork: vi.fn(),

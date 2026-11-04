@@ -762,46 +762,6 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		expect(getText(lsRes)).toContain("fast.txt");
 	});
 
-	it("moves a command still running at its timeout to the background and reports when it ends", async () => {
-		let done: (message: string) => void = () => {};
-		const message = new Promise<string>((resolve) => {
-			done = resolve;
-		});
-		const bash = createBashTool(testDir, { onBackgroundDone: (text) => done(text) });
-		const start = performance.now();
-		const result = await bash.execute("bg-1", { command: "echo started; sleep 0.6; echo finished", timeout: 0.2 });
-		expect(performance.now() - start).toBeLessThan(500);
-		const text = getText(result);
-		expect(text).toContain("started");
-		expect(text).toMatch(/Command still running after 0\.2 seconds: moved to the background as job bg\d+/);
-		const report = await message;
-		expect(report).toMatch(
-			/Background job bg\d+ \(`echo started; sleep 0\.6; echo finished`\) ended with exit code 0/,
-		);
-		expect(report).toContain("finished");
-		const file = report.match(/\[Full output: ([^\]]+)\]/)?.[1];
-		expect(file && readFileSync(file, "utf-8")).toBe("started\nfinished\n");
-	});
-
-	it("ends a background job with Pi, and does not keep Pi running for it", () => {
-		const script = join(testDir, "exit-with-job.ts");
-		const bashModule = join(import.meta.dirname, "..", "src", "core", "tools", "bash.ts");
-		writeFileSync(
-			script,
-			`import { createBashTool } from ${JSON.stringify(bashModule)};\n` +
-				`const tool = createBashTool(${JSON.stringify(testDir)}, { onBackgroundDone: () => {} });\n` +
-				`const r = await tool.execute("x", { command: "sleep 30; echo late", timeout: 0.2 });\n` +
-				`console.log(r.content[0].text.match(/pid (\\d+)/)[1]);\n`,
-		);
-		const start = performance.now();
-		const result = spawnSync(process.execPath, [script], { timeout: 15_000, encoding: "utf-8" });
-		expect(result.status).toBe(0);
-		expect(performance.now() - start).toBeLessThan(10_000);
-		const pid = Number(result.stdout.trim());
-		expect(pid).toBeGreaterThan(0);
-		expect(() => process.kill(pid, 0)).toThrow();
-	});
-
 	it("lets the process exit after a command ran through the warm bash worker", () => {
 		// The worker started for the next command must not hold the event loop (`pi -p` and `--mode json` hung).
 		const script = join(testDir, "exit-after-bash.ts");

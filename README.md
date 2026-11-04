@@ -182,9 +182,10 @@ and that file is added to the result, once per session (as Claude Code does). Th
 - Added: keep changes to what was asked: no unrequested features, unrelated refactors, or comments on unchanged code.
 - Added: a `<communication>` section (verify premises first, bottom line first, correct directly, short paragraphs, label
   certainty as verified, likely or unsupported).
-- Added to bash's guidelines: do not wait for a command with `sleep` or a polling loop; give it a timeout (it then goes on
-  in the background and reports when it ends) and go on with other work (from deepseek-harness; in Pi's sessions, 80
-  local `sleep` calls waited 2.8 h). Its effect is not measured.
+- Added to bash's guidelines: a command still running after a minute goes on in the background as a job, and a message
+  reports when it ends; go on with other work, call `wait` only when nothing else is left, and do not wait with `sleep`
+  or poll (from deepseek-harness and oh-my-pi; in Pi's sessions, 97 `sleep` calls waited 3.2 h). Its effect is not
+  measured.
 - Removed: "Be concise in your responses".
 
 ## bash tool
@@ -197,11 +198,17 @@ and that file is added to the result, once per session (as Claude Code does). Th
   after `\r` only as it was last written), and commands run with `NO_COLOR=1` unless `NO_COLOR` or `FORCE_COLOR` is set.
 - Output over 2000 lines or 32 KB (was 50 KB, the end only) keeps its first 40 lines (up to 4 KB) and its end, so the
   first compiler error and the summary are both there. The full output is still saved to a file.
-- A command still running when its timeout ends goes on in the background instead of being ended: the call returns its
-  output so far, the job's pid and its output file, and when the command ends a message reports its exit code and the
-  last 2 KB of its output, after the current run or as a new turn when the agent is idle (as deepseek-harness does).
-  Jobs end with Pi and do not keep `pi -p` running. In Pi's sessions (23 Oct – 1 Nov 2026), 17 timeouts had ended 1.6 h
-  of running commands, one after 90 min. `PI_BASH_BACKGROUND_ON_TIMEOUT=off` ends them as before.
+- Background jobs, as in oh-my-pi: a command still running after 60 s goes on in the background as a job (`bg1`, `bg2`,
+  ...), and one called with `background: true` starts there. The call returns its output so far, the job's pid and its
+  output file. A `timeout` still ends the command, in the background too; one that ends it within 60 s keeps it in the
+  foreground. When a job ends, the agent gets its exit code and the last 2 KB of its output: before its next request
+  when it is working, as a new turn when it is idle. Jobs that end within 1.5 s of each other come in one report. Jobs
+  end with Pi and do not keep `pi -p` running; `pi -p` waits for running jobs and gives their reports a turn before it
+  exits. `PI_BASH_AUTO_BACKGROUND=off` keeps commands in the foreground unless the call asks.
+- A `wait` tool (from oh-my-pi) blocks until one of the session's background jobs ends and returns its report, which
+  then does not come again as a message. With no job running it returns at once. A wait with nothing ending returns
+  after 5 s, the next one right after it after 10 s, then 30 s, 60 s and 5 min; from the second one on, it tells the
+  model to go on with other work. A message from the user ends a wait.
 - Commands that only read (`git status/log/diff/show`, `cat`, `rg`, `grep`, `find` without `-exec`/`-delete`, ...,
   joined by pipes, `&&`, `||`, `;`; no redirections or substitutions) start while the model's message still streams, as
   read and grep do. Measured: a faux model at 100–1000 tokens/s with three such calls gets their results when the
