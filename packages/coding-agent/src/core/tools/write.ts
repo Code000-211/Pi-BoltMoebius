@@ -30,6 +30,11 @@ export interface WriteOperations {
 	writeFile: (absolutePath: string, content: string) => Promise<void>;
 	/** Create directory recursively */
 	mkdir: (dir: string) => Promise<void>;
+	/**
+	 * The file's current content, or undefined when there is none: lets read-before-edit check other operations than
+	 * the local filesystem's (by content, as they have no modification times).
+	 */
+	readExisting?: (absolutePath: string) => Promise<string | undefined>;
 }
 
 const defaultWriteOperations: WriteOperations = {
@@ -98,6 +103,10 @@ export function createWriteToolDefinition(
 						throwIfAborted();
 						harness.assertCanModifyExistingFile(absolutePath, existingStat.mtimeMs, current);
 					}
+				} else if (enforceReadBeforeEdit && ops.readExisting) {
+					const existing = await ops.readExisting(absolutePath);
+					throwIfAborted();
+					if (existing !== undefined) harness.assertCanModifyExistingFile(absolutePath, undefined, existing);
 				}
 
 				// Create parent directories if needed.

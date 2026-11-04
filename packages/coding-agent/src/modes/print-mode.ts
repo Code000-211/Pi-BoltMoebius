@@ -124,6 +124,10 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		}
 
 		await rebindSession();
+		if (session.remoteRestoreError) {
+			console.error(`Could not work on the remote machine: ${session.remoteRestoreError}`);
+			return 1;
+		}
 
 		if (initialMessage) {
 			await session.prompt(initialMessage, { images: initialImages });

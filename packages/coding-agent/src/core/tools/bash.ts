@@ -21,6 +21,7 @@ import {
 } from "../../utils/shell.ts";
 import type { BackgroundJobs } from "../background-jobs.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
+import { type FileWrite, fileWritesInCommand } from "./bash-file-writes.ts";
 import { notifySearchExternalChange } from "./native-search.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
@@ -65,6 +66,7 @@ export const bashToolSystemPromptContribution = {
 	guidelines: [
 		"You can inspect PI_* environment variables for current model and session details.",
 		// From deepseek-harness and oh-my-pi. In Pi's sessions, 97 `sleep` calls waited 3.2 h for other commands.
+		"Change files with edit and write, not with sed -i, a shell redirection or a script that rewrites them: those skip the checks edit and write do.",
 		"A command still running after a minute goes on in the background as a job (background: true starts it there right away), and a message reports when it ends. Meanwhile, go on with work that does not depend on it; call wait only when nothing else is left. Do not wait with sleep or poll for it.",
 	],
 } as const;
@@ -124,7 +126,8 @@ let backgroundExitHook = false;
 function keepAsBackgroundJob(child: ChildProcess | undefined): number | undefined {
 	if (!child?.pid) return undefined;
 	// It must not keep `pi -p` alive: Pi's exit ends it instead.
-	for (const stream of [child.stdout, child.stderr]) {
+	// stdin too: a remote command's ssh keeps it open (closing it ends the command there).
+	for (const stream of [child.stdin, child.stdout, child.stderr]) {
 		(stream as unknown as { unref?: () => void } | null)?.unref?.();
 	}
 	child.unref();
@@ -199,6 +202,15 @@ function fixedSleepRefusal(seconds: number): string {
 		"To wait for something else, wait for the thing itself in a loop, such as `until curl -sf localhost:8000; do sleep 2; done`, " +
 		"or `until ssh host 'grep -q EXIT build.log'; do sleep 10; done` for a job on another machine: the loop ends as soon as the condition holds, " +
 		`and goes on in the background after a minute. A sleep of up to ${MAX_FIXED_SLEEP_SECONDS} seconds runs.`
+	);
+}
+
+/** Why a command that changes files as the edit and write tools would was not run, and what to do instead. */
+function fileWriteRefusal(writes: FileWrite[]): string {
+	const what = writes.map((w) => `${w.target} (${w.how})`).join(", ");
+	return (
+		`Not run: the command changes ${what}. Change files with edit (exact replacements: it checks that the file was read and did not change since, and reports the compiler's new errors) or write (whole files). ` +
+		"Appending (`>>`), files under /tmp, and a program's output redirected into a file run."
 	);
 }
 
@@ -614,6 +626,11 @@ export interface BashToolOptions {
 	backgroundJobs?: BackgroundJobs;
 	/** Default {@link DEFAULT_AUTO_BACKGROUND_SECONDS}; 0 moves commands to the background only when the call asks. */
 	autoBackgroundSeconds?: number;
+	/**
+	 * Whether the edit tool is there: then a command that changes a file as edit or write would (`sed -i`, text redirected
+	 * into a file) is refused, see bash-file-writes.ts.
+	 */
+	editToolActive?: () => boolean;
 }
 
 export type BashRenderState = {
@@ -781,6 +798,11 @@ export function createShellToolDefinition(
 				const sleep = fixedSleepSeconds(command);
 				// From oh-my-pi's "NEVER poll". Of the 97 sleep calls in Pi's sessions, 28 slept more than 10 s outside a loop.
 				if (sleep > MAX_FIXED_SLEEP_SECONDS) throw new Error(fixedSleepRefusal(sleep));
+			}
+			if (options?.editToolActive?.() && process.env.PI_BASH_EDIT_GUARD !== "off") {
+				// From oh-my-pi's bash interceptor. In Pi's sessions, 65 of 2615 commands changed files this way.
+				const writes = fileWritesInCommand(command);
+				if (writes.length > 0) throw new Error(fileWriteRefusal(writes));
 			}
 			// The command's own abort: the tool call's, until the command goes to the background.
 			const commandAbort = new AbortController();

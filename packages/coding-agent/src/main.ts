@@ -653,6 +653,8 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	const parsed = parseArgs(args);
+	// The session takes the remote machine from here when it binds (AgentSession.setRemote).
+	if (parsed.remote) process.env.PI_REMOTE = parsed.remote;
 	if (parsed.diagnostics.length > 0) {
 		for (const d of parsed.diagnostics) {
 			const color = d.type === "error" ? chalk.red : chalk.yellow;
