@@ -22,6 +22,21 @@ interface PendingWaiter {
 	resolve: (result: DiagnosticsResult) => void;
 	timer: ReturnType<typeof setTimeout>;
 	receivedInitialPush: boolean;
+	/** The document was saved, so a cargo check runs for it. */
+	awaitsCheck: boolean;
+	/** A cargo check began after the save: when it ends, the file's diagnostics are those of the saved text. */
+	checkStarted: boolean;
+}
+
+/**
+ * The folder rust-analyzer's cargo check builds in: by default its own (`target/rust-analyzer`), so it does not hold the
+ * lock of the folder the agent's `cargo build` and `cargo test` use. `PI_RUST_ANALYZER_TARGET_DIR=shared` uses that folder,
+ * any other value names a folder.
+ */
+function rustAnalyzerTargetDir(): boolean | string {
+	const value = process.env.PI_RUST_ANALYZER_TARGET_DIR;
+	if (value === undefined || value === "") return true;
+	return value === "shared" ? false : value;
 }
 
 interface LateFlycheckState {
@@ -162,6 +177,8 @@ export class RustDiagnosticsEngine {
 		const promise = new Promise<DiagnosticsResult>((resolveWait) => {
 			const waiter: PendingWaiter = {
 				receivedInitialPush: false,
+				awaitsCheck: triggerSave,
+				checkStarted: false,
 				resolve: (result) => {
 					clearTimeout(waiter.timer);
 					resolveWait(result);
@@ -257,6 +274,7 @@ export class RustDiagnosticsEngine {
 				},
 				cargo: {
 					buildScripts: { enable: false },
+					targetDir: rustAnalyzerTargetDir(),
 				},
 				procMacro: { enable: true },
 			},
@@ -343,8 +361,14 @@ export class RustDiagnosticsEngine {
 				this.activeFlycheckTokens.add(token);
 				if (this.lateSettleTimer) clearTimeout(this.lateSettleTimer);
 				this.lateSettleTimer = undefined;
+				for (const waiters of this.waiters.values()) {
+					for (const w of waiters) if (w.awaitsCheck) w.checkStarted = true;
+				}
 			} else if (kind === "end") {
 				this.activeFlycheckTokens.delete(token);
+				// rust-analyzer reports no quiescence after an edit, and a clean edit has no error to end the wait: the
+				// check of the saved text ending does (its diagnostics are pushed before the end).
+				if (this.activeFlycheckTokens.size === 0) this.resolveCheckedWaiters();
 				this.scheduleLateSettle(LATE_SETTLE_GRACE_MS);
 			}
 			return;
@@ -413,6 +437,18 @@ export class RustDiagnosticsEngine {
 			if (diffed.length > 0) {
 				this.lateDiagnosticsQueue.push({ filePath: late.filePath, diagnostics: diffed });
 			}
+		}
+	}
+
+	private resolveCheckedWaiters(): void {
+		for (const [key, waiters] of this.waiters.entries()) {
+			const checked = waiters.filter((w) => w.checkStarted);
+			if (checked.length === 0) continue;
+			const remaining = waiters.filter((w) => !w.checkStarted);
+			if (remaining.length === 0) this.waiters.delete(key);
+			else this.waiters.set(key, remaining);
+			const diags = this.latestDiagnostics.get(key) ?? [];
+			for (const w of checked) w.resolve({ diagnostics: diags, complete: false });
 		}
 	}
 

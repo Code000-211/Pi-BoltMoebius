@@ -11,6 +11,13 @@ export const SETTINGS_DEFAULTS = {
 		reserveTokens: 16384,
 		keepRecentTokens: 20000,
 		thresholdPercent: 90,
+		maxContextTokens: 128000,
+	},
+	toolResultPruning: {
+		enabled: true,
+		triggerTokens: 40000,
+		keepRecent: 8,
+		minChars: 2000,
 	},
 	branchSummary: {
 		reserveTokens: 16384,

@@ -1,5 +1,6 @@
 //! Node-API binding: `new DocIndex({ roots })`, then `search(query, { k })`. Calls are synchronous
-//! and take microseconds; building and refreshing happen on a thread.
+//! and take microseconds; building and refreshing happen on a thread. `await whenReady(ms)` waits
+//! for the first build without blocking the event loop.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use docsearch_core::{Config, Engine, SearchOpts};
+use napi::bindgen_prelude::AsyncTask;
+use napi::{Env, Task};
 use napi_derive::napi;
 
 const DEFAULT_EXTENSIONS: [&str; 7] = ["md", "mdx", "markdown", "txt", "rst", "adoc", "org"];
@@ -29,7 +32,8 @@ pub struct QueryOptions {
     pub path_prefix: Option<String>,
     /// At most this many sections per file (default 3).
     pub max_per_file: Option<u32>,
-    /// How long to wait for the first build, in ms (default 5000).
+    /// How long to wait for the first build, in ms, blocking the caller (default 0: `whenReady` waits
+    /// without blocking).
     pub wait_ms: Option<u32>,
 }
 
@@ -87,14 +91,34 @@ fn cut(text: &str, max: usize) -> (String, bool) {
 type CacheKey = (String, u32, u32, Option<String>, u32);
 
 /// Results of recent searches on one index: an agent asks the same thing more than once (the
-/// prompt's recall, then the tool; a retry). Emptied whenever another index takes over.
+/// prompt's recall, then the tool; a retry). Emptied whenever another view takes over (by its
+/// generation: the address of a freed view can come back for the next one).
 #[derive(Default)]
 struct Cache {
-    index: usize,
+    generation: u64,
     results: HashMap<CacheKey, SearchResult>,
 }
 
 const CACHE_ENTRIES: usize = 256;
+
+/// Waits for the first build on a worker thread of Node's pool.
+pub struct WaitReady {
+    engine: Arc<Engine>,
+    wait: Duration,
+}
+
+impl Task for WaitReady {
+    type Output = bool;
+    type JsValue = bool;
+
+    fn compute(&mut self) -> napi::Result<bool> {
+        Ok(self.engine.index(self.wait).is_some())
+    }
+
+    fn resolve(&mut self, _env: Env, ready: bool) -> napi::Result<bool> {
+        Ok(ready)
+    }
+}
 
 #[napi]
 pub struct DocIndex {
@@ -125,16 +149,15 @@ impl DocIndex {
     pub fn search(&self, query: String, opts: Option<QueryOptions>) -> SearchResult {
         let t0 = Instant::now();
         let o = opts.unwrap_or(QueryOptions { k: None, max_chars: None, path_prefix: None, max_per_file: None, wait_ms: None });
-        let Some(ix) = self.engine.index(Duration::from_millis(o.wait_ms.unwrap_or(5000) as u64)) else {
+        let Some(ix) = self.engine.index(Duration::from_millis(o.wait_ms.unwrap_or(0) as u64)) else {
             return SearchResult { ready: false, hits: Vec::new(), entities: Vec::new(), query_terms: 0, micros: 0 };
         };
         self.engine.maybe_refresh();
         let key: CacheKey = (query.clone(), o.k.unwrap_or(6), o.max_chars.unwrap_or(1500), o.path_prefix.clone(), o.max_per_file.unwrap_or(3));
         {
             let mut cache = self.cache.lock().unwrap();
-            let here = Arc::as_ptr(&ix) as usize;
-            if cache.index != here {
-                cache.index = here;
+            if cache.generation != ix.generation {
+                cache.generation = ix.generation;
                 cache.results.clear();
             }
             if let Some(hit) = cache.results.get(&key) {
@@ -180,13 +203,22 @@ impl DocIndex {
             micros: t0.elapsed().as_micros() as u32,
         };
         let mut cache = self.cache.lock().unwrap();
-        if cache.index == Arc::as_ptr(&ix) as usize {
+        if cache.generation == ix.generation {
             if cache.results.len() >= CACHE_ENTRIES {
                 cache.results.clear();
             }
             cache.results.insert(key, result.clone());
         }
         result
+    }
+
+    /// Resolves to true once the first build is there, or to false after `waitMs` (default 5000).
+    #[napi(ts_return_type = "Promise<boolean>")]
+    pub fn when_ready(&self, wait_ms: Option<u32>) -> AsyncTask<WaitReady> {
+        AsyncTask::new(WaitReady {
+            engine: Arc::clone(&self.engine),
+            wait: Duration::from_millis(wait_ms.unwrap_or(5000) as u64),
+        })
     }
 
     #[napi]

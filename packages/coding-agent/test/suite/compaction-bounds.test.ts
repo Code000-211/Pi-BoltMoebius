@@ -163,11 +163,11 @@ describe("compaction bounds", () => {
 	});
 
 	// Without an explicit reserveTokens, a 1M window raises only the summary caps of the same requests.
-	it("scales only the summary caps of a 1M-window compaction by default", async () => {
+	it("scales only the summary caps of a 1M-window compaction when maxContextTokens allows it", async () => {
 		const captured: Array<Record<string, unknown>> = [];
 		const large = await createHarness({
 			models: [{ id: "faux-1m", contextWindow: 1_000_000, maxTokens: 64_000 }],
-			settings: { compaction: { keepRecentTokens: 600 } },
+			settings: { compaction: { keepRecentTokens: 600, maxContextTokens: 1_000_000 } },
 		});
 		harnesses.push(large);
 		seedTurn(large, 1, ["src/a.ts", "src/b.ts"]);

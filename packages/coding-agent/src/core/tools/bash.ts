@@ -20,20 +20,19 @@ import {
 	untrackDetachedChildPid,
 } from "../../utils/shell.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
+import { notifySearchExternalChange } from "./native-search.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
-import {
-	DEFAULT_MAX_BYTES,
-	DEFAULT_MAX_LINES,
-	formatSize,
-	type TruncationResult,
-	truncationDetails,
-} from "./truncate.ts";
+import { DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncationDetails } from "./truncate.ts";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
 /** Output limit of `structuredContent.output`, which programmatic callers such as codemode scripts receive. */
 const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
+/** What the model gets of a command's output: its first lines (the first error) and its end (the summary). */
+const BASH_MAX_BYTES = 32 * 1024;
+const BASH_HEAD_LINES = 40;
+const BASH_HEAD_BYTES = 4 * 1024;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
 
 function resolveTimeoutMs(timeout: number | undefined): number | undefined {
@@ -226,6 +225,21 @@ function warmCommandInput(child: ChildProcess): Writable | undefined {
 	return (WARM_BASH_FD3 ? child.stdio[3] : child.stdin) as Writable | undefined;
 }
 
+/**
+ * Whether a waiting warm shell keeps the process alive: not while it waits (`pi -p` and `--mode json` would never exit
+ * once a command ran through it), again once it runs a command. `unref` on the child alone leaves its pipes holding the
+ * event loop.
+ */
+function holdWarmShell(child: ChildProcess, hold: boolean): void {
+	for (const stream of [child.stdout, child.stderr, warmCommandInput(child)]) {
+		const handle = stream as unknown as { ref?: () => void; unref?: () => void } | null | undefined;
+		if (hold) handle?.ref?.();
+		else handle?.unref?.();
+	}
+	if (hold) child.ref();
+	else child.unref();
+}
+
 function quoteBashSingle(value: string): string {
 	return `'${value.replace(/'/g, "'\\''")}'`;
 }
@@ -281,7 +295,7 @@ function spawnWarmBashCandidate(
 		child.on("exit", () => {
 			if (warmBashProcess?.child === child) warmBashProcess = undefined;
 		});
-		child.unref();
+		holdWarmShell(child, false);
 		return { child, shellExe, cwd, msys };
 	} catch {
 		return undefined;
@@ -352,7 +366,7 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 					warmBashProcess = undefined;
 					child = taken.child;
 					msys = taken.msys;
-					child.ref();
+					holdWarmShell(child, true);
 					const envPrefix = env ? buildEnvDiffScript(defaultShellEnv, shellEnv) : "";
 					const input = warmCommandInput(child);
 					input?.on("error", () => {});
@@ -521,7 +535,7 @@ export function createShellToolDefinition(
 	return {
 		name: config.name,
 		label: config.label,
-		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
+		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output longer than ${DEFAULT_MAX_LINES} lines or ${BASH_MAX_BYTES / 1024}KB keeps its first ${BASH_HEAD_LINES} lines and its end; the full output is then saved to a temp file. Colors and progress-bar redraws are removed. Optionally provide a timeout in seconds.`,
 		promptSnippet: config.promptSnippet,
 		promptGuidelines: exposeSessionEnvironment && config.promptGuidelines ? [...config.promptGuidelines] : undefined,
 		parameters: bashSchema,
@@ -542,7 +556,13 @@ export function createShellToolDefinition(
 				exposeSessionEnvironment,
 				ctx,
 			);
-			const output = new OutputAccumulator({ tempFilePrefix: config.tempFilePrefix });
+			const output = new OutputAccumulator({
+				tempFilePrefix: config.tempFilePrefix,
+				maxBytes: BASH_MAX_BYTES,
+				clean: true,
+				headLines: BASH_HEAD_LINES,
+				headBytes: BASH_HEAD_BYTES,
+			});
 			let acceptingOutput = true;
 			let updateTimer: NodeJS.Timeout | undefined;
 			let updateDirty = false;
@@ -616,18 +636,19 @@ export function createShellToolDefinition(
 				let details: BashToolDetails | undefined;
 				if (truncation.truncated) {
 					details = { truncation: truncationDetails(truncation), fullOutputPath: snapshot.fullOutputPath };
-					const startLine = truncation.totalLines - truncation.outputLines + 1;
+					const startLine = truncation.totalLines - (truncation.outputLines - (snapshot.headLines ?? 0)) + 1;
 					const endLine = truncation.totalLines;
+					const head = snapshot.headLines ? `lines 1-${snapshot.headLines} and ` : "";
 					const fullOutput = snapshot.fullOutputPath
 						? `Full output: ${snapshot.fullOutputPath}`
 						: "The full output could not be saved";
 					if (truncation.lastLinePartial) {
 						const lastLineSize = formatSize(output.getLastLineBytes());
-						text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). ${fullOutput}]`;
+						text += `\n\n[Showing ${head}the last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). ${fullOutput}]`;
 					} else if (truncation.truncatedBy === "lines") {
-						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. ${fullOutput}]`;
+						text += `\n\n[Showing ${head || "lines "}${startLine}-${endLine} of ${truncation.totalLines}. ${fullOutput}]`;
 					} else {
-						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). ${fullOutput}]`;
+						text += `\n\n[Showing ${head || "lines "}${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(BASH_MAX_BYTES)} limit). ${fullOutput}]`;
 					}
 					if (fullOutputError) {
 						text += snapshot.fullOutputPath
@@ -691,6 +712,8 @@ export function createShellToolDefinition(
 				return { content: [{ type: "text", text: outputText }], details, structuredContent };
 			} finally {
 				clearUpdateTimer();
+				// The command may have created, changed or removed files that grep and find hold in their caches.
+				notifySearchExternalChange();
 			}
 		},
 		...createShellRenderers(config.prompt),

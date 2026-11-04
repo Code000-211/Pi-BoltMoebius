@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,12 +8,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	ClaudeHarnessManager,
 	CompileCommandsResolver,
+	FileStateTracker,
 	fuzzyFilterPaths,
 	type HarnessDiagnostic,
+	RustDiagnosticsEngine,
 	sanitizeCompileFlags,
 } from "../src/core/harness/index.ts";
 import { buildEnvDiffScript, createBashTool } from "../src/core/tools/bash.ts";
-import { createEditTool } from "../src/core/tools/edit.ts";
+import { createEditTool, createEditToolDefinition } from "../src/core/tools/edit.ts";
 import { createFindTool } from "../src/core/tools/find.ts";
 import { createLsTool } from "../src/core/tools/ls.ts";
 import { getFileFrecencyScore, nativeFind, nativeFindDetailed, nativeGrep } from "../src/core/tools/native-search.ts";
@@ -102,6 +105,7 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		await readTool.execute("read-1", { path: "stale.cpp" });
 
 		// Simulate external modification advancing mtime by 2 seconds
+		writeFileSync(filePath, "int x = 5;\n", "utf-8");
 		const futureTime = new Date(Date.now() + 2000);
 		utimesSync(filePath, futureTime, futureTime);
 
@@ -111,6 +115,71 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 				edits: [{ oldText: "int x = 1;", newText: "int x = 2;" }],
 			}),
 		).rejects.toThrow(/File has been modified since it was last read/);
+	});
+
+	it("allows edit and write after a newer modification time with the same content (touch)", async () => {
+		const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
+		const readTool = createReadTool(testDir, { harness });
+		const editTool = createEditTool(testDir, { harness, enforceReadBeforeEdit: true, enableDiagnostics: false });
+		const writeTool = createWriteTool(testDir, { harness, enforceReadBeforeEdit: true, enableDiagnostics: false });
+		const filePath = join(testDir, "touched.cpp");
+		writeFileSync(filePath, "int x = 1;\n", "utf-8");
+		await readTool.execute("read-touch", { path: "touched.cpp" });
+
+		utimesSync(filePath, new Date(Date.now() + 2000), new Date(Date.now() + 2000));
+		const edited = await editTool.execute("edit-touch", {
+			path: "touched.cpp",
+			edits: [{ oldText: "int x = 1;", newText: "int x = 2;" }],
+		});
+		expect(getText(edited)).not.toContain("changed on disk");
+
+		utimesSync(filePath, new Date(Date.now() + 4000), new Date(Date.now() + 4000));
+		await writeTool.execute("write-touch", { path: "touched.cpp", content: "int x = 3;\n" });
+		expect(readFileSync(filePath, "utf-8")).toBe("int x = 3;\n");
+
+		// A real change still blocks write, which replaces the whole file.
+		writeFileSync(filePath, "int x = 4;\n", "utf-8");
+		utimesSync(filePath, new Date(Date.now() + 6000), new Date(Date.now() + 6000));
+		await expect(writeTool.execute("write-stale", { path: "touched.cpp", content: "int y;\n" })).rejects.toThrow(
+			/File has been modified since it was last read/,
+		);
+	});
+
+	it("applies an edit to a file changed on disk when every oldText still matches exactly once", async () => {
+		const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
+		const readTool = createReadTool(testDir, { harness });
+		const editTool = createEditTool(testDir, { harness, enforceReadBeforeEdit: true, enableDiagnostics: false });
+		const filePath = join(testDir, "formatted.cpp");
+		writeFileSync(filePath, "int a=1;\nint b = 2;\n", "utf-8");
+		await readTool.execute("read-fmt", { path: "formatted.cpp" });
+
+		// A formatter rewrites another line.
+		writeFileSync(filePath, "int a = 1;\nint b = 2;\n", "utf-8");
+		utimesSync(filePath, new Date(Date.now() + 2000), new Date(Date.now() + 2000));
+		const edited = await editTool.execute("edit-fmt", {
+			path: "formatted.cpp",
+			edits: [{ oldText: "int b = 2;", newText: "int b = 3;" }],
+		});
+		expect(getText(edited)).toContain("The file had changed on disk since it was last read");
+		expect(readFileSync(filePath, "utf-8")).toBe("int a = 1;\nint b = 3;\n");
+
+		// The next edit sees the file as current; an oldText from before the change is refused.
+		writeFileSync(filePath, "int a = 1;\nint b = 3;\nint b = 3;\n", "utf-8");
+		utimesSync(filePath, new Date(Date.now() + 4000), new Date(Date.now() + 4000));
+		await expect(
+			editTool.execute("edit-twice", { path: "formatted.cpp", edits: [{ oldText: "int b = 3;", newText: "x" }] }),
+		).rejects.toThrow(/File has been modified since it was last read/);
+		await expect(
+			editTool.execute("edit-old", { path: "formatted.cpp", edits: [{ oldText: "int a=1;", newText: "x" }] }),
+		).rejects.toThrow(/File has been modified since it was last read/);
+	});
+
+	it("tells the model to read before editing, the same for every edit tool", () => {
+		const guidelines = (enforce: boolean) =>
+			createEditToolDefinition(testDir, { enforceReadBeforeEdit: enforce }).promptGuidelines ?? [];
+		expect(guidelines(true).some((line) => line.startsWith("Read a file before you first edit it"))).toBe(true);
+		// An extension re-registering the tool must not change the system prompt.
+		expect(guidelines(false)).toEqual(guidelines(true));
 	});
 
 	it("allows write on a brand-new file without prior read, but blocks overwriting an unread existing file", async () => {
@@ -664,6 +733,21 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		expect(getText(lsRes)).toContain("fast.txt");
 	});
 
+	it("lets the process exit after a command ran through the warm bash worker", () => {
+		// The worker started for the next command must not hold the event loop (`pi -p` and `--mode json` hung).
+		const script = join(testDir, "exit-after-bash.ts");
+		const bashModule = join(import.meta.dirname, "..", "src", "core", "tools", "bash.ts");
+		writeFileSync(
+			script,
+			`import { createBashTool } from ${JSON.stringify(bashModule)};\n` +
+				`const tool = createBashTool(${JSON.stringify(testDir)});\n` +
+				`for (const command of ["echo a | cat", "echo b | cat"]) await tool.execute("x", { command });\n`,
+		);
+		const result = spawnSync(process.execPath, [script], { timeout: 15_000, encoding: "utf-8" });
+		expect(result.error).toBeUndefined();
+		expect(result.status).toBe(0);
+	});
+
 	it("gives a command run by the warm bash worker an empty stdin, not the rest of its own script", async () => {
 		const bashTool = createBashTool(testDir);
 		await bashTool.execute("b-stdin-1", { command: "echo first" });
@@ -752,7 +836,7 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		await expect(
 			editTool.execute("e-content-stale", {
 				path: "packages/kernels/softmax.hip",
-				edits: [{ oldText: "__global__ void softmax()", newText: "__global__ void softmax_v2()" }],
+				edits: [{ oldText: "__global__ void softmax() {}", newText: "__global__ void softmax_v2() {}" }],
 			}),
 		).rejects.toThrow(/File has been modified since it was last read/);
 	});
@@ -790,6 +874,39 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		expect(updated).toBe(
 			["export function compute() {", "\tif (ready) {", "\t\treturn 42;", "\t}", "\treturn 0;", "}", ""].join("\n"),
 		);
+	});
+
+	it("writes lines the edit adds in the file's unit of indentation, not the model's", async () => {
+		const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
+		const readTool = createReadTool(testDir, { harness });
+		const editTool = createEditTool(testDir, { harness, enforceReadBeforeEdit: true, enableDiagnostics: false });
+		const edit = async (name: string, file: string, oldText: string, newText: string) => {
+			const filePath = join(testDir, name);
+			writeFileSync(filePath, file, "utf-8");
+			await readTool.execute(`r-${name}`, { path: name });
+			await editTool.execute(`e-${name}`, { path: name, edits: [{ oldText, newText }] });
+			return readFileSync(filePath, "utf-8");
+		};
+
+		// Tabs in the file, four spaces from the model; the new lines are deeper than any oldText line.
+		expect(
+			await edit(
+				"tabs.ts",
+				"function f() {\n\tif (a) {\n\t\tg();\n\t}\n}\n",
+				"    if (a) {\n        g();\n    }",
+				"    if (a) {\n        g();\n        if (b) {\n            h();\n        }\n    }",
+			),
+		).toBe("function f() {\n\tif (a) {\n\t\tg();\n\t\tif (b) {\n\t\t\th();\n\t\t}\n\t}\n}\n");
+
+		// Two spaces in the file, four from the model, and the same depth of the first line.
+		expect(
+			await edit(
+				"two.py",
+				"def f():\n  if a:\n    g()\n",
+				"def f():\n    if a:\n        g()",
+				"def f():\n    if a:\n        g()\n        for x in y:\n            h(x)",
+			),
+		).toBe("def f():\n  if a:\n    g()\n    for x in y:\n      h(x)\n");
 	});
 
 	it("allows consecutive edits of a CRLF file with a BOM and keeps its bytes intact", async () => {
@@ -914,6 +1031,59 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 			testDir,
 		);
 		expect(cppFlags.slice(0, 2)).toEqual(["-x", "c++-header"]);
+	});
+
+	// As rust-analyzer 1.99 does: no quiescence after an edit, and no diagnostics but those of the cargo check.
+	it("ends a Rust edit's wait when its cargo check ends, and checks in rust-analyzer's own target folder", async () => {
+		const mockRaScript = join(testDir, "mock-rust-analyzer-check-end.mjs");
+		const initFile = join(testDir, "ra-init.json");
+		writeFileSync(
+			mockRaScript,
+			`
+			import { writeFileSync } from "node:fs";
+			let buf = Buffer.alloc(0);
+			function send(msg) {
+				const body = Buffer.from(JSON.stringify(msg), "utf-8");
+				process.stdout.write(Buffer.concat([Buffer.from("Content-Length: " + body.length + "\\r\\n\\r\\n", "ascii"), body]));
+			}
+			const progress = (kind) => send({ jsonrpc: "2.0", method: "$/progress", params: { token: "rust-analyzer/flycheck/0", value: { kind } } });
+			process.stdin.on("data", (chunk) => {
+				buf = Buffer.concat([buf, chunk]);
+				while (true) {
+					const end = buf.indexOf("\\r\\n\\r\\n");
+					if (end === -1) break;
+					const len = Number.parseInt(/Content-Length:\\s*(\\d+)/i.exec(buf.subarray(0, end).toString("ascii"))[1], 10);
+					if (buf.length < end + 4 + len) break;
+					const msg = JSON.parse(buf.subarray(end + 4, end + 4 + len).toString("utf-8"));
+					buf = buf.subarray(end + 4 + len);
+					if (msg.method === "initialize") {
+						writeFileSync(${JSON.stringify(initFile)}, JSON.stringify(msg.params.initializationOptions));
+						send({ jsonrpc: "2.0", id: msg.id, result: { capabilities: {} } });
+					} else if (msg.method === "textDocument/didSave") {
+						setTimeout(() => progress("begin"), 20);
+						setTimeout(() => progress("end"), 60);
+					}
+				}
+			});
+			`,
+			"utf-8",
+		);
+		process.env.RUST_ANALYZER_PATH = mockRaScript;
+		const tracker = new FileStateTracker();
+		const engine = new RustDiagnosticsEngine(tracker);
+		try {
+			const rsFile = join(testDir, "lib.rs");
+			writeFileSync(rsFile, "pub fn a() {}\n", "utf-8");
+			tracker.recordFileRead(rsFile, "pub fn a() {}\n", Date.now());
+			await engine.warmupFile(rsFile, "pub fn a() {}\n", testDir);
+			const start = performance.now();
+			const result = await engine.checkEditedFile(rsFile, "pub fn b() {}\n", testDir);
+			expect(performance.now() - start).toBeLessThan(300);
+			expect(result.diagnostics).toEqual([]);
+			expect(JSON.parse(readFileSync(initFile, "utf-8")).cargo.targetDir).toBe(true);
+		} finally {
+			engine.dispose();
+		}
 	});
 
 	it("reports cargo flycheck diagnostics that settle after a fast in-budget result, despite stderr noise", async () => {

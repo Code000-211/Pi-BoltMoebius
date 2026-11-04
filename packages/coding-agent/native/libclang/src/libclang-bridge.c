@@ -147,18 +147,27 @@ static struct {
     clang_disposeString_fn disposeString;
 } g_clang;
 
-// --- Unlimited Session Translation Unit Cache (O(1) FNV-1a Hash Table) ------------------------------------------------
+// --- Translation Unit Cache (FNV-1a Hash Table, the MAX_TUS used last) -------------------------------------------------
 
 #define TU_BUCKET_COUNT 256
+// A TU with its preamble holds tens to hundreds of MB (a HIP source with the ROCm headers): keep the ones used last.
+#define MAX_TUS 8
 
 typedef struct tu_entry {
     uint64_t hash;
     char* filename;
     CXTranslationUnit tu;
+    // The arguments the TU was parsed with: a reparse keeps them, and a parse after a failed reparse needs them again.
+    char** args;
+    int num_args;
+    uint64_t args_hash;
+    uint64_t last_used;
     struct tu_entry* next;
 } tu_entry;
 
 static tu_entry* g_tu_buckets[TU_BUCKET_COUNT];
+static unsigned g_tu_count = 0;
+static uint64_t g_tu_clock = 0;
 
 static uint64_t fnv1a_hash(const char* str) {
     uint64_t h = 14695981039346656037ULL;
@@ -261,29 +270,98 @@ static tu_entry* find_tu_entry(const char* filename) {
     return NULL;
 }
 
-static tu_entry* upsert_tu_entry(const char* filename, CXTranslationUnit tu) {
-    tu_entry* existing = find_tu_entry(filename);
-    if (existing) {
-        if (existing->tu && existing->tu != tu && g_clang.disposeTU) {
-            g_clang.disposeTU(existing->tu);
+static uint64_t args_hash(char** args, int num_args) {
+    uint64_t h = 14695981039346656037ULL;
+    for (int i = 0; i < num_args; i++) {
+        for (const unsigned char* p = (const unsigned char*)args[i]; *p; p++) {
+            h ^= (uint64_t)(*p);
+            h *= 1099511628211ULL;
         }
-        existing->tu = tu;
-        return existing;
+        h ^= 0xff; // (An argument's end: "-a" "b" and "-ab" differ.)
+        h *= 1099511628211ULL;
     }
-    tu_entry* entry = (tu_entry*)calloc(1, sizeof(tu_entry));
-    if (!entry) return NULL;
-    size_t len = strlen(filename);
-    entry->filename = (char*)malloc(len + 1);
-    if (!entry->filename) {
-        free(entry);
-        return NULL;
+    return h;
+}
+
+static void free_args(char** args, int num_args) {
+    if (!args) return;
+    for (int i = 0; i < num_args; i++) free(args[i]);
+    free(args);
+}
+
+static char** copy_args(char** args, int num_args) {
+    char** copy = (char**)calloc(num_args > 0 ? (size_t)num_args : 1, sizeof(char*));
+    if (!copy) return NULL;
+    for (int i = 0; i < num_args; i++) {
+        copy[i] = strdup(args[i]);
+        if (!copy[i]) {
+            free_args(copy, i);
+            return NULL;
+        }
     }
-    memcpy(entry->filename, filename, len + 1);
-    entry->hash = fnv1a_hash(filename);
-    entry->tu = tu;
+    return copy;
+}
+
+static void remove_tu_entry(tu_entry* entry) {
     unsigned idx = (unsigned)(entry->hash & (TU_BUCKET_COUNT - 1));
-    entry->next = g_tu_buckets[idx];
-    g_tu_buckets[idx] = entry;
+    for (tu_entry** link = &g_tu_buckets[idx]; *link != NULL; link = &(*link)->next) {
+        if (*link == entry) {
+            *link = entry->next;
+            break;
+        }
+    }
+    if (entry->tu && g_clang.disposeTU) g_clang.disposeTU(entry->tu);
+    free_args(entry->args, entry->num_args);
+    free(entry->filename);
+    free(entry);
+    g_tu_count--;
+}
+
+/** Disposes the TUs used longest ago while more than MAX_TUS are kept (`keep` stays). */
+static void evict_tu_entries(tu_entry* keep) {
+    while (g_tu_count > MAX_TUS) {
+        tu_entry* oldest = NULL;
+        for (unsigned i = 0; i < TU_BUCKET_COUNT; i++) {
+            for (tu_entry* cur = g_tu_buckets[i]; cur != NULL; cur = cur->next) {
+                if (cur != keep && (!oldest || cur->last_used < oldest->last_used)) oldest = cur;
+            }
+        }
+        if (!oldest) return;
+        remove_tu_entry(oldest);
+    }
+}
+
+/** Stores `tu`, parsed with `args`, for `filename`. Returns NULL (and leaves `tu` to the caller) when out of memory. */
+static tu_entry* upsert_tu_entry(const char* filename, CXTranslationUnit tu, char** args, int num_args) {
+    // (`args` may be the entry's own, freed below: copied and hashed first.)
+    char** args_copy = copy_args(args, num_args);
+    if (!args_copy) return NULL;
+    uint64_t new_args_hash = args_hash(args, num_args);
+    tu_entry* entry = find_tu_entry(filename);
+    if (entry) {
+        if (entry->tu && entry->tu != tu && g_clang.disposeTU) {
+            g_clang.disposeTU(entry->tu);
+        }
+        free_args(entry->args, entry->num_args);
+    } else {
+        entry = (tu_entry*)calloc(1, sizeof(tu_entry));
+        if (!entry || !(entry->filename = strdup(filename))) {
+            free(entry);
+            free_args(args_copy, num_args);
+            return NULL;
+        }
+        entry->hash = fnv1a_hash(filename);
+        unsigned idx = (unsigned)(entry->hash & (TU_BUCKET_COUNT - 1));
+        entry->next = g_tu_buckets[idx];
+        g_tu_buckets[idx] = entry;
+        g_tu_count++;
+    }
+    entry->tu = tu;
+    entry->args = args_copy;
+    entry->num_args = num_args;
+    entry->args_hash = new_args_hash;
+    entry->last_used = ++g_tu_clock;
+    evict_tu_entries(entry);
     return entry;
 }
 
@@ -459,6 +537,19 @@ static void PI_NAPI_CALL execute_clang_work(napi_env env, void* data) {
     mutex_lock(&g_clang.lock);
     tu_entry* entry = find_tu_entry(job->filename);
     CXTranslationUnit tu = entry ? entry->tu : NULL;
+    // A reparse keeps the arguments of the first parse: new ones (a changed compile_commands.json) need a new parse.
+    if (tu != NULL && job->num_args > 0 && entry->args_hash != args_hash(job->args, job->num_args)) {
+        g_clang.disposeTU(tu);
+        entry->tu = NULL;
+        tu = NULL;
+    }
+    // Without arguments given, a parse (a reparse that failed) uses those the TU was parsed with.
+    char** parse_args = job->args;
+    int parse_num_args = job->num_args;
+    if (entry && job->num_args == 0) {
+        parse_args = entry->args;
+        parse_num_args = entry->num_args;
+    }
 
     unsigned parse_options = CXTranslationUnit_PrecompiledPreamble |
                              CXTranslationUnit_CreatePreambleOnFirstParse |
@@ -475,6 +566,8 @@ static void PI_NAPI_CALL execute_clang_work(napi_env env, void* data) {
             g_clang.disposeTU(tu);
             entry->tu = NULL;
             tu = NULL;
+        } else {
+            entry->last_used = ++g_tu_clock;
         }
     }
 
@@ -482,15 +575,20 @@ static void PI_NAPI_CALL execute_clang_work(napi_env env, void* data) {
         enum CXErrorCode err = g_clang.parseTU2(
             g_clang.index,
             job->filename,
-            (const char* const*)job->args,
-            job->num_args,
+            (const char* const*)parse_args,
+            parse_num_args,
             unsaved_arr,
             job->num_unsaved,
             parse_options,
             &tu
         );
         if (err == CXError_Success && tu != NULL) {
-            upsert_tu_entry(job->filename, tu);
+            if (!upsert_tu_entry(job->filename, tu, parse_args, parse_num_args)) {
+                // Not kept: the diagnostics are still read below, then the TU goes.
+                job->result_json = serialize_diagnostics(tu);
+                g_clang.disposeTU(tu);
+                tu = NULL;
+            }
         } else {
             job->error = "clang_parseTranslationUnit2 failed";
         }

@@ -40,7 +40,7 @@ pub fn split(text: &str, markdown: bool) -> Vec<Chunk> {
         }
         if markdown && !in_fence {
             if let Some((level, title)) = heading_level(line) {
-                flush(&stack, &section, section_start, &mut out);
+                flush(&stack, &section, section_start, true, &mut out);
                 while stack.last().is_some_and(|(l, _)| *l >= level) {
                     stack.pop();
                 }
@@ -51,14 +51,15 @@ pub fn split(text: &str, markdown: bool) -> Vec<Chunk> {
         }
         section.push(line);
     }
-    flush(&stack, &section, section_start, &mut out);
+    flush(&stack, &section, section_start, true, &mut out);
     out
 }
 
-fn flush(stack: &[(usize, String)], lines: &[&str], start: u32, out: &mut Vec<Chunk>) {
+/// `heading_line`: the first line is the heading (Markdown), not text of its own (code, where it is the definition).
+fn flush(stack: &[(usize, String)], lines: &[&str], start: u32, heading_line: bool, out: &mut Vec<Chunk>) {
     let heading = stack.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" › ");
     // A heading with nothing under it adds nothing: its title reaches the children's path.
-    let body_lines = lines.iter().skip(if stack.is_empty() { 0 } else { 1 });
+    let body_lines = lines.iter().skip(if stack.is_empty() || !heading_line { 0 } else { 1 });
     if body_lines.clone().all(|l| l.trim().is_empty()) {
         return;
     }
@@ -90,22 +91,159 @@ fn flush(stack: &[(usize, String)], lines: &[&str], start: u32, out: &mut Vec<Ch
     }
 }
 
+/// The language of a source file, by its extension: how its definitions look.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lang {
+    /// C, C++, HIP, CUDA.
+    C,
+    Rust,
+    Python,
+    /// JavaScript and TypeScript.
+    Script,
+    Go,
+    Shell,
+}
+
+impl Lang {
+    pub fn of(ext: &str) -> Option<Lang> {
+        Some(match ext {
+            "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hip" | "cu" | "cuh" => Lang::C,
+            "rs" => Lang::Rust,
+            "py" => Lang::Python,
+            "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" => Lang::Script,
+            "go" => Lang::Go,
+            "sh" | "bash" | "zsh" => Lang::Shell,
+            _ => return None,
+        })
+    }
+}
+
+fn ident(s: &str) -> String {
+    s.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect()
+}
+
+/// `s` without the words in `words` it starts with, in any order (`export default async `).
+fn strip_words<'a>(mut s: &'a str, words: &[&str]) -> &'a str {
+    'again: loop {
+        for w in words {
+            if let Some(rest) = s.strip_prefix(w) {
+                if rest.starts_with([' ', '\t']) {
+                    s = rest.trim_start();
+                    continue 'again;
+                }
+            }
+        }
+        return s;
+    }
+}
+
+/// JavaScript, TypeScript: `function f`, `class C`, `interface I`, `type T =`, `enum E`, `const f = (...) =>`, and
+/// methods (`name(...) {` inside a class, so indented).
+fn script_name(lines: &[&str], i: usize, t: &str, indent: usize) -> Option<String> {
+    if indent > 4 {
+        return None;
+    }
+    let t = strip_words(t, &["export", "default", "declare", "abstract", "async"]);
+    for kw in ["function* ", "function ", "class ", "interface ", "enum ", "const enum ", "namespace "] {
+        if let Some(rest) = t.strip_prefix(kw) {
+            let n = ident(rest.trim_start_matches('*').trim_start());
+            return (!n.is_empty()).then_some(n);
+        }
+    }
+    if let Some(rest) = t.strip_prefix("type ") {
+        let n = ident(rest);
+        let after = rest[n.len()..].trim_start();
+        return (!n.is_empty() && (after.starts_with('=') || after.starts_with('<'))).then_some(n);
+    }
+    for kw in ["const ", "let ", "var "] {
+        if let Some(rest) = t.strip_prefix(kw) {
+            let n = ident(rest);
+            let after = rest[n.len()..].trim_start();
+            // A type annotation before the `=`: `const f: Handler = (...) =>`.
+            let value = after.find('=').map(|e| after[e + 1..].trim_start())?;
+            let function = value.starts_with("function")
+                || value.starts_with("async")
+                || value.starts_with('(') && lines[i..lines.len().min(i + 4)].join(" ").contains("=>")
+                || ident(value).len() == value.find("=>").map_or(usize::MAX, |a| value[..a].trim_end().len());
+            return (!n.is_empty() && function).then_some(n);
+        }
+    }
+    // A method: indented, `name(` or `name<T>(`, a body before any `;`.
+    if indent == 0 {
+        return None;
+    }
+    let t = strip_words(t, &["public", "private", "protected", "static", "override", "readonly", "get", "set"]);
+    let n = ident(t);
+    let after = t[n.len()..].trim_start();
+    if n.is_empty() || !(after.starts_with('(') || after.starts_with('<')) {
+        return None;
+    }
+    if matches!(n.as_str(), "if" | "for" | "while" | "switch" | "catch" | "return" | "function" | "constructor" | "super") {
+        return None;
+    }
+    let window = lines[i..lines.len().min(i + 6)].join("\n");
+    let brace = window.find('{')?;
+    (!window[..brace].contains(';') && !window[..brace].contains("=>")).then_some(n)
+}
+
+/// Go: `func F(`, `func (r *T) M(` (as `T.M`), `type T struct|interface|...`.
+fn go_name(t: &str, indent: usize) -> Option<String> {
+    if indent > 0 {
+        return None;
+    }
+    if let Some(rest) = t.strip_prefix("func ") {
+        if let Some(recv) = rest.strip_prefix('(') {
+            let close = recv.find(')')?;
+            let receiver = recv[..close].split_whitespace().last()?.trim_start_matches('*');
+            let receiver = ident(receiver);
+            let n = ident(recv[close + 1..].trim_start());
+            return (!n.is_empty()).then(|| if receiver.is_empty() { n.clone() } else { format!("{receiver}.{n}") });
+        }
+        let n = ident(rest);
+        return (!n.is_empty()).then_some(n);
+    }
+    let rest = t.strip_prefix("type ")?;
+    let n = ident(rest);
+    (!n.is_empty() && !rest[n.len()..].trim_start().is_empty()).then_some(n)
+}
+
+/// Shell: `name() {`, `function name`, up to one indent.
+fn shell_name(t: &str, indent: usize) -> Option<String> {
+    if indent > 4 {
+        return None;
+    }
+    let shell_ident = |s: &str| -> String { s.chars().take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | ':' | '.')).collect() };
+    if let Some(rest) = t.strip_prefix("function ") {
+        let n = shell_ident(rest.trim_start());
+        return (!n.is_empty()).then_some(n);
+    }
+    let n = shell_ident(t);
+    let after = t[n.len()..].trim_start();
+    (!n.is_empty() && after.starts_with("()") && after[2..].trim_start().starts_with(['{', '('])).then_some(n)
+}
+
 /// The name a line defines, when it starts a function, method, class or struct: top-level C/C++
 /// definitions (`int foo(...)` with the body's `{` on this or the next lines), Python `def` and
-/// `class` up to one indent, Rust `fn`, `struct`, `enum`, `impl`.
-fn defined_name(lines: &[&str], i: usize, python: bool) -> Option<String> {
+/// `class` up to one indent, Rust `fn`, `struct`, `enum`, `impl`, and those of JavaScript and
+/// TypeScript, Go and shell scripts (see their functions).
+fn defined_name(lines: &[&str], i: usize, lang: Lang) -> Option<String> {
     let line = lines[i];
     let t = line.trim_start();
     let indent = line.len() - t.len();
-    let ident = |s: &str| -> String { s.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect() };
-    if python {
-        for kw in ["def ", "async def ", "class "] {
-            if indent <= 4 && t.starts_with(kw) {
-                let n = ident(&t[kw.len()..]);
-                return (!n.is_empty()).then_some(n);
+    match lang {
+        Lang::Python => {
+            for kw in ["def ", "async def ", "class "] {
+                if indent <= 4 && t.starts_with(kw) {
+                    let n = ident(&t[kw.len()..]);
+                    return (!n.is_empty()).then_some(n);
+                }
             }
+            return None;
         }
-        return None;
+        Lang::Script => return script_name(lines, i, t, indent),
+        Lang::Go => return go_name(t, indent),
+        Lang::Shell => return shell_name(t, indent),
+        Lang::C | Lang::Rust => {}
     }
     for kw in ["pub fn ", "fn ", "pub(crate) fn ", "pub struct ", "struct ", "pub enum ", "enum ", "impl ", "pub trait ", "trait "] {
         if indent <= 4 && t.starts_with(kw) {
@@ -150,13 +288,15 @@ fn defined_name(lines: &[&str], i: usize, python: bool) -> Option<String> {
 
 /// Splits source code at its definitions: one section per function, class or struct, named
 /// by it, so that a search for a name lands on where it is defined.
-pub fn split_code(text: &str, python: bool) -> Vec<Chunk> {
+pub fn split_code(text: &str, lang: Lang) -> Vec<Chunk> {
     let lines: Vec<&str> = text.lines().collect();
     let mut out = Vec::new();
     let mut stack: Vec<(usize, String)> = Vec::new();
     let mut start = 0usize;
+    // The current section's definition opens a block (`class Box:`, `impl Pool {`), rather than being whole on its line.
+    let mut opens_block = false;
     for i in 0..lines.len() {
-        if let Some(name) = defined_name(&lines, i, python) {
+        if let Some(name) = defined_name(&lines, i, lang) {
             // Comments and attributes just above a definition belong to it.
             let mut head = i;
             while head > start && {
@@ -167,21 +307,25 @@ pub fn split_code(text: &str, python: bool) -> Vec<Chunk> {
             }
             // A header with nothing of its own before the next definition (`class Box:` right
             // above `def size`) joins it, and names it too.
-            let only_header = !stack.is_empty() && lines[start + 1.min(head - start)..head].iter().all(|l| l.trim().is_empty());
+            let only_header = !stack.is_empty()
+                && opens_block
+                && lines[start + 1.min(head - start)..head].iter().all(|l| l.trim().is_empty());
             if only_header && head > start {
                 let outer = stack.pop().map(|(_, n)| n).unwrap_or_default();
                 stack = vec![(1, format!("{outer} › {name}"))];
                 continue;
             }
             if head > start {
-                flush(&stack, &lines[start..head], start as u32 + 1, &mut out);
+                flush(&stack, &lines[start..head], start as u32 + 1, false, &mut out);
             }
             stack = vec![(1, name)];
             start = head;
+            let t = lines[i].trim_end();
+            opens_block = t.ends_with(['{', ':']) || lines.get(i + 1).is_some_and(|l| l.trim() == "{");
         }
     }
     if start < lines.len() {
-        flush(&stack, &lines[start..], start as u32 + 1, &mut out);
+        flush(&stack, &lines[start..], start as u32 + 1, false, &mut out);
     }
     out
 }
@@ -202,13 +346,35 @@ mod tests {
     #[test]
     fn code_splits_at_definitions() {
         let src = "#include <x.h>\n\n// Adds.\nstatic int add(int a, int b)\n{\n    return a + b;\n}\n\nvoid Pool::evict(Block *b) {\n    free(b);\n}\nint x = f(1);\n";
-        let c = split_code(src, false);
+        let c = split_code(src, Lang::C);
         let h: Vec<_> = c.iter().map(|c| c.heading.as_str()).collect();
         assert_eq!(h, ["", "add", "Pool::evict"]);
         assert_eq!(c[1].line_start, 3, "the comment above belongs to the function");
-        let py = split_code("import os\n\ndef load(p):\n    return p\n\nclass Box:\n    def size(self):\n        return 1\n", true);
+        let py = split_code("import os\n\ndef load(p):\n    return p\n\nclass Box:\n    def size(self):\n        return 1\n", Lang::Python);
         let h: Vec<_> = py.iter().map(|c| c.heading.as_str()).collect();
         assert_eq!(h, ["", "load", "Box › size"]);
+    }
+
+    #[test]
+    fn script_go_and_shell_definitions() {
+        let heads = |src: &str, lang| split_code(src, lang).into_iter().map(|c| c.heading).collect::<Vec<_>>();
+        let ts = "import { x } from \"./x\";\n\nexport async function loadAll(a: string) {\n  return a;\n}\n\
+                  export const toKey = (p: string): string => p.trim();\n\
+                  export interface Options {\n  k: number;\n}\n\
+                  type Mode = \"a\" | \"b\";\n\
+                  export default class Pool<T> extends Base {\n  private evictOldest(n: number): void {\n    this.n = n;\n  }\n}\n\
+                  const result = compute(1);\nfoo(bar);\n";
+        assert_eq!(heads(ts, Lang::Script), ["", "loadAll", "toKey", "Options", "Mode", "Pool › evictOldest"]);
+        let go = "package main\n\nfunc Run(x int) error {\n\treturn nil\n}\n\nfunc (p *Pool) Evict(n int) {\n}\n\ntype Pool struct {\n\tn int\n}\n";
+        assert_eq!(heads(go, Lang::Go), ["", "Run", "Pool.Evict", "Pool"]);
+        let sh = "#!/bin/sh\nset -e\n\nbuild_all() {\n  make\n}\n\nfunction deploy {\n  echo\n}\nbuild_all\n";
+        assert_eq!(heads(sh, Lang::Shell), ["", "build_all", "deploy"]);
+    }
+
+    #[test]
+    fn one_line_definitions_are_kept() {
+        let c = split_code("use x;\n\npub fn one() -> u32 { 1 }\n", Lang::Rust);
+        assert_eq!(c.last().map(|c| (c.heading.as_str(), c.line_start)), Some(("one", 3)));
     }
 
     #[test]

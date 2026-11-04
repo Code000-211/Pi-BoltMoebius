@@ -1,16 +1,21 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { createBashTool } from "../src/core/tools/bash.ts";
 import { createFindTool } from "../src/core/tools/find.ts";
 import { createGrepTool } from "../src/core/tools/grep.ts";
 import {
+	clearNativeSearchCache,
 	compileGlob,
+	contentCacheStats,
 	expandBraces,
 	globMatch,
 	nativeFind,
 	nativeGrep,
+	notifySearchExternalChange,
+	notifySearchFileTouched,
 	requiredLiteral,
 	translatePattern,
 	walk,
@@ -219,6 +224,18 @@ describe("grep", () => {
 		]);
 	});
 
+	// Both from the one cached walk: the ignored files it keeps aside are taken only by a glob that includes them.
+	test("a glob and no glob on the same cached tree", async () => {
+		clearNativeSearchCache();
+		const files = async (glob?: string) =>
+			[...new Set(where(await grep("needle", { glob })).map((line) => line.split(":")[0]))].sort();
+		expect(await files("*.ts")).toContain("nested/skip.ts");
+		const all = await files();
+		expect(all).not.toContain("nested/skip.ts");
+		expect(all).toContain("src/a.ts");
+		expect(await files("*.ts")).toContain("nested/skip.ts");
+	});
+
 	test("a literal in either case, and an expression run only on the lines that have its literal", async () => {
 		expect(where(await grep("NEEDLE TWO", { literal: true, ignoreCase: true }))).toEqual([
 			"src/sub/b.ts:1:needle two",
@@ -357,6 +374,89 @@ const has = (command: string) => spawnSync(command, ["--version"], { stdio: "ign
 
 // The tools' output with ripgrep and fd and in-process, on the same files: the same lines (as sets: ripgrep and fd give
 // them in no fixed order; .git, which they would search, holds nothing that matches).
+describe("the cached tree", () => {
+	test("is walked again only for a file of its own it does not know", async () => {
+		const top = mkdtempSync(join(tmpdir(), "pi-tree-touch-"));
+		const project = join(top, "project");
+		const other = join(top, "other");
+		mkdirSync(join(project, "build"), { recursive: true });
+		mkdirSync(other);
+		writeFileSync(join(project, ".gitignore"), "build/\n");
+		writeFileSync(join(project, "a.ts"), "a");
+		writeFileSync(join(project, "build", "out.ts"), "out");
+		writeFileSync(join(other, "b.ts"), "b");
+		try {
+			clearNativeSearchCache();
+			const find = () => nativeFind({ root: project, pattern: "*.ts", limit: 100 });
+			expect(await find()).toEqual(["a.ts"]);
+			// On disk, but not yet in the tree, which is reused for 2 s without checks.
+			writeFileSync(join(project, "new.ts"), "new");
+			notifySearchFileTouched(join(other, "b.ts"), "b", Date.now());
+			notifySearchFileTouched(join(project, "build", "next.ts"), "next", Date.now());
+			notifySearchFileTouched(join(project, "a.ts"), "a", Date.now());
+			expect(await find()).toEqual(["a.ts"]);
+			notifySearchFileTouched(join(project, "new.ts"), "new", Date.now());
+			expect(await find()).toEqual(["a.ts", "new.ts"]);
+		} finally {
+			rmSync(top, { recursive: true, force: true });
+		}
+	});
+
+	test("a bash command's changes are seen by the next grep and find at once", async () => {
+		const project = mkdtempSync(join(tmpdir(), "pi-tree-bash-"));
+		writeFileSync(join(project, "a.txt"), "needle old\n");
+		try {
+			clearNativeSearchCache();
+			const grepped = async () =>
+				(
+					await nativeGrep({ root: project, isDirectory: true, pattern: "needle", limit: 10, keepChars: 200 })
+				).matches
+					.map((m) => `${m.filePath.slice(project.length + 1)}:${m.lineText}`)
+					.sort();
+			expect(await grepped()).toEqual(["a.txt:needle old"]);
+			expect(await nativeFind({ root: project, pattern: "*.txt", limit: 10 })).toEqual(["a.txt"]);
+			// Same size, and within the times the caches are used without checks (2 s, 1.5 s).
+			await createBashTool(project).execute("bash-change", {
+				command: "printf 'needle new\\n' > a.txt && printf 'needle b\\n' > b.txt",
+			});
+			expect(await grepped()).toEqual(["a.txt:needle new", "b.txt:needle b"]);
+			expect(await nativeFind({ root: project, pattern: "*.txt", limit: 10 })).toEqual(["a.txt", "b.txt"]);
+		} finally {
+			rmSync(project, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("the content cache", () => {
+	test("counts what it holds when files change, and stays within its pool", async () => {
+		const project = mkdtempSync(join(tmpdir(), "pi-content-cache-"));
+		const file = join(project, "a.txt");
+		try {
+			clearNativeSearchCache();
+			for (let i = 0; i < 20; i++) {
+				writeFileSync(file, `needle ${"x".repeat(1000 + i)}\n`);
+				utimesSync(file, new Date(Date.now() + i * 1000), new Date(Date.now() + i * 1000));
+				notifySearchExternalChange();
+				await nativeGrep({ root: project, isDirectory: true, pattern: "needle", limit: 10, keepChars: 50 });
+			}
+			const stats = contentCacheStats();
+			expect(stats.files).toBe(1);
+			expect(stats.counted).toBe(stats.held);
+			expect(stats.held).toBe(1000 + 19 + 8);
+
+			// 140 files of 500 KB: more than the 64 MB pool, the first ones dropped.
+			const big = `needle ${"y".repeat(500 * 1024 - 8)}\n`;
+			for (let i = 0; i < 140; i++) notifySearchFileTouched(join(project, `big${i}.txt`), big, Date.now());
+			const full = contentCacheStats();
+			expect(full.counted).toBe(full.held);
+			expect(full.held).toBeLessThanOrEqual(64 * 1024 * 1024);
+			expect(full.files).toBeLessThan(141);
+		} finally {
+			rmSync(project, { recursive: true, force: true });
+		}
+	});
+});
+
 describe.skipIf(!has("rg") || !has("fd"))("the same results as ripgrep and fd", () => {
 	const text = (result: { content: Array<{ type: string; text?: string }> }) =>
 		(result.content[0] as { text: string }).text.split("\n").sort();

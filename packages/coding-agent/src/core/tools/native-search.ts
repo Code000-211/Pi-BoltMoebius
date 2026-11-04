@@ -522,6 +522,10 @@ export interface WalkOptions {
 	 * held while the walk goes on (a walk through a whole disk finds millions of entries).
 	 */
 	keep?: (rel: string, kind: WalkEntry["kind"]) => boolean;
+	/** Given, the files an ignore file leaves out (not those in a folder left out) are added to it instead of passed over. */
+	ignoredFiles?: WalkEntry[];
+	/** Given, the folders an ignore file leaves out are added to it (absolute paths). */
+	ignoredDirs?: string[];
 	signal?: AbortSignal;
 }
 
@@ -589,10 +593,17 @@ export async function walk(options: WalkOptions): Promise<WalkEntry[]> {
 						: undefined;
 			if (!kind) continue;
 			const rel = task.rel ? `${task.rel}/${dirent.name}` : dirent.name;
-			if (taskRules.length > 0 && isIgnored(taskRules, topRel(rel), kind === "dir")) {
-				if (kind === "dir" || !options.override?.(rel)) continue;
-			}
 			const abs = path.join(task.abs, dirent.name);
+			if (taskRules.length > 0 && isIgnored(taskRules, topRel(rel), kind === "dir")) {
+				if (kind === "dir") {
+					options.ignoredDirs?.push(abs);
+					continue;
+				}
+				if (!options.override?.(rel)) {
+					options.ignoredFiles?.push({ rel, abs, kind });
+					continue;
+				}
+			}
 			if (!options.keep || options.keep(rel, kind)) entries.push({ rel, abs, kind });
 			if (kind === "dir") subdirs.push({ abs, rel, rules: taskRules, git: taskGit });
 		}
@@ -615,16 +626,31 @@ const byPath = (a: WalkEntry, b: WalkEntry) => (a.rel < b.rel ? -1 : a.rel > b.r
 // --- fff-style persistent in-memory tree & content cache + frecency -----------------------------------------------------
 
 interface CachedTreeEntry {
+	/** The search folder, as `normalizeCacheKey` gives it. */
+	rootKey: string;
 	entries: WalkEntry[];
+	/** The files ignore files leave out, outside folders left out, sorted: a glob of grep takes them (ripgrep's --glob). */
+	ignoredFiles: WalkEntry[];
 	displayPaths: string[];
 	packedPathsBuffer?: Buffer;
 	knownAbsKeys: Set<string>;
+	/** The folders the walk left out, as `normalizeCacheKey` gives them: what is below them is not in the tree. */
+	ignoredDirKeys: Set<string>;
 	dirMtimes: Map<string, number>;
+	/** More folders than MAX_VERIFIED_DIRS: their modification times cannot tell a change after an external one. */
+	partial: boolean;
 	timestamp: number;
 }
 
 const treeCache = new Map<string, CachedTreeEntry>();
 const TREE_CACHE_VERIFY_MS = 2000;
+/** The folders whose modification times tell whether a tree is still current (about 1.5 µs each to check). */
+const MAX_VERIFIED_DIRS = 4096;
+/**
+ * When something may have changed files without a read, edit or write (a bash command): a tree or a file content checked
+ * before this is checked again on its next use, without waiting for its time without checks to end.
+ */
+let externalChangeAt = Number.NEGATIVE_INFINITY;
 
 interface CachedFileBuffer {
 	mtimeMs: number;
@@ -633,11 +659,43 @@ interface CachedFileBuffer {
 	buffer: Buffer | null; // null means binary file (has NUL byte)
 }
 
+/** In the order stored (a file stored again moves to the end): the first are dropped when the pool is full. */
 const contentCache = new Map<string, CachedFileBuffer>();
 let contentCacheBytes = 0;
 const MAX_CONTENT_CACHE_BYTES = 64 * 1024 * 1024; // 64 MB hot buffer pool
 const MAX_CACHED_FILE_BYTES = 512 * 1024; // Cache individual source files up to 512 KB
 const CONTENT_CACHE_STAT_FREE_MS = 1500;
+
+/** Stores a file's content (`buffer` null for a binary file), dropping the files stored longest ago past the pool's size. */
+function storeContent(key: string, mtimeMs: number, buffer: Buffer): void {
+	const previous = contentCache.get(key);
+	if (previous) {
+		if (previous.buffer) contentCacheBytes -= previous.buffer.length;
+		contentCache.delete(key);
+	}
+	if (buffer.length > MAX_CACHED_FILE_BYTES) return;
+	const binary = buffer.indexOf(0) !== -1;
+	contentCache.set(key, {
+		mtimeMs,
+		size: buffer.length,
+		verifiedAt: performance.now(),
+		buffer: binary ? null : buffer,
+	});
+	if (binary) return;
+	contentCacheBytes += buffer.length;
+	for (const [oldKey, old] of contentCache) {
+		if (contentCacheBytes <= MAX_CONTENT_CACHE_BYTES) break;
+		if (old.buffer) contentCacheBytes -= old.buffer.length;
+		contentCache.delete(oldKey);
+	}
+}
+
+/** For tests: the bytes the content cache holds, by its count and by its entries. */
+export function contentCacheStats(): { counted: number; held: number; files: number } {
+	let held = 0;
+	for (const entry of contentCache.values()) held += entry.buffer?.length ?? 0;
+	return { counted: contentCacheBytes, held, files: contentCache.size };
+}
 
 const frecencyScores = new Map<string, number>();
 
@@ -652,27 +710,37 @@ export function notifySearchFileTouched(filePath: string, content?: string | Buf
 	frecencyScores.set(key, (frecencyScores.get(key) ?? 0) + 10);
 
 	if (content !== undefined && mtimeMs !== undefined) {
-		const buf = typeof content === "string" ? Buffer.from(content, "utf8") : content;
-		if (buf.length <= MAX_CACHED_FILE_BYTES) {
-			const prev = contentCache.get(key);
-			if (prev?.buffer) contentCacheBytes -= prev.buffer.length;
-			const isBin = buf.indexOf(0) !== -1;
-			contentCache.set(key, {
-				mtimeMs,
-				size: buf.length,
-				verifiedAt: performance.now(),
-				buffer: isBin ? null : buf,
-			});
-			if (!isBin) contentCacheBytes += buf.length;
-		}
+		storeContent(key, mtimeMs, typeof content === "string" ? Buffer.from(content, "utf8") : content);
 	}
 
-	// Only invalidate tree cache if this file is NOT already known in the cached tree
+	// A tree is walked again only when the file belongs in it and it does not know the file (one the agent created): not for
+	// a file outside its folder, or below a folder it leaves out (a build directory).
 	for (const [cacheKey, cachedTree] of treeCache.entries()) {
-		if (!cachedTree.knownAbsKeys.has(key)) {
-			treeCache.delete(cacheKey);
-		}
+		if (cachedTree.knownAbsKeys.has(key) || !isBelow(key, cachedTree.rootKey)) continue;
+		if (isBelowIgnoredDir(key, cachedTree)) continue;
+		treeCache.delete(cacheKey);
 	}
+}
+
+function isBelow(key: string, rootKey: string): boolean {
+	return (
+		key.length > rootKey.length &&
+		key.startsWith(rootKey) &&
+		(key[rootKey.length] === path.sep || rootKey.endsWith(path.sep))
+	);
+}
+
+function isBelowIgnoredDir(key: string, tree: CachedTreeEntry): boolean {
+	if (tree.ignoredDirKeys.size === 0) return false;
+	for (let dir = path.dirname(key); dir.length > tree.rootKey.length; dir = path.dirname(dir)) {
+		if (tree.ignoredDirKeys.has(dir)) return true;
+	}
+	return false;
+}
+
+/** Files may have changed outside read, edit and write (a bash command ran): check the cached trees and contents again. */
+export function notifySearchExternalChange(): void {
+	externalChangeAt = performance.now();
 }
 
 export function getFileFrecencyScore(filePath: string): number {
@@ -692,10 +760,11 @@ async function getCachedTree(root: string, requireGit: boolean, signal?: AbortSi
 	const cached = treeCache.get(cacheKey);
 
 	if (cached) {
-		if (now - cached.timestamp < TREE_CACHE_VERIFY_MS) {
+		const changedSince = cached.timestamp <= externalChangeAt;
+		if (now - cached.timestamp < TREE_CACHE_VERIFY_MS && !changedSince) {
 			return cached;
 		}
-		let valid = true;
+		let valid = !(changedSince && cached.partial);
 		for (const [dirPath, oldMtime] of cached.dirMtimes) {
 			try {
 				if (statSync(dirPath).mtimeMs !== oldMtime) {
@@ -713,8 +782,11 @@ async function getCachedTree(root: string, requireGit: boolean, signal?: AbortSi
 		}
 	}
 
-	const allEntries = await walk({ root: resolvedRoot, requireGit, signal });
+	const ignoredFiles: WalkEntry[] = [];
+	const ignoredDirs: string[] = [];
+	const allEntries = await walk({ root: resolvedRoot, requireGit, signal, ignoredFiles, ignoredDirs });
 	allEntries.sort(byPath);
+	ignoredFiles.sort(byPath);
 
 	const displayPaths = new Array<string>(allEntries.length);
 	const knownAbsKeys = new Set<string>();
@@ -728,7 +800,7 @@ async function getCachedTree(root: string, requireGit: boolean, signal?: AbortSi
 		const entry = allEntries[i];
 		displayPaths[i] = entry.kind === "dir" ? `${entry.rel}/` : entry.rel;
 		knownAbsKeys.add(normalizeCacheKey(entry.abs));
-		if (entry.kind === "dir" && dirMtimes.size < 256) {
+		if (entry.kind === "dir" && dirMtimes.size < MAX_VERIFIED_DIRS) {
 			try {
 				dirMtimes.set(entry.abs, statSync(entry.abs).mtimeMs);
 			} catch {
@@ -737,11 +809,17 @@ async function getCachedTree(root: string, requireGit: boolean, signal?: AbortSi
 		}
 	}
 
+	for (const entry of ignoredFiles) knownAbsKeys.add(normalizeCacheKey(entry.abs));
+
 	const treeEntry: CachedTreeEntry = {
+		rootKey: normalizeCacheKey(resolvedRoot),
 		entries: allEntries,
+		ignoredFiles,
 		displayPaths,
 		knownAbsKeys,
+		ignoredDirKeys: new Set(ignoredDirs.map(normalizeCacheKey)),
 		dirMtimes,
+		partial: dirMtimes.size >= MAX_VERIFIED_DIRS,
 		timestamp: performance.now(),
 	};
 	treeCache.set(cacheKey, treeEntry);
@@ -1414,21 +1492,19 @@ export async function nativeGrep(
 	let files: string[];
 	if (options.isDirectory) {
 		const { take, include } = globFilter(options.glob);
-		if (!include) {
-			const cachedTree = await getCachedTree(options.root, true, options.signal);
-			const cachedEntries = cachedTree.entries;
-			files = [];
-			for (let i = 0; i < cachedEntries.length; i++) {
-				const entry = cachedEntries[i];
-				if (entry.kind === "file" && take(entry.rel)) {
-					files.push(entry.abs);
-				}
+		const cachedTree = await getCachedTree(options.root, true, options.signal);
+		const entries = cachedTree.entries;
+		// A glob that includes files also takes those an ignore file leaves out (ripgrep's --glob): both lists are sorted,
+		// so they are merged in path order.
+		const ignored = include ? cachedTree.ignoredFiles : [];
+		files = [];
+		let j = 0;
+		for (let i = 0; i <= entries.length; i++) {
+			const entry = entries[i];
+			for (; j < ignored.length && (!entry || ignored[j].rel < entry.rel); j++) {
+				if (ignored[j].kind === "file" && include?.(ignored[j].rel)) files.push(ignored[j].abs);
 			}
-		} else {
-			const keep = (rel: string, kind: WalkEntry["kind"]) => kind === "file" && take(rel);
-			files = (await walk({ root: options.root, requireGit: true, override: include, keep, signal: options.signal }))
-				.sort(byPath)
-				.map((entry) => entry.abs);
+			if (entry && entry.kind === "file" && take(entry.rel)) files.push(entry.abs);
 		}
 	} else {
 		files = [options.root];
@@ -1452,7 +1528,12 @@ export async function nativeGrep(
 			for (const end = Math.min(files.length, index + STAT_AHEAD); sized < end; sized++) {
 				const fKey = normalizeCacheKey(files[sized]);
 				const cBuf = contentCache.get(fKey);
-				if (cBuf && now - cBuf.verifiedAt < CONTENT_CACHE_STAT_FREE_MS && cBuf.size <= wholeFileBytes) {
+				if (
+					cBuf &&
+					now - cBuf.verifiedAt < CONTENT_CACHE_STAT_FREE_MS &&
+					cBuf.verifiedAt > externalChangeAt &&
+					cBuf.size <= wholeFileBytes
+				) {
 					sizes[sized] = undefined;
 				} else {
 					sizes[sized] = stat(files[sized]).catch(skip);
@@ -1469,6 +1550,7 @@ export async function nativeGrep(
 					cachedBuf &&
 					sizes[requested] === undefined &&
 					now - cachedBuf.verifiedAt < CONTENT_CACHE_STAT_FREE_MS &&
+					cachedBuf.verifiedAt > externalChangeAt &&
 					cachedBuf.size <= wholeFileBytes
 				) {
 					reads[requested] = Promise.resolve(cachedBuf.buffer ?? undefined);
@@ -1484,19 +1566,7 @@ export async function nativeGrep(
 						}
 						return readFile(file)
 							.then((buf) => {
-								if (
-									buf.length <= MAX_CACHED_FILE_BYTES &&
-									contentCacheBytes + buf.length <= MAX_CONTENT_CACHE_BYTES
-								) {
-									const isBin = buf.indexOf(0) !== -1;
-									contentCache.set(cacheKey, {
-										mtimeMs: stats.mtimeMs,
-										size: stats.size,
-										verifiedAt: performance.now(),
-										buffer: isBin ? null : buf,
-									});
-									if (!isBin) contentCacheBytes += buf.length;
-								}
+								storeContent(cacheKey, stats.mtimeMs, buf);
 								return buf;
 							})
 							.catch(skip);

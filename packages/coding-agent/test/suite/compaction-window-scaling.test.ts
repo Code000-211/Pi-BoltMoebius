@@ -174,8 +174,10 @@ describe("compaction scaled with the context window", () => {
 	});
 
 	it.each([
-		{ window: 200_000, settings: {}, threshold: 180_000 },
-		{ window: 1_000_000, settings: {}, threshold: 900_000 },
+		// The default maxContextTokens (128,000) is below 90% of these windows.
+		{ window: 200_000, settings: {}, threshold: 128_000 },
+		{ window: 1_000_000, settings: {}, threshold: 128_000 },
+		{ window: 1_000_000, settings: { maxContextTokens: 1_000_000 }, threshold: 900_000 },
 		{ window: 1_000_000, settings: { reserveTokens: 16_384 }, threshold: 983_616 },
 		{ window: 1_000_000, settings: { reserveTokens: 16_384, thresholdPercent: 95 }, threshold: 950_000 },
 	])("compacts before a prompt above $threshold tokens of a $window-token window with $settings", async (row) => {
@@ -203,7 +205,15 @@ describe("compaction scaled with the context window", () => {
 		{ window: 200_000, settings: {}, keptFrom: 21, summary: 13_107, turnPrefix: 8_192 },
 		// 5% of 1M keeps 50K tokens: the whole 45K-token history, so nothing is summarized but the 1M
 		// window still sets the caps of the history summary below.
-		{ window: 1_000_000, settings: { keepRecentTokens: 20_000 }, keptFrom: 21, summary: 32_000, turnPrefix: 16_000 },
+		{
+			window: 1_000_000,
+			settings: { keepRecentTokens: 20_000, maxContextTokens: 1_000_000 },
+			keptFrom: 21,
+			summary: 32_000,
+			turnPrefix: 16_000,
+		},
+		// The default maxContextTokens caps the window the summary's share is taken of.
+		{ window: 1_000_000, settings: { keepRecentTokens: 20_000 }, keptFrom: 21, summary: 13_107, turnPrefix: 8_192 },
 		{
 			window: 1_000_000,
 			settings: { keepRecentTokens: 20_000, reserveTokens: 16_384 },
@@ -236,9 +246,10 @@ describe("compaction scaled with the context window", () => {
 		expect(captured.compactions).toMatchObject([{ reason: "manual", firstKeptIndex: row.keptFrom }]);
 	});
 
-	it("keeps 5% of a 1M window as recent context", async () => {
+	it("keeps 5% of a 1M window as recent context when maxContextTokens allows it", async () => {
 		const harness = await harnessWith({
 			models: [{ id: "faux-1m", contextWindow: 1_000_000, maxTokens: 128_000 }],
+			settings: { compaction: { maxContextTokens: 1_000_000 } },
 		});
 		// Ten more 6K-token turns: 105K estimated tokens in all, of which the newest 50K are kept.
 		seedHistory(harness, 10);

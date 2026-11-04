@@ -9,6 +9,7 @@ const defaults = {
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
 	thresholdPercent: 90,
+	maxContextTokens: 128000,
 	scaleSummaryWithContextWindow: true,
 };
 

@@ -132,6 +132,11 @@ export interface CompactionSettings {
 	/** Output cap of the summary; a split turn's prefix summary gets half. Absent: derived from `reserveTokens`. */
 	summaryMaxTokens?: number;
 	/**
+	 * Also compact once the context exceeds this many tokens, whatever the window. Each turn re-reads the
+	 * context, so past about 100k tokens a long session pays on every turn. Absent: no such cap.
+	 */
+	maxContextTokens?: number;
+	/**
 	 * Let the summary cap derived from `reserveTokens` grow with the summarizer's context window:
 	 * to 3.2% of it (1.6% for a split turn's prefix).
 	 */
@@ -147,6 +152,7 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
 	thresholdPercent: 90,
+	maxContextTokens: 128000,
 	scaleSummaryWithContextWindow: true,
 };
 
@@ -284,12 +290,15 @@ export function estimateProjectedContextTokens(
 
 /**
  * Context size above which compaction triggers: `contextWindow - reserveTokens`, or
- * `thresholdPercent` of the window when that is lower.
+ * `thresholdPercent` of the window, or `maxContextTokens`, whichever is lowest.
  */
 export function getCompactionThreshold(contextWindow: number, settings: CompactionSettings): number {
-	const reserveThreshold = contextWindow - settings.reserveTokens;
-	if (settings.thresholdPercent === undefined) return reserveThreshold;
-	return Math.min(reserveThreshold, Math.floor((contextWindow * settings.thresholdPercent) / 100));
+	let threshold = contextWindow - settings.reserveTokens;
+	if (settings.thresholdPercent !== undefined) {
+		threshold = Math.min(threshold, Math.floor((contextWindow * settings.thresholdPercent) / 100));
+	}
+	if (settings.maxContextTokens !== undefined) threshold = Math.min(threshold, settings.maxContextTokens);
+	return threshold;
 }
 
 /**
@@ -655,11 +664,14 @@ const MIN_SUMMARY_OUTPUT_TOKENS = 4096;
  * Output cap of a summary, capped by the model's output limit. An explicit `summaryMaxTokens` is used
  * as set (half of it for a split turn's prefix). Otherwise the cap is 80% of `reserveTokens` (50% for
  * the prefix), at least the minimum, and with `scaleSummaryWithContextWindow` at least 3.2% of the
- * model's context window (1.6% for the prefix).
+ * model's context window capped at `maxContextTokens` (1.6% for the prefix).
  */
 export function getSummaryMaxTokens(
 	model: Model<any>,
-	settings: Pick<CompactionSettings, "reserveTokens" | "summaryMaxTokens" | "scaleSummaryWithContextWindow">,
+	settings: Pick<
+		CompactionSettings,
+		"reserveTokens" | "summaryMaxTokens" | "scaleSummaryWithContextWindow" | "maxContextTokens"
+	>,
 	part: "summary" | "turnPrefix" = "summary",
 ): number {
 	let budget: number;
@@ -670,7 +682,8 @@ export function getSummaryMaxTokens(
 		budget = Math.max(Math.floor(share * settings.reserveTokens), MIN_SUMMARY_OUTPUT_TOKENS);
 		if (settings.scaleSummaryWithContextWindow && model.contextWindow > 0) {
 			const perMille = part === "summary" ? 32 : 16;
-			budget = Math.max(budget, Math.floor((model.contextWindow * perMille) / 1000));
+			const window = Math.min(model.contextWindow, settings.maxContextTokens ?? Number.POSITIVE_INFINITY);
+			budget = Math.max(budget, Math.floor((window * perMille) / 1000));
 		}
 	}
 	return model.maxTokens > 0 ? Math.min(budget, model.maxTokens) : budget;

@@ -6,10 +6,12 @@ adds the tool `project_search`, adds matching doc sections to a typed prompt (au
 - **No model at search time.** BM25 over sections, plus a graph of sections and the names they mention, walked with
   personalized PageRank (the retrieval of HippoRAG and E²GraphRAG, with rule-based entities instead of an LLM or NER).
 - **Docs are split at their headings, code at its definitions**: one section per function, class or struct, named by
-  it. A query that names a function or type gets its definition first.
+  it, in C, C++, HIP, CUDA, Rust, Python, JavaScript, TypeScript, Go and shell scripts. A query that names a function
+  or type gets its definition first.
 - **The index is a file, mapped.** The first process on a folder builds and saves it; every later one is ready in
   milliseconds and shares the same pages. Changed files are searched from a small overlay within a second of the
-  change; the saved index is rebuilt once the files have been quiet for 30 seconds.
+  change; the saved index is rebuilt once the files have been quiet for 30 seconds and the overlay holds 20 files or is
+  10 minutes old (at once past 200 files).
 
 ## Measured
 
@@ -21,13 +23,17 @@ descriptions):
 | Docs | 73% | 83% | 88% |
 | Code, function by name | 87% | 97% | 98% |
 | Code, function by description | 15% | 32% | 55% |
+| TypeScript, function or type by name (Pi-Bolt's sources) | 98% | 100% | 100% |
+
+TypeScript, JavaScript, Go and shell files were split like plain text until the change that added them: the same 60
+TypeScript names had 53% / 83% / 98% then (search p50 33 → 38 µs, build 93 → 107 ms for 568 files).
 
 | | |
 |---|---|
 | Search, seen from Bun, each query once (p50) | docs 77 µs, names 99 µs, descriptions 336 µs |
 | The same query again (result cache) | ~15 µs |
 | Index build (once per folder) | ~0.9 s |
-| Ready in a process when the index file exists | ~12 ms |
+| Ready in a process when the index file exists | 0.3 ms (12.4 ms before the check stamp; the first process to map a new version checks it, ~12 ms) |
 | Memory per process with the mapped index | ~32 MB private, ~110 MB page cache shared by all |
 | A changed file searchable after | ≤ ~1 s (51 ms in the test), nothing written to disk |
 
@@ -49,7 +55,11 @@ packages/docsearch/install.sh                 # builds the addon, copies it and 
 pi-bolt compile --only klar-ui,docsearch      # compiles it into the executable (list the extensions you compile in)
 ```
 
-`install.sh` honours `PI_CODING_AGENT_DIR`. The addon is loaded by a literal `require`, so `pi-bolt compile` embeds
+`install.sh` builds for the platform it runs on (Linux, macOS, Windows in Git Bash; x64 or arm64), copies the addon as
+`docsearch.<platform>-<arch>.node` and writes that name into the extension it installs. Run on Linux x64 only; the core
+compiles for Windows (`cargo check --target x86_64-pc-windows-gnu`), but the addon has not been built or run there. On
+Windows an index file mapped by another process cannot be replaced, so a process whose save fails keeps its build in
+memory. `install.sh` honours `PI_CODING_AGENT_DIR`. The addon is loaded by a literal `require`, so `pi-bolt compile` embeds
 it in the executable. `PI_DOCSEARCH=off` leaves the extension out of a run (no tool, no recall), to measure without it.
 
 ## Settings
@@ -65,7 +75,8 @@ it in the executable. `PI_DOCSEARCH=off` leaves the extension out of a run (no t
 | `results`, `resultChars` | `6`, `[1500, 1000, 600]` | The best three results come with this much text, the rest as `path:lines` only. |
 | `autoRecall` | `true` | Add matching doc sections to a typed prompt; `/docs auto on\|off`. |
 
-The index files live in `~/.cache/docsearch/index/` (`DOCSEARCH_CACHE_DIR` to move them). A folder whose build takes
+The index files live in `~/.cache/docsearch/index/` (`DOCSEARCH_CACHE_DIR` to move them). A file of another format
+version (the last byte of its magic) is built again. A folder whose build takes
 less than 100 ms is kept in memory only. Files unused for 30 days are removed.
 
 ## Layout
@@ -80,7 +91,9 @@ less than 100 ms is kept in memory only. Files unused for 30 days are removed.
 ## Measuring a change
 
 The test sets point at frozen snapshots of radiance taken on 2026-11-03: `corpus/` with its tracked Markdown and text
-files, `code/` with its tracked source files. Put both in one folder, then:
+files, `code/` with its tracked source files. `ts-names.tsv` points at `ts/`, Pi-Bolt's TypeScript at commit `5641c898`
+of this fork: `git archive 5641c898 packages/{coding-agent,ai,agent,tui}/src | tar -x -C ts`, without
+`models.generated.ts`. Put them in one folder, then:
 
 ```sh
 cargo build --release -p docsearch-core

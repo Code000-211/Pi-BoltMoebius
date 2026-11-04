@@ -10,6 +10,7 @@ import { splitIncompleteAnsiSuffix, stripAnsi } from "../utils/ansi.ts";
 import { createOutputFile, type OutputFile } from "../utils/output-files.ts";
 import { sanitizeBinaryOutput } from "../utils/shell.ts";
 import type { BashOperations } from "./tools/bash.ts";
+import { notifySearchExternalChange } from "./tools/native-search.ts";
 import { DEFAULT_MAX_BYTES, truncateTail } from "./tools/truncate.ts";
 
 // ============================================================================
@@ -136,6 +137,9 @@ export async function executeBashWithOperations(
 			closeTempFile();
 			throw err;
 		}
+	} finally {
+		// The command may have changed files that grep and find hold in their caches.
+		notifySearchExternalChange();
 	}
 
 	flushOutput();

@@ -26,6 +26,7 @@ import {
 } from "./settings-manager.ts";
 import { BUILTIN_PATH_PREFIX } from "./source-info.ts";
 import { time } from "./timings.ts";
+import { pruneToolResults } from "./tool-result-pruning.ts";
 import {
 	createBashTool,
 	createCodingTools,
@@ -301,7 +302,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
-		const converted = convertToLlm(messages);
+		const converted = pruneToolResults(convertToLlm(messages), settingsManager.getToolResultPruningSettings());
 		// Check setting dynamically so mid-session changes take effect
 		if (!settingsManager.getBlockImages()) {
 			return converted;

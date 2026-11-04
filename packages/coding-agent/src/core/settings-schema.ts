@@ -18,11 +18,46 @@ function summaryMaxTokens(options: TSchemaOptions = {}) {
 	return Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER, ...options });
 }
 
+function maxContextTokens(options: TSchemaOptions = {}) {
+	return Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER, ...options });
+}
+
 const CompactionModelOverrideSchema = Type.Object({
 	reserveTokens: Type.Optional(nonNegativeSafeInteger()),
 	keepRecentTokens: Type.Optional(nonNegativeSafeInteger()),
 	thresholdPercent: Type.Optional(compactionThresholdPercent()),
 	summaryMaxTokens: Type.Optional(summaryMaxTokens()),
+	maxContextTokens: Type.Optional(maxContextTokens()),
+});
+
+const ToolResultPruningSettingsSchema = Type.Object({
+	enabled: Type.Optional(
+		Type.Boolean({
+			description: "Send old, large tool results to the model as a one-line note. The session keeps them in full.",
+			default: SETTINGS_DEFAULTS.toolResultPruning.enabled,
+		}),
+	),
+	triggerTokens: Type.Optional(
+		nonNegativeSafeInteger({
+			description: "Clear only once the context is at least this many tokens (estimated).",
+			default: SETTINGS_DEFAULTS.toolResultPruning.triggerTokens,
+		}),
+	),
+	keepRecent: Type.Optional(
+		Type.Integer({
+			minimum: 1,
+			maximum: Number.MAX_SAFE_INTEGER,
+			description:
+				"The most recent tool results that are never cleared. The boundary moves in steps of this many results, so the prompt cache breaks only once per step.",
+			default: SETTINGS_DEFAULTS.toolResultPruning.keepRecent,
+		}),
+	),
+	minChars: Type.Optional(
+		nonNegativeSafeInteger({
+			description: "Clear only results with at least this many characters of text, or with an image.",
+			default: SETTINGS_DEFAULTS.toolResultPruning.minChars,
+		}),
+	),
 });
 
 const CompactionSettingsSchema = Type.Object({
@@ -52,6 +87,13 @@ const CompactionSettingsSchema = Type.Object({
 		summaryMaxTokens({
 			description:
 				"Output cap of a compaction summary; a split turn's prefix summary gets half. Unset: the largest of 80% of reserveTokens, 4096 and (while reserveTokens is unset) 3.2% of the context window, capped by the model's output limit.",
+		}),
+	),
+	maxContextTokens: Type.Optional(
+		maxContextTokens({
+			description:
+				"Compact once the context exceeds this many tokens, however large the context window. Every later turn re-reads the whole context, so a long session on a 1M-token model slows down well before 90% of the window. The context-window shares of keepRecentTokens and the summary cap are taken of the window capped at this size.",
+			default: SETTINGS_DEFAULTS.compaction.maxContextTokens,
 		}),
 	),
 	modelOverrides: Type.Optional(
@@ -275,6 +317,7 @@ export const SettingsSchema = Type.Object(
 		),
 		theme: Type.Optional(Type.String()),
 		compaction: Type.Optional(CompactionSettingsSchema),
+		toolResultPruning: Type.Optional(ToolResultPruningSettingsSchema),
 		branchSummary: Type.Optional(BranchSummarySettingsSchema),
 		retry: Type.Optional(RetrySettingsSchema),
 		hideThinkingBlock: Type.Optional(Type.Boolean({ default: SETTINGS_DEFAULTS.hideThinkingBlock })),

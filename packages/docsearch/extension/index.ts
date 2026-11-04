@@ -24,7 +24,8 @@ import { Type } from "typebox";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 
-// A literal path, so that `pi-bolt compile` embeds the addon in the executable.
+// A literal path, so that `pi-bolt compile` embeds the addon in the executable; install.sh puts in the platform it
+// builds on (docsearch.darwin-arm64.node, docsearch.win32-x64.node, ...).
 const { DocIndex } = require("./docsearch.linux-x64.node");
 
 interface Hit {
@@ -75,7 +76,10 @@ interface Config {
 }
 
 const DOC_EXTENSIONS = ["md", "mdx", "markdown", "txt", "rst", "adoc", "org"];
-const CODE_EXTENSIONS = ["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hip", "cu", "cuh", "rs", "py", "sh", "ts", "js", "go"];
+const CODE_EXTENSIONS = [
+	...["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hip", "cu", "cuh", "rs", "py", "go", "sh", "bash"],
+	...["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"],
+];
 const isCode = (p: string) => CODE_EXTENSIONS.includes(p.slice(p.lastIndexOf(".") + 1).toLowerCase());
 
 const DEFAULTS: Config = {
@@ -131,6 +135,8 @@ export default function (pi: ExtensionAPI) {
 	// PI_DOCSEARCH=off leaves the extension out entirely (no tool, no recall), to measure without it.
 	if (process.env.PI_DOCSEARCH === "off") return;
 	let index: any;
+	/** The current index's first build is there: searches need not wait for it. */
+	let ready = false;
 	let base = "";
 	let config = DEFAULTS;
 
@@ -148,6 +154,7 @@ export default function (pi: ExtensionAPI) {
 		);
 		const extensions = config.extensions ?? [...DOC_EXTENSIONS, ...(config.code ? CODE_EXTENSIONS : [])];
 		index = roots.length ? new DocIndex({ roots, extensions }) : undefined;
+		ready = false;
 		if (!index) {
 			ctx.ui.setStatus("docsearch", undefined);
 			return;
@@ -163,10 +170,26 @@ export default function (pi: ExtensionAPI) {
 		}, 100);
 	}
 
-	function search(query: string, k: number, maxChars: number, path?: string, waitMs = 5000): SearchResult | undefined {
-		if (!index) return undefined;
+	/**
+	 * Searches once the first build is there, waiting up to `waitMs` for it on a worker thread (the event loop, and with
+	 * it the screen and Escape, keeps running); `ready` is false when it was not there in time.
+	 */
+	async function search(
+		query: string,
+		k: number,
+		maxChars: number,
+		path?: string,
+		waitMs = 5000,
+	): Promise<SearchResult | undefined> {
+		const ix = index;
+		if (!ix) return undefined;
 		const pathPrefix = path ? (isAbsolute(expand(path)) ? expand(path) : resolve(base || process.cwd(), path)) : undefined;
-		return index.search(query, { k, maxChars, pathPrefix, waitMs });
+		if (!ready) {
+			const built = await ix.whenReady(waitMs);
+			// (`/docs rebuild` may have started another index meanwhile.)
+			if (ix === index) ready = built;
+		}
+		return ix.search(query, { k, maxChars, pathPrefix });
 	}
 
 	/** Cuts `text` to at most `max` characters, at a line break when one is in the second half. */
@@ -235,7 +258,7 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_id, params) {
-			const r = search(params.query, params.k ?? config.results, Math.max(...config.resultChars, 200), params.path);
+			const r = await search(params.query, params.k ?? config.results, Math.max(...config.resultChars, 200), params.path);
 			if (!r) throw new Error(`Nothing to search: no project root here and no "roots" in ${CONFIG_PATH}.`);
 			if (!r.ready) throw new Error("The index is still being built; try again in a moment.");
 			const hits = r.hits.map((h) => ({ ...h, path: show(h.path) }));
@@ -266,7 +289,13 @@ export default function (pi: ExtensionAPI) {
 		if (!config.autoRecall || event.messageType !== "user" || !event.prompt || !index) return;
 		const prompt = event.prompt.trim();
 		if (prompt.startsWith("/")) return;
-		const r = search(prompt, config.autoRecallHits * 2, Math.floor(config.autoRecallChars / config.autoRecallHits), undefined, 300);
+		const r = await search(
+			prompt,
+			config.autoRecallHits * 2,
+			Math.floor(config.autoRecallChars / config.autoRecallHits),
+			undefined,
+			300,
+		);
 		if (!r?.ready) return;
 		const hits = r.hits
 			.filter(
@@ -320,7 +349,7 @@ export default function (pi: ExtensionAPI) {
 				);
 				return;
 			}
-			const r = search(a, 8, 200);
+			const r = await search(a, 8, 200);
 			if (!r?.ready) return ctx.ui.notify("docsearch: still building", "warning");
 			const lines = r.hits.map((h) => `${show(h.path)}:${h.lineStart}-${h.lineEnd}  ${h.heading}`);
 			ctx.ui.notify(`${lines.length} sections in ${(r.micros / 1000).toFixed(1)} ms\n${lines.join("\n")}`, "info");

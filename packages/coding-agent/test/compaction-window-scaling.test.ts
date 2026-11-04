@@ -36,9 +36,10 @@ describe("window-scaled compaction budgets", () => {
 		// 128K and smaller: as before the defaults scaled.
 		{ window: 128_000, threshold: 111_616, keepRecentTokens: 20_000, summary: 13_107, turnPrefix: 8_192 },
 		{ window: 131_072, threshold: 114_688, keepRecentTokens: 20_000, summary: 13_107, turnPrefix: 8_192 },
-		{ window: 200_000, threshold: 180_000, keepRecentTokens: 20_000, summary: 13_107, turnPrefix: 8_192 },
-		{ window: 400_000, threshold: 360_000, keepRecentTokens: 20_000, summary: 13_107, turnPrefix: 8_192 },
-		{ window: 1_000_000, threshold: 900_000, keepRecentTokens: 50_000, summary: 32_000, turnPrefix: 16_000 },
+		// Larger windows: compaction at maxContextTokens (128,000), and the window's shares of a 128,000 window.
+		{ window: 200_000, threshold: 128_000, keepRecentTokens: 20_000, summary: 13_107, turnPrefix: 8_192 },
+		{ window: 400_000, threshold: 128_000, keepRecentTokens: 20_000, summary: 13_107, turnPrefix: 8_192 },
+		{ window: 1_000_000, threshold: 128_000, keepRecentTokens: 20_000, summary: 13_107, turnPrefix: 8_192 },
 	])("defaults for a $window-token window", ({ window, ...expected }) => {
 		expect(budgets(undefined, window)).toEqual(expected);
 	});
@@ -94,7 +95,9 @@ describe("window-scaled compaction budgets", () => {
 	});
 
 	it("caps every summary by the model's output limit", () => {
-		expect(budgets(undefined, 1_000_000, 16_384)).toMatchObject({ summary: 16_384, turnPrefix: 16_000 });
+		// (maxContextTokens raised, so that the window's 3.2% share passes the output limit)
+		const wide = { maxContextTokens: 1_000_000 };
+		expect(budgets(wide, 1_000_000, 16_384)).toMatchObject({ summary: 16_384, turnPrefix: 16_000 });
 		expect(budgets({ summaryMaxTokens: 50_000 }, 1_000_000, 16_384)).toMatchObject({
 			summary: 16_384,
 			turnPrefix: 16_384,
@@ -143,8 +146,10 @@ describe("window-scaled compaction budgets", () => {
 	});
 
 	it("uses the given context window over the model's", () => {
-		const manager = SettingsManager.inMemory();
+		const manager = SettingsManager.inMemory({ compaction: { maxContextTokens: 1_000_000 } });
 		expect(manager.getCompactionSettings(model(128_000), 1_000_000).keepRecentTokens).toBe(50_000);
+		// With the default cap, 5% of the window capped at 128,000 is below the 20,000 minimum.
+		expect(SettingsManager.inMemory().getCompactionSettings(model(128_000), 1_000_000).keepRecentTokens).toBe(20_000);
 	});
 
 	it.each([
@@ -159,5 +164,23 @@ describe("window-scaled compaction budgets", () => {
 		expect(() => SettingsManager.fromStorage(storage).getCompactionSettings()).toThrow(
 			`Invalid compaction.${field} setting: ${String(value)}. Expected ${range}.`,
 		);
+	});
+
+	it("maxContextTokens caps the threshold; set, it applies beside reserveTokens and per model", () => {
+		expect(budgets({ maxContextTokens: 300_000 }, 1_000_000)).toMatchObject({
+			threshold: 300_000,
+			keepRecentTokens: 20_000,
+			summary: 13_107,
+		});
+		expect(budgets({ maxContextTokens: 1_000_000 }, 1_000_000)).toMatchObject({
+			threshold: 900_000,
+			summary: 32_000,
+		});
+		expect(budgets({ reserveTokens: 16_384, maxContextTokens: 64_000 }, 1_000_000).threshold).toBe(64_000);
+		const perModel = { modelOverrides: { "provider/model-1000000": { maxContextTokens: 80_000 } } };
+		expect(budgets(perModel, 1_000_000).threshold).toBe(80_000);
+		// An explicit thresholdPercent asks for its own threshold, as an explicit reserveTokens does.
+		expect(budgets({ thresholdPercent: 50 }, 1_000_000).threshold).toBe(500_000);
+		expect(() => budgets({ maxContextTokens: 0 }, 1_000_000)).toThrow("Invalid compaction.maxContextTokens");
 	});
 });

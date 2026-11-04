@@ -131,6 +131,13 @@
           "maximum": 9007199254740991,
           "description": "Output cap of a compaction summary; a split turn's prefix summary gets half. Unset: the largest of 80% of reserveTokens, 4096 and (while reserveTokens is unset) 3.2% of the context window, capped by the model's output limit."
         },
+        "maxContextTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "Compact once the context exceeds this many tokens, however large the context window. Every later turn re-reads the whole context, so a long session on a 1M-token model slows down well before 90% of the window. The context-window shares of keepRecentTokens and the summary cap are taken of the window capped at this size.",
+          "default": 128000
+        },
         "modelOverrides": {
           "type": "object",
           "patternProperties": {
@@ -156,11 +163,47 @@
                   "type": "integer",
                   "minimum": 1,
                   "maximum": 9007199254740991
+                },
+                "maxContextTokens": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
                 }
               }
             }
           },
           "description": "Per-model overrides keyed by exact \"provider/modelId\" strings."
+        }
+      }
+    },
+    "toolResultPruning": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Send old, large tool results to the model as a one-line note. The session keeps them in full.",
+          "default": true
+        },
+        "triggerTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Clear only once the context is at least this many tokens (estimated).",
+          "default": 40000
+        },
+        "keepRecent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "The most recent tool results that are never cleared. The boundary moves in steps of this many results, so the prompt cache breaks only once per step.",
+          "default": 8
+        },
+        "minChars": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991,
+          "description": "Clear only results with at least this many characters of text, or with an image.",
+          "default": 2000
         }
       }
     },

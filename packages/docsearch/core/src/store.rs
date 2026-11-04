@@ -2,7 +2,6 @@
 //! index is used where it lies: opening one reads nothing, and every process that maps the same
 //! file shares its pages.
 
-use std::hash::Hasher;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -104,7 +103,7 @@ impl Strs {
     #[inline]
     pub fn str(&self, i: usize) -> &str {
         // SAFETY: tables read through `str` are built from Rust strings, and a mapped file is checked
-        // as a whole (`Reader::utf8`) before it is used.
+        // as a whole (`Reader::utf8`) the first time a version of it is used (see `Reader::trusting`).
         unsafe { std::str::from_utf8_unchecked(self.bytes(i)) }
     }
     pub fn len(&self) -> usize {
@@ -115,10 +114,28 @@ impl Strs {
     }
 }
 
+/// The table's hash. It is saved with the index, so it is defined here rather than taken from a crate whose next
+/// version may hash differently (the saved tables would then find nothing). Eight bytes at a time, then murmur3's
+/// finalizer, so the low bits the table uses depend on every byte.
 fn hash(key: &[u8]) -> u64 {
-    let mut h = rustc_hash::FxHasher::default();
-    h.write(key);
-    h.finish()
+    const K: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mix = |h: u64, word: u64| (h ^ word).wrapping_mul(K).rotate_left(31);
+    let mut h = key.len() as u64;
+    let mut words = key.chunks_exact(8);
+    for word in &mut words {
+        h = mix(h, u64::from_le_bytes(word.try_into().unwrap()));
+    }
+    let rest = words.remainder();
+    if !rest.is_empty() {
+        let mut last = [0u8; 8];
+        last[..rest.len()].copy_from_slice(rest);
+        h = mix(h, u64::from_le_bytes(last));
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^ (h >> 33)
 }
 
 /// String -> `u32`, as an open-addressing table over `keys`, usable straight from the file.
@@ -150,7 +167,8 @@ impl StrMap {
     pub fn get(&self, key: &str) -> Option<u32> {
         let mask = self.slots.len().checked_sub(1)?;
         let mut at = hash(key.as_bytes()) as usize & mask;
-        loop {
+        // At most every slot once: a damaged file whose table has no empty slot must not loop forever.
+        for _ in 0..self.slots.len() {
             let s = self.slots[at];
             if s == 0 {
                 return None;
@@ -160,6 +178,7 @@ impl StrMap {
             }
             at = (at + 1) & mask;
         }
+        None
     }
     pub fn len(&self) -> usize {
         self.keys.len()
@@ -208,6 +227,7 @@ impl<W: Write> Writer<W> {
 pub struct Reader {
     map: Arc<Mmap>,
     at: usize,
+    validate: bool,
 }
 
 #[derive(Debug)]
@@ -215,7 +235,12 @@ pub struct BadFile;
 
 impl Reader {
     pub fn new(map: Arc<Mmap>, start: usize) -> Self {
-        Reader { map, at: start }
+        Reader { map, at: start, validate: true }
+    }
+    /// A reader of a file whose contents were checked before (the same version of it): it keeps the checks of each
+    /// array's place in the file, and leaves out those that read the array (offsets, UTF-8, table slots).
+    pub fn trusting(map: Arc<Mmap>, start: usize) -> Self {
+        Reader { map, at: start, validate: false }
     }
     pub fn buf<T: Pod>(&mut self) -> Result<Buf<T>, BadFile> {
         let size = std::mem::size_of::<T>();
@@ -230,25 +255,32 @@ impl Reader {
     }
     pub fn lists(&mut self) -> Result<Lists, BadFile> {
         let l = Lists { off: self.buf()?, val: self.buf()? };
-        check_offsets(&l.off, l.val.len())?;
+        if self.validate {
+            check_offsets(&l.off, l.val.len())?;
+        }
         Ok(l)
     }
     pub fn strs(&mut self) -> Result<Strs, BadFile> {
         let s = Strs { off: self.buf()?, bytes: self.buf()? };
-        check_offsets(&s.off, s.bytes.len())?;
+        if self.validate {
+            check_offsets(&s.off, s.bytes.len())?;
+        }
         Ok(s)
     }
     /// A table read through `Strs::str`: its bytes must be UTF-8 where the offsets cut them.
     pub fn utf8(&mut self) -> Result<Strs, BadFile> {
         let s = self.strs()?;
-        for i in 0..s.len() {
+        for i in 0..if self.validate { s.len() } else { 0 } {
             std::str::from_utf8(s.bytes(i)).map_err(|_| BadFile)?;
         }
         Ok(s)
     }
     pub fn map(&mut self) -> Result<StrMap, BadFile> {
         let m = StrMap { keys: self.strs()?, vals: self.buf()?, slots: self.buf()? };
-        if m.vals.len() != m.keys.len() || !m.slots.len().is_power_of_two() || m.slots.iter().any(|&s| s as usize > m.keys.len()) {
+        if m.vals.len() != m.keys.len()
+            || !m.slots.len().is_power_of_two()
+            || self.validate && m.slots.iter().any(|&s| s as usize > m.keys.len())
+        {
             return Err(BadFile);
         }
         Ok(m)
@@ -273,5 +305,21 @@ mod tests {
         }
         assert_eq!(m.get("nope"), None);
         assert_eq!(StrMap::default().get("x"), None);
+    }
+
+    #[test]
+    fn the_saved_hash_does_not_change() {
+        // Saved tables depend on these values: changing the hash needs a new format version (MAGIC in index.rs).
+        assert_eq!(hash(b""), 0);
+        assert_eq!(hash(b"softmax"), hash(b"softmax"));
+        assert_ne!(hash(b"softmax"), hash(b"softmaz"));
+        assert_eq!(format!("{:016x}", hash(b"PrefixCache::trim")), "9d39b18ad9eca72d");
+    }
+
+    #[test]
+    fn a_table_without_an_empty_slot_ends_the_lookup() {
+        // A damaged file: every slot taken, none holding the key.
+        let m = StrMap { keys: Strs::from_iter(["a", "b"]), vals: vec![1u32, 2].into(), slots: vec![1u32, 2].into() };
+        assert_eq!(m.get("zzz"), None);
     }
 }

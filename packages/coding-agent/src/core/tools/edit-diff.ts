@@ -300,6 +300,28 @@ function getLeadingWhitespace(line: string): string {
  * Adjust the leading indentation of `newText` lines when `oldText` matched via
  * Codex-style trimmed line matching (e.g., model sent 2-space indent instead of tab indent).
  */
+function gcd(a: number, b: number): number {
+	return b === 0 ? a : gcd(b, a % b);
+}
+
+/** The step of indentation in `indents` beyond `base`: a tab, or the largest run of spaces they all are multiples of. */
+function indentUnit(indents: string[], base: string): string | undefined {
+	let spaces = 0;
+	for (const indent of indents) {
+		if (indent.length <= base.length || !indent.startsWith(base)) continue;
+		const extra = indent.slice(base.length);
+		if (extra.startsWith("\t")) return "\t";
+		const run = extra.length - extra.trimStart().length;
+		if (/^ +$/.test(extra)) spaces = gcd(spaces, run);
+	}
+	return spaces > 0 ? " ".repeat(spaces) : undefined;
+}
+
+/**
+ * newText's lines in the file's indentation, when oldText matched lines indented differently (the model sent spaces, the
+ * file uses tabs, or another depth). An indentation that oldText's lines have is mapped to that of the file's line it
+ * matched; a deeper one (a line newText adds) is counted in oldText's unit of indentation and written in the file's.
+ */
 function reindentNewTextForMatchedLines(matchedOriginalSlice: string, oldText: string, newText: string): string {
 	const hasTrailingNewline = newText.endsWith("\n");
 	const origLines = matchedOriginalSlice.endsWith("\n")
@@ -308,30 +330,51 @@ function reindentNewTextForMatchedLines(matchedOriginalSlice: string, oldText: s
 	const oldLines = oldText.endsWith("\n") ? oldText.slice(0, -1).split("\n") : oldText.split("\n");
 	const newLines = hasTrailingNewline ? newText.slice(0, -1).split("\n") : newText.split("\n");
 
+	const mapped = new Map<string, string>();
 	let origAnchorIndent: string | undefined;
 	let oldAnchorIndent: string | undefined;
+	let differs = false;
 	const pairCount = Math.min(origLines.length, oldLines.length);
 	for (let i = 0; i < pairCount; i++) {
-		if (origLines[i].trim().length > 0 && oldLines[i].trim().length > 0) {
-			origAnchorIndent = getLeadingWhitespace(origLines[i]);
-			oldAnchorIndent = getLeadingWhitespace(oldLines[i]);
-			break;
+		if (origLines[i].trim().length === 0 || oldLines[i].trim().length === 0) continue;
+		const orig = getLeadingWhitespace(origLines[i]);
+		const old = getLeadingWhitespace(oldLines[i]);
+		if (origAnchorIndent === undefined) {
+			origAnchorIndent = orig;
+			oldAnchorIndent = old;
 		}
+		if (!mapped.has(old)) mapped.set(old, orig);
+		if (orig !== old) differs = true;
 	}
-
-	if (origAnchorIndent === undefined || oldAnchorIndent === undefined || origAnchorIndent === oldAnchorIndent) {
+	if (origAnchorIndent === undefined || oldAnchorIndent === undefined || !differs) {
 		return newText;
 	}
 
+	const oldIndents = [...oldLines, ...newLines].filter((l) => l.trim().length > 0).map(getLeadingWhitespace);
+	const oldUnit = indentUnit(oldIndents, oldAnchorIndent);
+	const fileUnit =
+		indentUnit(origLines.filter((l) => l.trim().length > 0).map(getLeadingWhitespace), origAnchorIndent) ??
+		(origAnchorIndent.includes("\t") ? "\t" : oldUnit);
+
+	const reindent = (indent: string): string | undefined => {
+		const known = mapped.get(indent);
+		if (known !== undefined) return known;
+		if (!indent.startsWith(oldAnchorIndent)) return undefined;
+		let extra = indent.slice(oldAnchorIndent.length);
+		if (!oldUnit || !fileUnit || oldUnit === fileUnit) return origAnchorIndent + extra;
+		let levels = 0;
+		while (extra.startsWith(oldUnit)) {
+			extra = extra.slice(oldUnit.length);
+			levels++;
+		}
+		return origAnchorIndent + fileUnit.repeat(levels) + extra;
+	};
+
 	const adjustedLines = newLines.map((line) => {
 		if (line.trim().length === 0) return line;
-		if (oldAnchorIndent.length === 0) {
-			return origAnchorIndent + line;
-		}
-		if (line.startsWith(oldAnchorIndent)) {
-			return origAnchorIndent + line.slice(oldAnchorIndent.length);
-		}
-		return line;
+		const indent = getLeadingWhitespace(line);
+		const replaced = reindent(indent);
+		return replaced === undefined ? line : replaced + line.slice(indent.length);
 	});
 
 	const joined = adjustedLines.join("\n");
@@ -407,15 +450,129 @@ function findTrimmedLineSequence(content: string, oldText: string, newText: stri
 	};
 }
 
+/** An oldText that matched nowhere in the file, neither exactly, fuzzily nor line by line. */
+export class EditNotFoundError extends Error {
+	readonly editIndex: number;
+	constructor(message: string, editIndex: number) {
+		super(message);
+		this.name = "EditNotFoundError";
+		this.editIndex = editIndex;
+	}
+}
+
 function getNotFoundError(path: string, editIndex: number, totalEdits: number): Error {
 	if (totalEdits === 1) {
-		return new Error(
+		return new EditNotFoundError(
 			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.`,
+			editIndex,
 		);
 	}
-	return new Error(
+	return new EditNotFoundError(
 		`Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines.`,
+		editIndex,
 	);
+}
+
+/** The character pairs of a line, counted, keyed by their two UTF-16 code units. */
+function linePairs(line: string): Map<number, number> {
+	const pairs = new Map<number, number>();
+	for (let i = 0; i < line.length - 1; i++) {
+		const pair = (line.charCodeAt(i) << 16) | line.charCodeAt(i + 1);
+		pairs.set(pair, (pairs.get(pair) ?? 0) + 1);
+	}
+	return pairs;
+}
+
+/** Dice coefficient of the character pairs of two lines (`pairsOfB` from `linePairs(b)`): 1 for equal lines. */
+function lineSimilarity(a: string, b: string, pairsOfB: Map<number, number> = linePairs(b)): number {
+	if (a === b) return 1;
+	if (a.length < 2 || b.length < 2) return 0;
+	// At most the shorter line's pairs are shared.
+	if ((2 * (Math.min(a.length, b.length) - 1)) / (a.length + b.length - 2) < CLOSEST_MIN_SIMILARITY) return 0;
+	const used = new Map<number, number>();
+	let shared = 0;
+	for (let i = 0; i < a.length - 1; i++) {
+		const pair = (a.charCodeAt(i) << 16) | a.charCodeAt(i + 1);
+		const count = used.get(pair) ?? 0;
+		if (count < (pairsOfB.get(pair) ?? 0)) {
+			shared++;
+			used.set(pair, count + 1);
+		}
+	}
+	return (2 * shared) / (a.length + b.length - 2);
+}
+
+const CLOSEST_MAX_LINES = 20;
+const CLOSEST_MAX_LINE_CHARS = 200;
+const CLOSEST_MIN_SIMILARITY = 0.5;
+
+/**
+ * Where the file has text most like `oldText`, shown with line numbers, so the agent can correct the edit without
+ * reading the file again; undefined when nothing is similar enough. Candidate places are the lines equal to one of
+ * oldText's lines (ignoring surrounding whitespace), else the lines most like its first non-blank line.
+ */
+export function describeClosestText(content: string, oldText: string): string | undefined {
+	const fileLines = content.split("\n");
+	const trimmedFile = fileLines.map((line) => normalizeForFuzzyMatch(line).trim());
+	const patternLines = normalizeToLF(oldText).replace(/\n$/, "").split("\n");
+	const pattern = patternLines.map((line) => normalizeForFuzzyMatch(line).trim());
+	const n = Math.min(pattern.length, fileLines.length);
+	if (n === 0 || pattern.every((line) => line.length === 0)) return undefined;
+
+	const starts = new Set<number>();
+	const lineIndex = new Map<string, number[]>();
+	for (let i = 0; i < trimmedFile.length; i++) {
+		if (!trimmedFile[i]) continue;
+		const list = lineIndex.get(trimmedFile[i]);
+		if (list) list.push(i);
+		else lineIndex.set(trimmedFile[i], [i]);
+	}
+	for (let j = 0; j < n; j++) {
+		// Lines such as "}" occur everywhere and say nothing about the place.
+		if (pattern[j].length < 4) continue;
+		for (const i of lineIndex.get(pattern[j]) ?? []) {
+			if (starts.size >= 200) break;
+			starts.add(Math.max(0, Math.min(i - j, fileLines.length - n)));
+		}
+	}
+	if (starts.size === 0) {
+		const first = pattern.findIndex((line) => line.length > 0);
+		const firstPairs = linePairs(pattern[first]);
+		const best: Array<{ start: number; score: number }> = [];
+		for (let i = 0; i < trimmedFile.length; i++) {
+			const score = lineSimilarity(trimmedFile[i], pattern[first], firstPairs);
+			if (score < CLOSEST_MIN_SIMILARITY) continue;
+			best.push({ start: Math.max(0, Math.min(i - first, fileLines.length - n)), score });
+		}
+		best.sort((a, b) => b.score - a.score);
+		for (const { start } of best.slice(0, 5)) starts.add(start);
+	}
+
+	let bestStart = -1;
+	let bestScore = 0;
+	for (const start of [...starts].sort((a, b) => a - b)) {
+		let score = 0;
+		for (let j = 0; j < n; j++) score += lineSimilarity(trimmedFile[start + j], pattern[j]);
+		score /= n;
+		if (score > bestScore) {
+			bestScore = score;
+			bestStart = start;
+		}
+	}
+	if (bestStart === -1 || bestScore < CLOSEST_MIN_SIMILARITY) return undefined;
+
+	const firstDifference = pattern.findIndex((line, j) => j < n && line !== trimmedFile[bestStart + j]);
+	const shown = Math.min(n, CLOSEST_MAX_LINES);
+	const width = String(bestStart + shown).length;
+	const lines = fileLines.slice(bestStart, bestStart + shown).map((line, j) => {
+		const text = line.length > CLOSEST_MAX_LINE_CHARS ? `${line.slice(0, CLOSEST_MAX_LINE_CHARS)}...` : line;
+		return `${String(bestStart + j + 1).padStart(width)}→${text}`;
+	});
+	const range = n === 1 ? `line ${bestStart + 1}` : `lines ${bestStart + 1}-${bestStart + n}`;
+	const difference =
+		firstDifference === -1 ? "" : ` It differs from oldText first at line ${bestStart + firstDifference + 1}.`;
+	const more = shown < n ? `\n[${n - shown} more lines]` : "";
+	return `The closest text in the file is at ${range}.${difference}\n${lines.join("\n")}${more}`;
 }
 
 function getDuplicateError(path: string, editIndex: number, totalEdits: number, occurrences: number): Error {

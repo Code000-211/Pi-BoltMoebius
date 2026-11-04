@@ -28,6 +28,7 @@ import type {
 	TuiMode,
 	WarningSettings,
 } from "./settings-schema.ts";
+import type { ToolResultPruningSettings } from "./tool-result-pruning.ts";
 
 export type {
 	BranchSummarySettings,
@@ -62,6 +63,7 @@ const COMPACTION_SETTING_RANGES: Record<keyof CompactionModelOverride, { min: nu
 	keepRecentTokens: { min: 0, max: Number.MAX_SAFE_INTEGER },
 	thresholdPercent: { min: 1, max: 100 },
 	summaryMaxTokens: { min: 1, max: Number.MAX_SAFE_INTEGER },
+	maxContextTokens: { min: 1, max: Number.MAX_SAFE_INTEGER },
 };
 
 /** Share of the context window kept as recent context when keepRecentTokens is unset, in percent. */
@@ -1104,8 +1106,8 @@ export class SettingsManager {
 	/**
 	 * Resolve each setting through model override, ordinary setting, then built-in default. Unset
 	 * defaults scale with `contextWindow` (default: the model's): the threshold is also capped at
-	 * thresholdPercent of the window, keepRecentTokens grows to 5% of it, and the summary cap to 3.2%
-	 * of the summarizer's window. An explicit reserveTokens keeps the threshold and summary cap derived
+	 * thresholdPercent of the window and at maxContextTokens, keepRecentTokens grows to 5% of the window
+	 * capped at maxContextTokens, and the summary cap to 3.2% of the summarizer's window capped likewise. An explicit reserveTokens keeps the threshold and summary cap derived
 	 * from reserveTokens alone, unless thresholdPercent or summaryMaxTokens is set too.
 	 */
 	getCompactionSettings(
@@ -1117,10 +1119,24 @@ export class SettingsManager {
 			this.getExplicitCompactionSetting("thresholdPercent", model) ??
 			(explicitReserveTokens === undefined ? SETTINGS_DEFAULTS.compaction.thresholdPercent : undefined);
 		const summaryMaxTokens = this.getExplicitCompactionSetting("summaryMaxTokens", model);
+		// Like the thresholdPercent default, the maxContextTokens default gives way to an explicit
+		// reserveTokens or thresholdPercent: those ask for a threshold of their own.
+		const maxContextTokens =
+			this.getExplicitCompactionSetting("maxContextTokens", model) ??
+			(explicitReserveTokens === undefined &&
+			this.getExplicitCompactionSetting("thresholdPercent", model) === undefined
+				? SETTINGS_DEFAULTS.compaction.maxContextTokens
+				: undefined);
+		// The window's shares are taken of the part of it a session may fill before it is compacted.
+		const usableWindow =
+			contextWindow > 0 && maxContextTokens !== undefined
+				? Math.min(contextWindow, maxContextTokens)
+				: contextWindow;
 		return {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: explicitReserveTokens ?? SETTINGS_DEFAULTS.compaction.reserveTokens,
-			keepRecentTokens: this.getCompactionKeepRecentTokens(model, contextWindow),
+			keepRecentTokens: this.getCompactionKeepRecentTokens(model, usableWindow),
+			...(maxContextTokens === undefined ? {} : { maxContextTokens }),
 			...(thresholdPercent === undefined ? {} : { thresholdPercent }),
 			...(summaryMaxTokens === undefined ? {} : { summaryMaxTokens }),
 			...(explicitReserveTokens === undefined && summaryMaxTokens === undefined
@@ -1677,6 +1693,19 @@ export class SettingsManager {
 		this.globalSettings.images.autoResize = enabled;
 		this.markModified("images", "autoResize");
 		this.save();
+	}
+
+	getToolResultPruningSettings(): ToolResultPruningSettings {
+		const settings = this.settings.toolResultPruning;
+		const defaults = SETTINGS_DEFAULTS.toolResultPruning;
+		const count = (value: unknown, fallback: number, min: number) =>
+			typeof value === "number" && Number.isSafeInteger(value) && value >= min ? value : fallback;
+		return {
+			enabled: settings?.enabled ?? defaults.enabled,
+			triggerTokens: count(settings?.triggerTokens, defaults.triggerTokens, 0),
+			keepRecent: count(settings?.keepRecent, defaults.keepRecent, 1),
+			minChars: count(settings?.minChars, defaults.minChars, 0),
+		};
 	}
 
 	getBlockImages(): boolean {

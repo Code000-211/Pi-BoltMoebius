@@ -76,6 +76,7 @@ CLI tool options override this setting for one invocation. `--tools` with only `
 | `compaction.keepRecentTokens` | number | Larger of `20000` and 5% of the context window | Recent tokens retained without summarization. |
 | `compaction.thresholdPercent` | number | `90` while `reserveTokens` is unset | Also compact above this percentage of the context window when that is below `contextWindow - reserveTokens`. |
 | `compaction.summaryMaxTokens` | number | Largest of 80% of `reserveTokens`, `4096` and 3.2% of the context window | Output cap of a compaction summary; a split turn's prefix gets half. The window share applies only while `reserveTokens` is unset. |
+| `compaction.maxContextTokens` | number | `128000` while `reserveTokens` and `thresholdPercent` are unset | Also compact above this many tokens, whatever the context window: every turn re-reads the context, so a session on a 1M window slows down long before 90% of it. The window shares of `keepRecentTokens` and the summary cap are taken of the window capped at this size. |
 | `compaction.modelOverrides` | object | None | Per-model token settings keyed by exact `provider/modelId`. |
 
 The defaults scale with the context window only while the matching setting is unset:
@@ -83,14 +84,25 @@ The defaults scale with the context window only while the matching setting is un
 | Context window | Compacts above | Kept recent tokens | Summary cap |
 |---|---|---|---|
 | 128K | 111616 | 20000 | 13107 |
-| 200K | 180000 | 20000 | 13107 |
-| 1M | 900000 | 50000 | 32000 |
+| 200K | 128000 | 20000 | 13107 |
+| 1M | 128000 | 20000 | 13107 |
 
 <a id="per-model-compaction-overrides"></a>
 
-`reserveTokens` and `keepRecentTokens` must be non-negative safe integers, `thresholdPercent` an integer from 1 to 100, and `summaryMaxTokens` a positive safe integer. Each value resolves independently from the matching model override, then the ordinary compaction setting, then the built-in default. Project and user objects merge before model lookup.
+`reserveTokens` and `keepRecentTokens` must be non-negative safe integers, `thresholdPercent` an integer from 1 to 100, and `summaryMaxTokens` and `maxContextTokens` positive safe integers. Each value resolves independently from the matching model override, then the ordinary compaction setting, then the built-in default. Project and user objects merge before model lookup.
 
 See [Compaction Reference](compaction.md) for trigger, summarization, and validation behavior.
+
+### Old tool results
+
+Once the context passes `triggerTokens`, tool results older than the most recent `keepRecent` are sent to the model as a one-line note when their text is at least `minChars` long or they hold an image. The session keeps the full results, and compaction summarizes them in full. The boundary moves in steps of `keepRecent` results, so the prompt cache is rebuilt from the boundary once per step rather than on every call.
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `toolResultPruning.enabled` | boolean | `true` | Clear old, large tool results from what is sent. |
+| `toolResultPruning.triggerTokens` | number | `40000` | Clear only once the context is at least this many tokens (estimated from its characters). |
+| `toolResultPruning.keepRecent` | number | `8` | Recent tool results never cleared, and the step of the boundary. |
+| `toolResultPruning.minChars` | number | `2000` | Clear only results with at least this many characters of text, or with an image. |
 
 ### Branch summaries
 

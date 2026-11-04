@@ -1,6 +1,7 @@
 //! The in-memory index: BM25 over sections, plus a section–entity graph searched with
 //! personalized PageRank (HippoRAG's retrieval, without an LLM at query time).
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -205,10 +206,39 @@ pub fn scan(cfg: &Config) -> Signature {
     out
 }
 
-/// Source files, split at their definitions rather than at headings.
+/// A path as the index stores it: the system's bytes on Unix, UTF-8 elsewhere (Windows).
+#[cfg(unix)]
+fn path_bytes(path: &Path) -> Cow<'_, [u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    Cow::Borrowed(path.as_os_str().as_bytes())
+}
+
+#[cfg(not(unix))]
+fn path_bytes(path: &Path) -> Cow<'_, [u8]> {
+    match path.to_string_lossy() {
+        Cow::Borrowed(s) => Cow::Borrowed(s.as_bytes()),
+        Cow::Owned(s) => Cow::Owned(s.into_bytes()),
+    }
+}
+
+#[cfg(unix)]
+fn bytes_path(bytes: &[u8]) -> &Path {
+    use std::os::unix::ffi::OsStrExt;
+    Path::new(std::ffi::OsStr::from_bytes(bytes))
+}
+
+#[cfg(not(unix))]
+fn bytes_path(bytes: &[u8]) -> &Path {
+    Path::new(std::str::from_utf8(bytes).unwrap_or(""))
+}
+
+/// The language of a source file, split at its definitions rather than at headings.
+fn code_lang(path: &Path) -> Option<chunk::Lang> {
+    chunk::Lang::of(&path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase())
+}
+
 fn is_code(path: &Path) -> bool {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-    matches!(ext.as_str(), "c" | "cc" | "cpp" | "cxx" | "h" | "hh" | "hpp" | "hip" | "cu" | "cuh" | "rs" | "py")
+    code_lang(path).is_some()
 }
 
 struct Parsed {
@@ -235,8 +265,10 @@ fn parse_file(path: &Path, extra: Option<&ExtraEntities>) -> Vec<Parsed> {
     let mut name_terms = Vec::new();
     text::terms(name.rsplit_once('.').map_or(name, |(stem, _)| stem), &mut name_terms);
 
-    let python = path.extension().is_some_and(|e| e == "py");
-    let chunks = if is_code(path) { chunk::split_code(&content, python) } else { chunk::split(&content, markdown) };
+    let chunks = match code_lang(path) {
+        Some(lang) => chunk::split_code(&content, lang),
+        None => chunk::split(&content, markdown),
+    };
     let n_chunks = chunks.len();
     chunks
         .into_iter()
@@ -290,7 +322,8 @@ fn parse_file(path: &Path, extra: Option<&ExtraEntities>) -> Vec<Parsed> {
 
 /// Bumped whenever the file layout or what goes into it changes, so an old file is rebuilt.
 const FORMAT: u64 = 3;
-const MAGIC: &[u8; 8] = b"DSINDEX\0";
+/// The format's version is its last byte: 2 with the table hash of `store.rs` (0, before it, hashed with FxHash).
+const MAGIC: &[u8; 8] = b"DSINDEX\x02";
 
 fn nanos(t: SystemTime) -> u64 {
     t.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
@@ -446,11 +479,10 @@ impl Index {
             })
             .collect();
         let (def_names, def_lists): (Vec<String>, Vec<Vec<u32>>) = definitions.into_iter().unzip();
-        use std::os::unix::ffi::OsStrExt;
         Index {
             hub_limit,
             avg_len,
-            files: Strs::from_iter(signature.iter().map(|(p, _, _)| p.as_os_str().as_bytes())),
+            files: Strs::from_iter(signature.iter().map(|(p, _, _)| path_bytes(p))),
             file_mtime: signature.iter().map(|x| nanos(x.1)).collect::<Vec<_>>().into(),
             file_size: signature.iter().map(|x| x.2).collect::<Vec<_>>().into(),
             sec_file: sec_file.into(),
@@ -510,11 +542,16 @@ impl Index {
     /// Maps a file `save` wrote. Nothing is read until a search touches it, and every process that
     /// maps the same file shares its pages. A file of another format, or damaged, is refused.
     pub fn load(path: &Path) -> Result<Index, BadFile> {
-        let file = std::fs::File::open(path).map_err(|_| BadFile)?;
+        Index::load_file(&std::fs::File::open(path).map_err(|_| BadFile)?, true)
+    }
+
+    /// Maps an open index file. `validate`: check what every array holds (UTF-8, offsets, ids in bounds), which reads
+    /// every page (12 ms for radiance's 110 MB); false for a version of the file that was checked before.
+    pub fn load_file(file: &std::fs::File, validate: bool) -> Result<Index, BadFile> {
         // SAFETY: the file is only ever replaced by renaming a new one over it, never written in
         // place, so the mapped pages do not change under us.
-        let map = std::sync::Arc::new(unsafe { memmap2::Mmap::map(&file) }.map_err(|_| BadFile)?);
-        let mut r = Reader::new(map, 0);
+        let map = std::sync::Arc::new(unsafe { memmap2::Mmap::map(file) }.map_err(|_| BadFile)?);
+        let mut r = if validate { Reader::new(map, 0) } else { Reader::trusting(map, 0) };
         let magic: Buf<u8> = r.buf()?;
         if magic.get(..8) != Some(MAGIC.as_slice()) {
             return Err(BadFile);
@@ -548,7 +585,7 @@ impl Index {
             def_sections: r.lists()?,
             graph: r.lists()?,
         };
-        ix.check().then_some(ix).ok_or(BadFile)
+        (!validate || ix.check()).then_some(ix).ok_or(BadFile)
     }
 
     /// That the arrays agree in length and every id stays in bounds, so a search cannot index past
@@ -580,12 +617,11 @@ impl Index {
     /// What changed since this index was built: the files of `sig` that are new or differ, and per
     /// file of this index whether it changed or is gone.
     pub fn diff(&self, sig: &Signature) -> (Signature, Vec<bool>) {
-        use std::os::unix::ffi::OsStrExt;
         let by_path: FxHashMap<&[u8], usize> = (0..self.files.len()).map(|i| (self.files.bytes(i), i)).collect();
         let mut gone = vec![true; self.files.len()];
         let mut changed = Vec::new();
         for (p, t, size) in sig {
-            match by_path.get(p.as_os_str().as_bytes()) {
+            match by_path.get(path_bytes(p).as_ref()) {
                 Some(&i) if self.file_mtime[i] == nanos(*t) && self.file_size[i] == *size => gone[i] = false,
                 Some(&i) => {
                     gone[i] = true;
@@ -604,10 +640,9 @@ impl Index {
 
     /// Whether the index was built from exactly these files, as `scan` lists them now.
     pub fn matches(&self, sig: &Signature) -> bool {
-        use std::os::unix::ffi::OsStrExt;
         sig.len() == self.files.len()
             && sig.iter().enumerate().all(|(i, (p, t, size))| {
-                self.files.bytes(i) == p.as_os_str().as_bytes() && self.file_mtime[i] == nanos(*t) && self.file_size[i] == *size
+                self.files.bytes(i) == path_bytes(p).as_ref() && self.file_mtime[i] == nanos(*t) && self.file_size[i] == *size
             })
     }
 
@@ -620,8 +655,7 @@ impl Index {
     }
 
     pub fn file_path(&self, i: usize) -> &Path {
-        use std::os::unix::ffi::OsStrExt;
-        Path::new(std::ffi::OsStr::from_bytes(self.files.bytes(i)))
+        bytes_path(self.files.bytes(i))
     }
 
     pub fn section(&self, s: usize) -> SectionRef<'_> {
@@ -733,7 +767,8 @@ impl Index {
         let nodes = self.graph.len();
         let ids = if nd > 0 { d0 + nd } else { n };
         grow(&mut sc.acc, ids);
-        grow(&mut sc.qidf, self.terms.len());
+        // Indexed by term ids, which `check` keeps below `post.len()` (not the map's key count).
+        grow(&mut sc.qidf, self.post.len());
         for &t in &qids {
             sc.qidf[t as usize] = idf(self.post.len_of(t as usize) as f32);
         }
