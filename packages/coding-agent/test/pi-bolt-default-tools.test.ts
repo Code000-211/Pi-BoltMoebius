@@ -10,7 +10,7 @@ vi.mock("../src/pi-bolt.ts", async (importOriginal) => ({
 
 describe("Pi-Bolt's default tools", () => {
 	test("grep and find are on by default", () => {
-		expect(DEFAULT_TOOL_NAMES).toEqual(["read", "bash", "edit", "write", "grep", "find"]);
+		expect(DEFAULT_TOOL_NAMES).toEqual(["read", "bash", "edit", "write", "grep", "find", "wait"]);
 		expect(defaultToolNamesFor(["/home/me/.pi/agent/extensions/word-count.ts"])).toEqual(DEFAULT_TOOL_NAMES);
 	});
 
@@ -20,7 +20,7 @@ describe("Pi-Bolt's default tools", () => {
 		"C:\\Users\\me\\.pi\\agent\\npm\\node_modules\\opensec-pi-fff\\dist-bun\\index.js",
 		"builtin:opensec-pi-fff",
 	])("not with FFF loaded (%s), which brings its own", (path) => {
-		expect(defaultToolNamesFor([path])).toEqual(["read", "bash", "edit", "write"]);
+		expect(defaultToolNamesFor([path])).toEqual(["read", "bash", "edit", "write", "wait"]);
 	});
 
 	test("a package that only has fff in its name is not FFF", () => {
@@ -35,12 +35,14 @@ describe("Pi-Bolt's default tools", () => {
 			"bash",
 			"edit",
 			"write",
+			"wait",
 			"codemode",
 		]);
 		expect(SettingsManager.inMemory({ defaultTools: ["-write"] }).getDefaultTools(fff)).toEqual([
 			"read",
 			"bash",
 			"edit",
+			"wait",
 		]);
 		expect(SettingsManager.inMemory({ defaultTools: ["read", "grep"] }).getDefaultTools(fff)).toEqual([
 			"read",

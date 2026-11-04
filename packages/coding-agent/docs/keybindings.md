@@ -136,6 +136,7 @@ On native Windows, `app.suspend` has no default because Windows terminals do not
 |--------|---------|-------------|
 | `app.session.new` | None | Start a new session (`/new`) |
 | `app.session.tree` | None | Open session tree navigator (`/tree`) |
+| `app.jobs.hub` | `alt+j` | Open the background jobs (`/jobs`) |
 | `app.session.fork` | None | Fork current session (`/fork`) |
 | `app.session.resume` | None | Open session resume picker (`/resume`) |
 | `app.session.togglePath` | `ctrl+p` | Toggle path display |

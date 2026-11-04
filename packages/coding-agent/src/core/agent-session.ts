@@ -63,6 +63,12 @@ import { processImage } from "../utils/image-process.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
+import {
+	BACKGROUND_JOB_MESSAGE_TYPE,
+	BackgroundJobs,
+	formatJobReport,
+	JOB_SETTLE_WINDOW_MS,
+} from "./background-jobs.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
@@ -534,6 +540,14 @@ export class AgentSession {
 	private _modelRuntime: ModelRuntime;
 	private _cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed">;
 	private _claudeHarness = new ClaudeHarnessManager();
+	/** Commands the bash tool let run on in the background. Their ends are reported to the agent (see _reportJobs). */
+	readonly backgroundJobs = new BackgroundJobs();
+	private _jobReportTimer: ReturnType<typeof setTimeout> | undefined;
+	/** The last report being handed over (with an idle agent: the run it starts). */
+	private _jobReportSending: Promise<void> = Promise.resolve();
+	private _unsubscribeJobs = this.backgroundJobs.subscribe((event) => {
+		if (event.type === "end") this._scheduleJobReport();
+	});
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -1583,6 +1597,9 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		clearTimeout(this._jobReportTimer);
+		this._unsubscribeJobs();
+		this.backgroundJobs.killAll();
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -2475,6 +2492,8 @@ export class AgentSession {
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
 	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+		// A blocked wait would hold the message back until it ends.
+		this.backgroundJobs.wake();
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -2492,6 +2511,7 @@ export class AgentSession {
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
 	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+		this.backgroundJobs.wake();
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -2564,6 +2584,56 @@ export class AgentSession {
 			this._pendingCustomMessages.push(appMessage);
 		} else {
 			this._appendCustomMessage(appMessage);
+		}
+	}
+
+	/** Reports jobs that ended in a moment: jobs ending together come in one report. */
+	private _scheduleJobReport(): void {
+		this._jobReportTimer ??= setTimeout(() => {
+			this._jobReportTimer = undefined;
+			this._reportJobs();
+		}, JOB_SETTLE_WINDOW_MS);
+	}
+
+	/**
+	 * Tells the agent which jobs ended: in the running turn before its next request, or as a new turn when it is idle.
+	 * A blocked `wait` call reports them itself.
+	 */
+	private _reportJobs(): void {
+		if (this.backgroundJobs.hasWaiters()) {
+			// Should the wait end without them (aborted), they still come as a message.
+			this._scheduleJobReport();
+			return;
+		}
+		const ended = this.backgroundJobs.takeUnreported();
+		if (ended.length === 0) return;
+		this._jobReportSending = this.sendCustomMessage(
+			{
+				customType: BACKGROUND_JOB_MESSAGE_TYPE,
+				content: formatJobReport(ended),
+				display: true,
+				details: { jobs: ended.map((job) => job.id) },
+			},
+			{ triggerTurn: true, deliverAs: "steer" },
+		).catch(() => {});
+	}
+
+	/** Resolves once no background job runs and every report is in a finished run (print mode exits after it). */
+	async waitForBackgroundJobs(): Promise<void> {
+		for (;;) {
+			await this.waitForIdle();
+			await this._jobReportSending;
+			const jobs = this.backgroundJobs;
+			if (jobs.running().length === 0 && !jobs.hasUnreported() && !this._jobReportTimer && this.isIdle) return;
+			await new Promise<void>((resolve) => {
+				const done = () => {
+					clearTimeout(timer);
+					unsubscribe();
+					resolve();
+				};
+				const timer = setTimeout(done, 500);
+				const unsubscribe = jobs.subscribe(done);
+			});
 		}
 	}
 
@@ -4010,14 +4080,9 @@ export class AgentSession {
 					bash: {
 						commandPrefix: shellCommandPrefix,
 						shellPath,
-						// A command a timeout moved to the background reports here when it ends: after the current run, or
-						// as a new turn when the agent is idle.
-						onBackgroundDone: (message) =>
-							void this.sendCustomMessage(
-								{ customType: "bash-background-job", content: message, display: true },
-								{ triggerTurn: true, deliverAs: "followUp" },
-							).catch(() => {}),
+						backgroundJobs: this.backgroundJobs,
 					},
+					wait: { backgroundJobs: this.backgroundJobs },
 				});
 
 		this._baseToolDefinitions = new Map(

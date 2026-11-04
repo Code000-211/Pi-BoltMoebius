@@ -132,6 +132,8 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		for (const message of messages) {
 			await session.prompt(message);
 		}
+		// A job still running would end with Pi: its report gets a turn first.
+		await session.waitForBackgroundJobs();
 
 		if (mode === "text") {
 			const state = session.state;

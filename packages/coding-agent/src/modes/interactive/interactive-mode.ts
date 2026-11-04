@@ -162,6 +162,7 @@ import { ExtensionEditorComponent } from "./components/extension-editor.ts";
 import { ExtensionInputComponent } from "./components/extension-input.ts";
 import { ExtensionSelectorComponent } from "./components/extension-selector.ts";
 import { FooterComponent, formatTokens } from "./components/footer.ts";
+import { JobHubComponent, jobStatusText } from "./components/job-hub.ts";
 import { formatKeyText, keyDisplayText, keyHint, keyText, rawKeyHint } from "./components/keybinding-hints.ts";
 import { LoginDialogComponent } from "./components/login-dialog.ts";
 import { createMermaidMarkdownTransformer } from "./components/mermaid.ts";
@@ -218,6 +219,9 @@ import {
 } from "./theme/theme.ts";
 import { InteractiveThemeController } from "./theme/theme-controller.ts";
 import { createInteractiveTui, createInteractiveTuiReference } from "./tui-renderer.ts";
+
+/** Status line entry that shows running background jobs. */
+const JOB_STATUS_KEY = "pi-jobs";
 
 export { createInteractiveTui, createInteractiveTuiReference } from "./tui-renderer.ts";
 
@@ -485,6 +489,8 @@ export class InteractiveMode {
 	private autocompleteProviderWrappers: AutocompleteProviderFactory[] = [];
 	private fdPath: string | undefined;
 	private editorContainer: Container;
+	/** The open job hub. */
+	private jobHub: JobHubComponent | undefined;
 	private activeSelectorToken?: object;
 	private activeSelectorDispose?: () => void;
 	private footer: FooterComponent;
@@ -3163,6 +3169,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.message.dequeue", () => this.handleDequeue());
 		this.defaultEditor.onAction("app.session.new", () => this.handleClearCommand());
 		this.defaultEditor.onAction("app.session.tree", () => this.showTreeSelector());
+		this.defaultEditor.onAction("app.jobs.hub", () => this.showJobHub());
 		this.defaultEditor.onAction("app.session.fork", () => this.showUserMessageSelector());
 		this.defaultEditor.onAction("app.session.resume", () => this.showSessionSelector());
 
@@ -3336,6 +3343,11 @@ export class InteractiveMode {
 				this.editor.setText("");
 				return;
 			}
+			if (text === "/jobs") {
+				this.editor.setText("");
+				this.showJobHub();
+				return;
+			}
 			if (text === "/trust") {
 				this.showTrustSelector();
 				this.editor.setText("");
@@ -3449,9 +3461,41 @@ export class InteractiveMode {
 	}
 
 	private subscribeToAgent(): void {
-		this.unsubscribe = this.session.subscribe(async (event) => {
+		const unsubscribeAgent = this.session.subscribe(async (event) => {
 			await this.handleEvent(event);
 		});
+		const jobs = this.session.backgroundJobs;
+		const showJobs = () => {
+			this.footerDataProvider.setExtensionStatus(JOB_STATUS_KEY, jobStatusText(jobs, keyText("app.jobs.hub")));
+			this.ui.requestRender();
+		};
+		const unsubscribeJobs = jobs.subscribe(showJobs);
+		showJobs();
+		this.unsubscribe = () => {
+			unsubscribeAgent();
+			unsubscribeJobs();
+		};
+	}
+
+	/** The session's background jobs, over the whole screen, until Escape. */
+	private showJobHub(): void {
+		if (this.jobHub) return;
+		const editorFocus = this.editor as Component;
+		const hub = new JobHubComponent(this.session.backgroundJobs, {
+			rows: () => this.ui.terminal.rows,
+			requestRender: () => this.ui.requestRender(),
+			onClose: () => {
+				hub.dispose();
+				handle.hide();
+				this.jobHub = undefined;
+				this.ui.setFocus(editorFocus);
+				this.ui.requestRender();
+			},
+		});
+		const handle = this.ui.showOverlay(hub, { anchor: "top-left", width: "100%", maxHeight: "100%" });
+		this.jobHub = hub;
+		this.ui.setFocus(hub);
+		this.ui.requestRender();
 	}
 
 	private async handleEvent(event: AgentSessionEvent): Promise<void> {

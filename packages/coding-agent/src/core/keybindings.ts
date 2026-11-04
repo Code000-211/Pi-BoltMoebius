@@ -78,6 +78,7 @@ const APP_KEYBINDINGS = {
 	},
 	"app.session.new": { defaultKeys: [], description: "Start a new session" },
 	"app.session.tree": { defaultKeys: [], description: "Open session tree" },
+	"app.jobs.hub": { defaultKeys: "alt+j", description: "Open background jobs" },
 	"app.session.fork": { defaultKeys: [], description: "Fork current session" },
 	"app.session.resume": { defaultKeys: [], description: "Resume a session" },
 	"app.tree.foldOrUp": {
@@ -247,6 +248,7 @@ const KEYBINDING_NAME_MIGRATIONS = {
 	pasteImage: "app.clipboard.pasteImage",
 	newSession: "app.session.new",
 	tree: "app.session.tree",
+	jobHub: "app.jobs.hub",
 	fork: "app.session.fork",
 	resume: "app.session.resume",
 	treeFoldOrUp: "app.tree.foldOrUp",

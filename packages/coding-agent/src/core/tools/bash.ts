@@ -19,6 +19,7 @@ import {
 	trackDetachedChildPid,
 	untrackDetachedChildPid,
 } from "../../utils/shell.ts";
+import type { BackgroundJobs } from "../background-jobs.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { notifySearchExternalChange } from "./native-search.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
@@ -51,14 +52,20 @@ function resolveTimeoutMs(timeout: number | undefined): number | undefined {
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Shell command to execute" }),
 	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+	background: Type.Optional(
+		Type.Boolean({
+			description:
+				"Start the command in the background right away: the call returns at once, and a message reports when it ends",
+		}),
+	),
 });
 
 export const bashToolSystemPromptContribution = {
 	snippet: "Execute bash commands (ls, grep, find, etc.)",
 	guidelines: [
 		"You can inspect PI_* environment variables for current model and session details.",
-		// From deepseek-harness. In Pi's sessions, 80 local `sleep` calls waited 2.8 h for other commands.
-		"Do not wait for a command with sleep or a polling loop: give a long command a timeout, after which it goes on in the background and a message reports when it ends. Meanwhile, go on with work that does not depend on it.",
+		// From deepseek-harness and oh-my-pi. In Pi's sessions, 97 `sleep` calls waited 3.2 h for other commands.
+		"A command still running after a minute goes on in the background as a job (background: true starts it there right away), and a message reports when it ends. Meanwhile, go on with work that does not depend on it; call wait only when nothing else is left. Do not wait with sleep or poll for it.",
 	],
 } as const;
 
@@ -110,9 +117,8 @@ export interface BashOperations {
 	) => Promise<{ exitCode: number | null }>;
 }
 
-/** Commands a timeout moved to the background, by process id: ended with Pi (as the timeout ended them before). */
+/** Commands that went on in the background, by process id: ended with Pi. */
 const backgroundJobPids = new Set<number>();
-let backgroundJobCount = 0;
 let backgroundExitHook = false;
 
 function keepAsBackgroundJob(child: ChildProcess | undefined): number | undefined {
@@ -134,17 +140,69 @@ function keepAsBackgroundJob(child: ChildProcess | undefined): number | undefine
 
 const MOVED_TO_BACKGROUND = Symbol("moved to the background");
 
-function untilTimeout<T>(running: Promise<T>, seconds: number): Promise<T | typeof MOVED_TO_BACKGROUND> {
+function untilBackground<T>(running: Promise<T>, ms: number): Promise<T | typeof MOVED_TO_BACKGROUND> {
 	let timer: NodeJS.Timeout | undefined;
 	return Promise.race([
 		running,
 		new Promise<typeof MOVED_TO_BACKGROUND>((resolve) => {
-			timer = setTimeout(() => resolve(MOVED_TO_BACKGROUND), seconds * 1000);
+			timer = setTimeout(() => resolve(MOVED_TO_BACKGROUND), ms);
 		}),
 	]).finally(() => clearTimeout(timer));
 }
 
-/** How much of a background job's output its completion message carries. */
+/** How long a command runs in the foreground before it goes on in the background, by default (oh-my-pi's value). */
+export const DEFAULT_AUTO_BACKGROUND_SECONDS = 60;
+
+/**
+ * After how many ms a call's command goes to the background: 0 when asked, undefined when it never does (no jobs, turned
+ * off, or a timeout that ends it first).
+ */
+function backgroundAfterMs(
+	jobs: BackgroundJobs | undefined,
+	background: boolean | undefined,
+	timeout: number | undefined,
+	autoBackgroundSeconds: number,
+): number | undefined {
+	if (!jobs) return undefined;
+	if (background) return 0;
+	if (process.env.PI_BASH_AUTO_BACKGROUND === "off" || autoBackgroundSeconds <= 0) return undefined;
+	if (timeout !== undefined && timeout > 0 && timeout <= autoBackgroundSeconds) return undefined;
+	return autoBackgroundSeconds * 1000;
+}
+
+/** A fixed `sleep` up to this long runs: waiting a moment for a server or a file is fine. */
+export const MAX_FIXED_SLEEP_SECONDS = 10;
+const SLEEP_UNIT_SECONDS: Record<string, number> = { "": 1, s: 1, m: 60, h: 3600, d: 86400 };
+
+/**
+ * The longest fixed `sleep` in a command, in seconds, outside a loop (a loop waits on a condition, which is what to do);
+ * 0 when there is none.
+ */
+export function fixedSleepSeconds(command: string): number {
+	// The body of a loop (`do ... done`, innermost first) is left out.
+	let outside = command;
+	for (let previous = ""; previous !== outside; ) {
+		previous = outside;
+		outside = outside.replace(/\bdo\b(?:(?!\bdo\b)[\s\S])*?\bdone\b/, " ");
+	}
+	let longest = 0;
+	for (const match of outside.matchAll(/(?:^|[\s;&|('"])sleep\s+(\d+(?:\.\d+)?)([smhd]?)(?=$|[\s;&|)'"])/g)) {
+		longest = Math.max(longest, Number(match[1]) * SLEEP_UNIT_SECONDS[match[2]!]!);
+	}
+	return longest;
+}
+
+/** Why a command with a long fixed sleep was not run, and what to do instead. */
+function fixedSleepRefusal(seconds: number): string {
+	return (
+		`Not run: the command sleeps ${seconds} seconds, a fixed time. To wait for a background job, call wait: it returns when the job ends. ` +
+		"To wait for something else, wait for the thing itself in a loop, such as `until curl -sf localhost:8000; do sleep 2; done`, " +
+		"or `until ssh host 'grep -q EXIT build.log'; do sleep 10; done` for a job on another machine: the loop ends as soon as the condition holds, " +
+		`and goes on in the background after a minute. A sleep of up to ${MAX_FIXED_SLEEP_SECONDS} seconds runs.`
+	);
+}
+
+/** How much of a background job's output its report carries. */
 const BACKGROUND_DONE_TAIL_CHARS = 2048;
 
 const SHELL_METACHAR_REGEX = /[|&;<>()$`"'*?[#~=%!{}\r\n\\]/;
@@ -550,10 +608,12 @@ export interface BashToolOptions {
 	/** Hook to adjust command, cwd, or env before execution */
 	spawnHook?: BashSpawnHook;
 	/**
-	 * Given, a command still running when its timeout ends goes on in the background instead of being ended: the call
-	 * returns its output so far, and this gets the completion message (exit code, end of the output) once it ends.
+	 * Given, a command still running after {@link autoBackgroundSeconds} (or right away, when the call asks) goes on in
+	 * the background as a job here: the call returns its output so far. Its timeout still ends it.
 	 */
-	onBackgroundDone?: (message: string) => void;
+	backgroundJobs?: BackgroundJobs;
+	/** Default {@link DEFAULT_AUTO_BACKGROUND_SECONDS}; 0 moves commands to the background only when the call asks. */
+	autoBackgroundSeconds?: number;
 }
 
 export type BashRenderState = {
@@ -581,10 +641,12 @@ export function createShellToolDefinition(
 	const commandPrefix = options?.commandPrefix;
 	const exposeSessionEnvironment = options?.exposeSessionEnvironment ?? true;
 	const spawnHook = options?.spawnHook;
+	const jobs = options?.backgroundJobs;
+	const autoBackgroundSeconds = options?.autoBackgroundSeconds ?? DEFAULT_AUTO_BACKGROUND_SECONDS;
 	return {
 		name: config.name,
 		label: config.label,
-		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output longer than ${DEFAULT_MAX_LINES} lines or ${BASH_MAX_BYTES / 1024}KB keeps its first ${BASH_HEAD_LINES} lines and its end; the full output is then saved to a temp file. Colors and progress-bar redraws are removed. Optionally provide a timeout in seconds${options?.onBackgroundDone ? ": a command still running then goes on in the background, and a message reports when it ends" : ""}.`,
+		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output longer than ${DEFAULT_MAX_LINES} lines or ${BASH_MAX_BYTES / 1024}KB keeps its first ${BASH_HEAD_LINES} lines and its end; the full output is then saved to a temp file. Colors and progress-bar redraws are removed. Optionally provide a timeout in seconds, after which the command is ended.${jobs && autoBackgroundSeconds > 0 ? ` A command still running after ${autoBackgroundSeconds} seconds goes on in the background as a job, and a message reports when it ends.` : ""}`,
 		promptSnippet: config.promptSnippet,
 		promptGuidelines: exposeSessionEnvironment && config.promptGuidelines ? [...config.promptGuidelines] : undefined,
 		parameters: bashSchema,
@@ -592,7 +654,7 @@ export function createShellToolDefinition(
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(
 			_toolCallId,
-			{ command, timeout }: { command: string; timeout?: number },
+			{ command, timeout, background }: { command: string; timeout?: number; background?: boolean },
 			signal?: AbortSignal,
 			onUpdate?,
 			ctx?: ExtensionContext,
@@ -712,67 +774,93 @@ export function createShellToolDefinition(
 
 			const appendStatus = (text: string, status: string) => `${text ? `${text}\n\n` : ""}${status}`;
 			const startedAt = performance.now();
+			const startedAtEpoch = Date.now();
 
-			const onBackgroundDone = options?.onBackgroundDone;
-			const background =
-				onBackgroundDone !== undefined &&
-				timeout !== undefined &&
-				timeout > 0 &&
-				process.env.PI_BASH_BACKGROUND_ON_TIMEOUT !== "off";
-			// The command's own abort: the tool call's, until a timeout moves it to the background.
+			const backgroundAfter = backgroundAfterMs(jobs, background, timeout, autoBackgroundSeconds);
+			if (jobs && !background && process.env.PI_BASH_SLEEP_GUARD !== "off") {
+				const sleep = fixedSleepSeconds(command);
+				// From oh-my-pi's "NEVER poll". Of the 97 sleep calls in Pi's sessions, 28 slept more than 10 s outside a loop.
+				if (sleep > MAX_FIXED_SLEEP_SECONDS) throw new Error(fixedSleepRefusal(sleep));
+			}
+			// The command's own abort: the tool call's, until the command goes to the background.
 			const commandAbort = new AbortController();
 			const forwardAbort = () => commandAbort.abort();
 			if (signal?.aborted) commandAbort.abort();
 			else signal?.addEventListener("abort", forwardAbort, { once: true });
 			let spawned: ChildProcess | undefined;
+			// The command goes to the background only once its process exists: it has to be known to end it.
+			let markSpawned = () => {};
+			const spawnedOnce = new Promise<void>((resolve) => {
+				markSpawned = resolve;
+			});
 
 			try {
 				let exitCode: number | null;
 				try {
 					const running = ops.exec(spawnContext.command, spawnContext.cwd, {
 						onData: handleData,
-						signal: background ? commandAbort.signal : signal,
-						timeout: background ? undefined : timeout,
+						signal: backgroundAfter !== undefined ? commandAbort.signal : signal,
+						timeout,
 						env: spawnContext.env,
 						onSpawn: (child) => {
 							spawned = child;
+							markSpawned();
 						},
 					});
-					const result = background ? await untilTimeout(running, timeout) : await running;
+					const result =
+						backgroundAfter !== undefined
+							? await Promise.race([running, spawnedOnce.then(() => untilBackground(running, backgroundAfter))])
+							: await running;
 					if (result === MOVED_TO_BACKGROUND) {
 						signal?.removeEventListener("abort", forwardAbort);
 						updatesStopped = true;
-						const id = `bg${++backgroundJobCount}`;
 						const pid = keepAsBackgroundJob(spawned);
 						const file = output.ensureFullOutputFile();
 						const { text, details } = formatOutput(output.snapshot({ persistIfTruncated: true }), "");
+						const handle = jobs!.add({
+							command,
+							cwd: spawnContext.cwd,
+							pid,
+							startedAt: startedAtEpoch,
+							outputFile: file,
+							output: () => output.snapshot().content,
+							kill: () => commandAbort.abort(),
+						});
+						const id = handle.job.id;
 						void running
 							.then(
-								(done) => done.exitCode,
-								() => null,
+								(done) => ({
+									code: done.exitCode,
+									status: done.exitCode === 0 ? ("done" as const) : ("failed" as const),
+								}),
+								(err: unknown) => ({
+									code: null,
+									status:
+										err instanceof Error && err.message.startsWith("timeout:")
+											? ("timed out" as const)
+											: ("failed" as const),
+								}),
 							)
-							.then(async (code) => {
+							.then(async ({ code, status }) => {
 								if (pid) backgroundJobPids.delete(pid);
 								notifySearchExternalChange();
 								const done = await finishOutput();
-								const tail = done.content.slice(-BACKGROUND_DONE_TAIL_CHARS);
-								const seconds = Math.round((performance.now() - startedAt) / 100) / 10;
-								onBackgroundDone?.(
-									`Background job ${id} (\`${command}\`) ended ${code === null ? "without an exit code" : `with exit code ${code}`} after ${seconds} s.` +
-										`${tail ? `\n\nEnd of its output:\n${tail}` : ""}${file ? `\n\n[Full output: ${file}]` : ""}`,
-								);
+								handle.end(status, code, done.content.slice(-BACKGROUND_DONE_TAIL_CHARS));
 							});
 						const stop = pid
 							? ` (pid ${pid}; stop it with: ${process.platform === "win32" ? `taskkill /T /F /PID ${pid}` : `kill -- -${pid}`})`
 							: "";
+						const status = background
+							? `Started in the background as job ${id}${stop}.`
+							: `Command still running after ${backgroundAfter! / 1000} seconds: moved to the background as job ${id}${stop}.`;
 						return {
 							content: [
 								{
 									type: "text",
 									text: appendStatus(
 										text,
-										`Command still running after ${timeout} seconds: moved to the background as job ${id}${stop}. ` +
-											`Its output goes on into ${file ?? "memory"}. A message reports when it ends, with its exit code and the end of its output: do not wait or poll for it, go on with other work.`,
+										`${status} Its output goes ${background ? "" : "on "}into ${file ?? "memory"}${timeout ? `; its timeout of ${timeout} seconds still ends it` : ""}. ` +
+											"A message reports when it ends, with its exit code and the end of its output: go on with other work, and call wait only when nothing else is left.",
 									),
 								},
 							],
