@@ -20,6 +20,7 @@ The executable is still called `pi-bolt`, and Pi-Bolt's commands (`pi-bolt compi
 | [Commands](#background-jobs-instead-of-sleep) | Long commands become background jobs that wake the agent; a `wait` tool; no fixed `sleep` | 97 real `sleep` calls had waited 3.2 h |
 | [Commands](#job-hub) | A job hub (`alt+j`): every background job, its live output, stop with `x` | |
 | [Commands](#bash-output-and-speed) | Output keeps the first error *and* the summary; read-only commands start while the model still writes | |
+| [Remote](#working-on-another-machine) | `/remote host:folder`: read, edit, write and bash work there over ssh, with the same checks | one ssh login, then a round trip per call |
 | [Context](#context-and-compaction) | Compaction at 128k at most, old tool results shortened, summaries from the prompt cache | compaction input 54k → **8.4k** new tokens |
 | [Provider](#melious-provider) | Melious built in, with live context windows and prices | |
 
@@ -32,6 +33,7 @@ The executable is still called `pi-bolt`, and Pi-Bolt's commands (`pi-bolt compi
   [no edits behind the edit tool's back](#no-edits-behind-the-edit-tools-back)
 - [Running commands](#running-commands): [background jobs](#background-jobs-instead-of-sleep) ·
   [job hub](#job-hub) · [output and speed](#bash-output-and-speed)
+- [Working on another machine](#working-on-another-machine)
 - [Context and compaction](#context-and-compaction)
 - [System prompt](#system-prompt) · [Melious provider](#melious-provider)
 - [Switches](#switches) · [Tests](#tests) · [Credits](#credits)
@@ -271,6 +273,27 @@ Enter shows a job's whole output to scroll through, `x` stops it. While jobs run
 - `pi -p` and `pi --mode json` exit again after a command ran through that pre-started bash (its pipes held the event
   loop).
 
+## Working on another machine
+
+`/remote dev:~/Projects/Radiance` (or `pi-bolt --remote dev:~/Projects/Radiance`) moves `read`, `edit`, `write` and
+`bash` to that folder on another machine over ssh; `/remote off` moves them back, `/remote` says where they work. The
+session remembers it, so resuming it works there again, and the status line shows `⇄ dev:/home/dev/Projects/Radiance`.
+
+- **The same checks there.** Read before edit, exact-unique edits of unread files, the closest-text hint, `sed -i` sent
+  to `edit`, background jobs, `wait` and the sleep guard all work on the remote files and commands. Compiler diagnostics
+  after edits do not (the compilers run on this machine).
+- **One login.** ssh keeps one master connection per host (ControlMaster), so every later call is a round trip on it.
+  A key's passphrase or a password is asked for in Pi, not shown and not kept; the connection then lasts 4 hours. In
+  `pi -p` nothing is asked: a key without passphrase or an ssh agent is needed.
+- **Commands end there too.** A command runs in its own process group on the host, and a watcher ends that group when the
+  connection's input closes: an abort, a timeout, a stopped background job or Pi's exit leaves nothing running there.
+- **The prompt cache holds.** The tools keep their declarations; the system prompt says where they work. `grep`, `find`
+  and `ls` search this machine, so they are off meanwhile: the model searches there with `rg` or `find` in bash.
+- It replaces extensions such as pi-ssh-remote, which replaced the built-in tools with plain ones and so turned off
+  everything above, also for local work.
+
+Not measured on a real host yet: checked with an ssh stand-in that runs the remote side on this machine.
+
 ## Context and compaction
 
 - **Compaction at 128,000 tokens at most**, whatever the window (`compaction.maxContextTokens`). Every turn re-reads the
@@ -325,6 +348,8 @@ Everything above is on by default.
 | `PI_BASH_SLEEP_GUARD=off` | Run fixed sleeps over 10 s |
 | `PI_EARLY_BASH=off` | Start read-only commands only after the model's message |
 | `PI_BASH_EDIT_GUARD=off` | Run `sed -i` and text redirected into files |
+| `--remote <host>[:<folder>]`, `PI_REMOTE` | Start working on that machine (as `/remote`) |
+| `PI_SSH_COMMAND` | The ssh program (default `ssh`) |
 | `PI_RUST_ANALYZER_TARGET_DIR` | `shared` to let cargo check use `target/`, or a folder |
 | `LIBCLANG_PATH`, `CLANGD_PATH`, `RUST_ANALYZER_PATH` | Where the diagnostics tools are |
 | `HCC_AMDGPU_TARGET`, `HIP_OFFLOAD_ARCH` | GPU target for HIP diagnostics (default `gfx1100`) |
@@ -340,6 +365,9 @@ Pi-Lightspeed's own tests, in `packages/coding-agent` unless noted:
 - `test/background-jobs.test.ts`, `test/suite/agent-session-bash-background.test.ts`, `test/job-hub.test.ts`: jobs,
   their reports and wake-ups, `wait`, the sleep guard and the hub.
 - `test/bash-file-writes.test.ts`: which commands count as changing files, and the bash tool refusing them.
+- `test/remote-ssh.test.ts`, `test/suite/agent-session-remote.test.ts`, `test/secret-input.test.ts`: the remote
+  operations through an ssh stand-in (quoting, errors, commands ended there, the passphrase question), and a session
+  working there.
 - `test/suite/request-prefix.test.ts`: every request starts with the previous one; a snapshot of the built-in tool
   schemas.
 - `test/tool-result-pruning.test.ts`, `test/native-search.test.ts`, `test/tools.test.ts`, and

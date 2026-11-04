@@ -126,7 +126,8 @@ let backgroundExitHook = false;
 function keepAsBackgroundJob(child: ChildProcess | undefined): number | undefined {
 	if (!child?.pid) return undefined;
 	// It must not keep `pi -p` alive: Pi's exit ends it instead.
-	for (const stream of [child.stdout, child.stderr]) {
+	// stdin too: a remote command's ssh keeps it open (closing it ends the command there).
+	for (const stream of [child.stdin, child.stdout, child.stderr]) {
 		(stream as unknown as { unref?: () => void } | null)?.unref?.();
 	}
 	child.unref();

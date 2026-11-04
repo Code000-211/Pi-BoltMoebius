@@ -110,6 +110,7 @@ import {
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import { RADIUS_MCP_URL, RADIUS_PROVIDER_ID } from "../../core/radius.ts";
+import { parseRemoteTarget } from "../../core/remote/ssh.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import {
@@ -176,6 +177,7 @@ import {
 import { piLogoLines, piWordmark, supportsPiLogo } from "./components/pi-logo.ts";
 import { createLoginMenuSelector } from "./components/radius-login-selector.ts";
 import { ScopedModelsSelectorComponent } from "./components/scoped-models-selector.ts";
+import { SecretInputComponent } from "./components/secret-input.ts";
 import { SessionSelectorComponent } from "./components/session-selector.ts";
 import { SettingsSelectorComponent } from "./components/settings-selector.ts";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.ts";
@@ -222,6 +224,8 @@ import { createInteractiveTui, createInteractiveTuiReference } from "./tui-rende
 
 /** Status line entry that shows running background jobs. */
 const JOB_STATUS_KEY = "pi-jobs";
+/** Status line entry that shows the remote machine the tools work on. */
+const REMOTE_STATUS_KEY = "pi-remote";
 
 export { createInteractiveTui, createInteractiveTuiReference } from "./tui-renderer.ts";
 
@@ -2195,6 +2199,8 @@ export class InteractiveMode {
 			this.subscribeToAgent();
 		}
 
+		// Before binding: the session connects to its remote machine then, which may ask for a passphrase.
+		session?.setSecretPrompt?.((prompt) => this.askSecret(prompt));
 		await this.bindCurrentSessionExtensions();
 
 		if (this.session !== session) {
@@ -2208,6 +2214,77 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
+		// Optional: tests run this method on a stand-in for the mode.
+		this.showRemoteStatus?.();
+		if (this.session?.remoteRestoreError) {
+			this.showWarning(
+				`The session worked on another machine, which could not be reached: ${this.session.remoteRestoreError}`,
+			);
+		}
+	}
+
+	/** Asks for what ssh needs (a passphrase, a password) without showing it, over the screen; undefined when given up. */
+	private askSecret(prompt: string): Promise<string | undefined> {
+		return new Promise((resolve) => {
+			const focus = this.editor as Component;
+			const input = new SecretInputComponent(prompt, (answer) => {
+				handle.hide();
+				this.ui.setFocus(focus);
+				this.ui.requestRender();
+				resolve(answer);
+			});
+			const handle = this.ui.showOverlay(input, { anchor: "center", width: "60%", minWidth: 40 });
+			this.ui.setFocus(input);
+			this.ui.requestRender();
+		});
+	}
+
+	/** The remote machine in the status line while the tools work there. */
+	private showRemoteStatus(): void {
+		const remote = this.session?.remote;
+		this.footerDataProvider.setExtensionStatus(
+			REMOTE_STATUS_KEY,
+			remote ? `${theme.fg("accent", "⇄")} ${remote.host}:${remote.resolvedDir}` : undefined,
+		);
+		this.ui.requestRender();
+	}
+
+	/** `/remote`: where the tools work; `/remote host[:dir]` moves them there over ssh, `/remote off` back here. */
+	private async handleRemoteCommand(argument: string): Promise<void> {
+		if (!argument) {
+			const remote = this.session.remote;
+			this.showStatus(
+				remote
+					? `Working on ${remote.host}:${remote.resolvedDir} over ssh. /remote off works on this machine again.`
+					: "Working on this machine. /remote <host>[:<folder>] works on another one over ssh.",
+			);
+			return;
+		}
+		if (argument === "off") {
+			await this.session.setRemote(undefined);
+			this.showRemoteStatus();
+			this.showStatus("Working on this machine again.");
+			return;
+		}
+		const target = parseRemoteTarget(argument);
+		if (!target) {
+			this.showError(
+				`Not a remote folder: ${argument}. Use /remote <host>[:<folder>], such as /remote dev:~/project.`,
+			);
+			return;
+		}
+		this.showStatus(`Connecting to ${target.host}...`);
+		try {
+			await this.session.setRemote(target);
+		} catch (error) {
+			this.showError(error instanceof Error ? error.message : String(error));
+			return;
+		}
+		this.showRemoteStatus();
+		const remote = this.session.remote;
+		this.showStatus(
+			`Working on ${remote?.host}:${remote?.resolvedDir} over ssh: read, edit, write and bash run there; grep, find and ls are off.`,
+		);
 	}
 
 	private async handleFatalRuntimeError(prefix: string, error: unknown): Promise<never> {
@@ -3341,6 +3418,11 @@ export class InteractiveMode {
 			if (text === "/tree") {
 				this.showTreeSelector();
 				this.editor.setText("");
+				return;
+			}
+			if (text === "/remote" || text.startsWith("/remote ")) {
+				this.editor.setText("");
+				await this.handleRemoteCommand(text.slice(7).trim());
 				return;
 			}
 			if (text === "/jobs") {

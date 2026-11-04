@@ -34,6 +34,8 @@ export interface Args {
 	mode?: Mode;
 	name?: string;
 	noSession?: boolean;
+	/** `host[:folder]`: the file tools and bash work there over ssh. */
+	remote?: string;
 	session?: string;
 	sessionId?: string;
 	fork?: string;
@@ -151,6 +153,8 @@ export function parseArgs(args: string[]): Args {
 			} else {
 				result.diagnostics.push({ type: "error", message: "--name requires a value" });
 			}
+		} else if (arg === "--remote" && i + 1 < args.length) {
+			result.remote = args[++i];
 		} else if (arg === "--no-session") {
 			result.noSession = true;
 		} else if (arg === "--session" && i + 1 < args.length) {
@@ -335,6 +339,7 @@ ${chalk.bold("Options:")}
   --session-id <id>              Use exact project session ID, creating it if missing
   --fork <path|id>               Fork specific session file or partial UUID into a new session
   --session-dir <dir>            Directory for session storage and lookup
+  --remote <host>[:<folder>]     Run read, edit, write and bash on another machine over ssh (/remote in the session)
   --no-session                   Don't save session (ephemeral)
   --name, -n <name>              Set session display name
   --models <patterns>            Comma-separated model patterns for Ctrl+P cycling
