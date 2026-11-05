@@ -140,9 +140,12 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		await expect(
 			editTool.execute("e-other", { path: "other.ts", edits: [{ oldText: "x = 2;", newText: "y" }] }),
 		).rejects.toThrow(/File has not been read yet/);
+		// write refuses it with its content, which then counts as read: the same write goes through next.
 		await expect(writeTool.execute("w-other", { path: "other.ts", content: "z\n" })).rejects.toThrow(
-			/File has not been read yet/,
+			/^Not written: other\.ts exists and was not read[\s\S]*x = 2;\nx = 2;/,
 		);
+		await writeTool.execute("w-other-again", { path: "other.ts", content: "z\n" });
+		expect(readFileSync(join(testDir, "other.ts"), "utf-8")).toBe("z\n");
 	});
 
 	it("allows edit and write after a newer modification time with the same content (touch)", async () => {
@@ -213,7 +216,6 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 
 	it("allows write on a brand-new file without prior read, but blocks overwriting an unread existing file", async () => {
 		const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
-		const readTool = createReadTool(testDir, { harness });
 		const writeTool = createWriteTool(testDir, {
 			harness,
 			enforceReadBeforeEdit: true,
@@ -236,10 +238,9 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 				path: "existing.rs",
 				content: "fn overwritten() {}\n",
 			}),
-		).rejects.toThrow(/File has not been read yet/);
+		).rejects.toThrow(/^Not written: existing\.rs exists and was not read[\s\S]*fn old\(\) \{\}/);
 
-		// After reading, overwrite succeeds
-		await readTool.execute("read-existing", { path: "existing.rs" });
+		// The refusal showed the file: it counts as read, and the overwrite succeeds without a read call
 		const overwriteRes = await writeTool.execute("write-after-read", {
 			path: "existing.rs",
 			content: "fn overwritten() {}\n",

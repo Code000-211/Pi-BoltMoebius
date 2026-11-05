@@ -21,6 +21,19 @@ export const writeToolSystemPromptContribution = {
 
 export type WriteToolInput = Static<typeof writeSchema>;
 
+/** Of a refused file, at most this much is shown; a longer one is cut, with a note. */
+const REFUSAL_MAX_CHARS = 30_000;
+
+/** Why a write over a file not read was refused, with the file as it is now. */
+function unreadWriteRefusal(path: string, existing: string): string {
+	const shown = existing.length > REFUSAL_MAX_CHARS ? existing.slice(0, REFUSAL_MAX_CHARS) : existing;
+	const cut =
+		shown.length < existing.length
+			? `\n[cut at ${REFUSAL_MAX_CHARS} of ${existing.length} characters: read the rest if it matters]`
+			: "";
+	return `Not written: ${path} exists and was not read, so writing would replace what is below unseen. It counts as read now: write again to replace it, or edit it.\n\n${shown}${cut}`;
+}
+
 /**
  * Pluggable operations for the write tool.
  * Override these to delegate file writing to remote systems (for example SSH).
@@ -96,6 +109,17 @@ export function createWriteToolDefinition(
 				if (enforceReadBeforeEdit && ops === defaultWriteOperations) {
 					const existingStat = await fsStat(absolutePath).catch(() => undefined);
 					throwIfAborted();
+					if (existingStat && !harness.stateTracker.hasBeenRead(absolutePath)) {
+						// Not read: refused, with the file as it is, which then counts as read, so a write that still means
+						// to replace it goes through next time instead of after a read call (10 times in 142 Terminal-Bench
+						// runs a read came between).
+						const existing = await fsReadFile(absolutePath, "utf-8").catch(() => undefined);
+						throwIfAborted();
+						if (existing !== undefined) {
+							harness.onFileRead(absolutePath, existing, existingStat.mtimeMs, workspaceCwd);
+							throw new Error(unreadWriteRefusal(path, existing));
+						}
+					}
 					if (existingStat) {
 						// A newer modification time with the same content (`touch`) is no change: compare the content then.
 						const state = harness.stateTracker.getTrackedState(absolutePath);
