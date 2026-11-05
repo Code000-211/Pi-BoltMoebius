@@ -8,23 +8,6 @@
 /** `customType` of the message that tells how much time is left. */
 export const TIME_LIMIT_MESSAGE_TYPE = "time-limit";
 
-/**
- * With a limit, a response stops at this many output tokens (or the model's own, if lower). glm-5.3-flash streams about
- * 128 a second: its 65,536 took 8.5 minutes of thinking in one response, over half of a 15-minute task, before the run
- * went on. This is still room for writing a large file in one call.
- */
-export const TIME_LIMIT_MAX_OUTPUT_TOKENS = 32_768;
-
-/**
- * The output limit a response gets: the model's (`modelMax`), and with `PI_TIME_LIMIT` at most
- * {@link TIME_LIMIT_MAX_OUTPUT_TOKENS}. A response cut off below it ran out of context (compact-and-retry); one that
- * reached it was cut off by this limit (the agent session's notice).
- */
-export function maxOutputTokens(modelMax: number): number {
-	if (parseTimeLimit(process.env.PI_TIME_LIMIT) === undefined) return modelMax;
-	return Math.min(modelMax || TIME_LIMIT_MAX_OUTPUT_TOKENS, TIME_LIMIT_MAX_OUTPUT_TOKENS);
-}
-
 /** When the model is told, as a share of the limit. */
 const NOTICE_AT = [0.5, 0.75, 0.9] as const;
 
