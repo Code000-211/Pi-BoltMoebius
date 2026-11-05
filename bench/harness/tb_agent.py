@@ -97,16 +97,29 @@ class PiLightspeed(BaseInstalledAgent):
         time_env = f"PI_TIME_LIMIT={int(limit * 0.95)} " if limit else ""
         events = self.environment_logs_dir / "pi.jsonl"
         stderr = self.environment_logs_dir / "pi.stderr"
-        await self.exec_as_agent(
-            environment,
-            command=(
-                f"{time_env}PI_CODING_AGENT_DIR={AGENT_DIR} {HARNESS_DIR}/pi --mode json --no-session -ne -ns -np -nc --no-mcp "
-                # `--`: an instruction may start with "-" (a task's list of steps).
-                f"{extension_args}--model {shlex.quote(self.model_name)} -- {shlex.quote(instruction)} "
-                f"</dev/null 2>{shlex.quote(str(stderr))} | grep --line-buffered -v '\"type\":\"message_update\"' "
-                f"> {shlex.quote(str(events))}"
-            ),
-        )
+        try:
+            await self.exec_as_agent(
+                environment,
+                command=(
+                    f"{time_env}PI_CODING_AGENT_DIR={AGENT_DIR} {HARNESS_DIR}/pi --mode json --no-session -ne -ns -np -nc "
+                    # `--`: an instruction may start with "-" (a task's list of steps).
+                    f"--no-mcp {extension_args}--model {shlex.quote(self.model_name)} -- {shlex.quote(instruction)} "
+                    f"</dev/null 2>{shlex.quote(str(stderr))} | grep --line-buffered -v '\"type\":\"message_update\"' "
+                    f"> {shlex.quote(str(events))}"
+                ),
+            )
+        finally:
+            # For the verifier, after the agent is done: many tasks' tests `apt-get install` their tools (curl, uv) with
+            # the image's package lists, and in the Debian 11 images those name versions the security mirror no longer
+            # has (404), so the tests fail before they test anything (qemu-startup, qemu-alpine-ssh). Fresh lists fix
+            # that; the agent never sees them.
+            try:
+                await self.exec_as_root(
+                    environment,
+                    "command -v apt-get >/dev/null && timeout 120 apt-get update -qq >/dev/null 2>&1; true",
+                )
+            except Exception:
+                pass
 
     def populate_context_post_run(self, context: AgentContext) -> None:
         events = self.logs_dir / "pi.jsonl"
