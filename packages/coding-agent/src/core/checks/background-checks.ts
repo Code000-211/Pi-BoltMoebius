@@ -1,14 +1,19 @@
 /**
  * Checks that run in the background after an edit, so that no tool call waits for them: `edit` and `write` return at
- * once, the file's checker (checkers.ts) runs, and only errors that are new against the unit's errors before are
- * reported, as a message the model gets before its next request. When the model would end its run while checks still
- * run, the agent session waits for them, up to a limit ({@link BackgroundChecks.waitForIdle}), so that a run does not
- * end on an error a check was about to report.
+ * once, the file's checkers (checkers.ts) run, and what is new against the state before is reported as a message the
+ * model gets before its next request. When the model would end its run while checks still run, the agent session
+ * waits for them, up to a limit ({@link BackgroundChecks.waitForIdle}), so that a run does not end on an error a check
+ * was about to report.
+ *
+ * Errors (severity `error`) are reported as soon as a check finds them, against the unit's errors at its check before.
+ * Lint findings (severity `warning`, from the linters a project configures) would interrupt work in progress: they
+ * are collected against the unit's findings before the agent first changed it and reported once, when the model would
+ * end its run ({@link BackgroundChecks.takeLintReport}), as they are then.
  *
  * Edits in quick succession make one run (they settle for {@link SETTLE_MS} first); one unit (a file, a Cargo
  * package, a tsconfig.json project) runs one check at a time, and a check that an edit overtook is run again rather
  * than reported. A unit's first check, started when one of its files is read, is its baseline; without one, only
- * errors in the files edited since count as new.
+ * findings in the files edited count as new.
  */
 
 import type { HarnessDiagnostic } from "../harness/file-state-tracker.ts";
@@ -16,15 +21,23 @@ import { type Checker, type CheckUnit, enabledCheckers, shown } from "./checkers
 
 /** How long edits settle before their check starts. */
 const SETTLE_MS = 150;
-/** Errors listed in one report. */
+/** Findings listed in one report. */
 const MAX_REPORTED = 15;
+
+type Counts = Map<string, number>;
 
 interface UnitState {
 	unit: CheckUnit;
-	/** Fingerprint -> count of the errors last seen; undefined until the first check ends. */
-	baseline?: Map<string, number>;
+	/** The errors at the last check; undefined until the first check ends. */
+	errors?: Counts;
+	/** The lint findings before the agent first changed the unit (or at the last lint report). */
+	lintBaseline?: Counts;
+	/** Lint findings new against `lintBaseline` at the last check, to report when the run would end. */
+	lint: HarnessDiagnostic[];
 	/** Files edited since the last check ended. */
 	edited: Set<string>;
+	/** Every file of the unit the agent edited. */
+	editedEver: Set<string>;
 	/** An edit came after the running check read the files, or no check ran since. */
 	dirty: boolean;
 	running?: Promise<void>;
@@ -42,14 +55,35 @@ export interface BackgroundChecksOptions {
 }
 
 function fingerprint(d: HarnessDiagnostic): string {
-	// Not the line: an edit above an old error moves it, and it is still the same error.
-	return `${d.file}\0${d.code ?? ""}\0${d.message}`;
+	// Not the line: an edit above an old finding moves it, and it is still the same finding.
+	return `${d.file}\0${d.severity}\0${d.code ?? ""}\0${d.message}`;
 }
 
-function counts(diagnostics: HarnessDiagnostic[]): Map<string, number> {
-	const map = new Map<string, number>();
+function counts(diagnostics: HarnessDiagnostic[]): Counts {
+	const map: Counts = new Map();
 	for (const d of diagnostics) map.set(fingerprint(d), (map.get(fingerprint(d)) ?? 0) + 1);
 	return map;
+}
+
+/** The findings not in `before`; without `before`, those in `files` only (one elsewhere may well have been there). */
+function newAgainst(
+	diagnostics: HarnessDiagnostic[],
+	before: Counts | undefined,
+	files: Set<string>,
+): HarnessDiagnostic[] {
+	const remaining = new Map(before ?? []);
+	const fresh: HarnessDiagnostic[] = [];
+	for (const d of diagnostics) {
+		const key = fingerprint(d);
+		const seen = remaining.get(key) ?? 0;
+		if (seen > 0) {
+			remaining.set(key, seen - 1);
+			continue;
+		}
+		if (!before && !files.has(d.file)) continue;
+		fresh.push(d);
+	}
+	return fresh;
 }
 
 export class BackgroundChecks {
@@ -69,37 +103,43 @@ export class BackgroundChecks {
 		return this.checkers.length > 0;
 	}
 
-	private unitFor(path: string): UnitState | undefined {
-		const checker = this.checkers.find((c) => c.matches(path));
-		if (!checker) return undefined;
-		let unit: CheckUnit | undefined;
-		try {
-			unit = checker.unit(path);
-		} catch {
-			return undefined;
+	/** The units of every checker that takes `path` (a TypeScript file: its project's tsc, and its linter). */
+	private unitsFor(path: string): UnitState[] {
+		const states: UnitState[] = [];
+		for (const checker of this.checkers) {
+			if (!checker.matches(path)) continue;
+			let unit: CheckUnit | undefined;
+			try {
+				unit = checker.unit(path);
+			} catch {
+				continue;
+			}
+			if (!unit) continue;
+			let state = this.units.get(unit.key);
+			if (!state) {
+				state = { unit, lint: [], edited: new Set(), editedEver: new Set(), dirty: true, runningForEdits: false };
+				this.units.set(unit.key, state);
+			}
+			states.push(state);
 		}
-		if (!unit) return undefined;
-		let state = this.units.get(unit.key);
-		if (!state) {
-			state = { unit, edited: new Set(), dirty: true, runningForEdits: false };
-			this.units.set(unit.key, state);
-		}
-		return state;
+		return states;
 	}
 
-	/** A file was read: its unit's first check runs now, as the baseline its edits are compared with. */
+	/** A file was read: its units' first checks run now, as the baselines its edits are compared with. */
 	onRead(path: string): void {
-		const state = this.unitFor(path);
-		if (state && !state.baseline && !state.running && !state.timer) this.schedule(state, 0);
+		for (const state of this.unitsFor(path)) {
+			if (!state.errors && !state.running && !state.timer) this.schedule(state, 0);
+		}
 	}
 
 	/** A file was changed by the agent (edit, write, or a bash command it ran). */
 	onEdited(path: string): void {
-		const state = this.unitFor(path);
-		if (!state) return;
-		state.edited.add(path);
-		state.dirty = true;
-		this.schedule(state, SETTLE_MS);
+		for (const state of this.unitsFor(path)) {
+			state.edited.add(path);
+			state.editedEver.add(path);
+			state.dirty = true;
+			this.schedule(state, SETTLE_MS);
+		}
 	}
 
 	private schedule(state: UnitState, delayMs: number): void {
@@ -130,34 +170,31 @@ export class BackgroundChecks {
 		try {
 			diagnostics = await state.unit.checker.run(state.unit, this.abort.signal);
 		} catch {
-			// A checker that fails (killed, gone) leaves the baseline as it was, and is not waited for again.
+			// A checker that fails (killed, gone) leaves the baselines as they were, and is not waited for again.
 			for (const file of edited) state.edited.delete(file);
 			return;
 		}
 		// An edit came while it ran: the next check reports, on the newer files.
 		if (state.dirty) return;
-		const before = state.baseline;
-		const now = counts(diagnostics);
-		state.baseline = now;
 		for (const file of edited) state.edited.delete(file);
-		if (edited.size === 0) return;
-		const fresh: HarnessDiagnostic[] = [];
-		const remaining = new Map(before ?? []);
-		for (const d of diagnostics) {
-			const key = fingerprint(d);
-			const seen = remaining.get(key) ?? 0;
-			if (seen > 0) {
-				remaining.set(key, seen - 1);
-				continue;
-			}
-			// Without a baseline, an error elsewhere may well have been there before.
-			if (!before && !edited.has(d.file)) continue;
-			fresh.push(d);
+		const errors = diagnostics.filter((d) => d.severity === "error");
+		const lint = diagnostics.filter((d) => d.severity !== "error");
+		const errorsBefore = state.errors;
+		state.errors = counts(errors);
+		// The check before any edit is the lint baseline.
+		if (state.editedEver.size === 0) {
+			state.lintBaseline = counts(lint);
+			return;
 		}
-		if (fresh.length > 0) this.options.report(this.format(state.unit.checker.name, fresh));
+		state.lint = newAgainst(lint, state.lintBaseline, state.editedEver);
+		if (edited.size === 0) return;
+		const fresh = newAgainst(errors, errorsBefore, edited);
+		if (fresh.length > 0) {
+			this.options.report(this.format(`New errors after your changes (${state.unit.checker.name} check):`, fresh));
+		}
 	}
 
-	private format(checker: string, diagnostics: HarnessDiagnostic[]): string {
+	private format(title: string, diagnostics: HarnessDiagnostic[]): string {
 		const lines = diagnostics
 			.slice(0, MAX_REPORTED)
 			.map(
@@ -165,7 +202,28 @@ export class BackgroundChecks {
 					`  ${shown(d.file, this.options.cwd)}:${d.line}:${d.column}${d.code ? ` ${d.code}` : ""}: ${d.message}`,
 			);
 		if (diagnostics.length > MAX_REPORTED) lines.push(`  ... and ${diagnostics.length - MAX_REPORTED} more`);
-		return `New errors after your changes (${checker} check, in the background):\n${lines.join("\n")}`;
+		return `${title}\n${lines.join("\n")}`;
+	}
+
+	/**
+	 * The lint findings the agent's changes brought, as they are now, for when the run would end; undefined when there
+	 * are none. What it reports becomes the baseline: the same finding is not reported again.
+	 */
+	takeLintReport(): string | undefined {
+		const findings: HarnessDiagnostic[] = [];
+		const linters = new Set<string>();
+		for (const state of this.units.values()) {
+			if (state.lint.length === 0) continue;
+			findings.push(...state.lint);
+			linters.add(state.unit.checker.name);
+			state.lintBaseline = new Map([...(state.lintBaseline ?? []), ...counts(state.lint)]);
+			state.lint = [];
+		}
+		if (findings.length === 0) return undefined;
+		return this.format(
+			`Lint findings in what you changed (${[...linters].join(", ")}, as this project configures them); fix them, or say why they stay:`,
+			findings,
+		);
 	}
 
 	/** Whether a check for edits runs or is about to (a baseline check alone is not waited for). */
@@ -201,7 +259,6 @@ export class BackgroundChecks {
 	dispose(): void {
 		this.abort.abort();
 		for (const state of this.units.values()) if (state.timer) clearTimeout(state.timer);
-		this.notifyIfIdle();
 		for (const resolve of this.idleWaiters) resolve();
 		this.idleWaiters = [];
 	}

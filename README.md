@@ -182,6 +182,21 @@ a time, and a check an edit overtook runs again instead of reporting.
 | Luau | luau-analyze | syntax; types under `--!strict` | 5 ms |
 | JSON, TOML, YAML | Bun's parsers, in the process | syntax | ~1 ms all three |
 
+Linters run where the project configures them, and their findings wait: they are collected against the state before
+the agent first changed the unit and reported once, when the model would end its run, so they do not interrupt work in
+progress (errors come at once).
+
+| Language | Linter (the fastest found) | Runs when the project has | Time |
+|---|---|---|---:|
+| Rust | clippy, in place of `cargo check` | `clippy.toml`, clippy lints in `Cargo.toml`, or `cargo clippy` in CI | as `cargo check` |
+| Python | ruff | `ruff.toml` or `[tool.ruff]` | 8 ms a file |
+| JS/TS | Biome; else oxlint (about 2-3x Biome, 50-100x ESLint) | `biome.json`; an oxlint or ESLint configuration | 31-35 ms a file |
+| Shell | shuck's warnings (about 20x ShellCheck) | `.shellcheckrc` or `shuck.toml` | 2-4 ms |
+| Markdown | rumdl (about 10x markdownlint-cli2) | a markdownlint or rumdl configuration | 3 ms |
+| YAML | ryl (a Rust yamllint) | a yamllint or ryl configuration | 1 ms |
+| Luau | selene | `selene.toml` | 3 ms |
+| C/C++/HIP | clangd-tidy (about 10x clang-tidy) | `.clang-tidy` and `compile_commands.json` | 0.2 s a file |
+
 On Moebius (443 Rust files), a type error the model wrote was reported 3 s after the edit, before the run ended, and
 fixed; rust-analyzer, which Pi used before, reported nothing within 84 s and took 3.2 GB. `PI_CHECKS=off` turns the
 checks off (for a harness that runs its own, as Moebius's lens), `PI_CHECKS=rust,python` keeps those named, and
@@ -412,7 +427,7 @@ Everything above is on by default.
 | `PI_PROJECT_SNAPSHOT=full` / `off` | The project listing with small files' contents / none |
 | `--remote <host>[:<folder>]`, `PI_REMOTE` | Start working on that machine (as `/remote`) |
 | `PI_SSH_COMMAND` | The ssh program (default `ssh`) |
-| `PI_CHECKS` | `off`, or the background checks to keep (`rust,python,typescript,javascript,shell,luau,json,toml,yaml`) |
+| `PI_CHECKS` | `off`, or the background checks to keep (`rust,python,typescript,javascript,shell,luau,json,toml,yaml`, and the linters `js-lint,markdown,yaml-lint,luau-lint,cpp-lint`) |
 | `PI_CHECKS_WAIT` | Seconds a run that would end waits for the checks of its edits (default 30) |
 | `PI_CHECKS_CARGO_TARGET` | `shared` to let the background `cargo check` use the project's `target/` |
 | `LIBCLANG_PATH`, `CLANGD_PATH` | Where the C/C++ diagnostics tools are |

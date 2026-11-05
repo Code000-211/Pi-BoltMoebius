@@ -12,10 +12,10 @@
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import type { HarnessDiagnostic } from "../harness/file-state-tracker.ts";
+import type { DiagnosticSeverity, HarnessDiagnostic } from "../harness/file-state-tracker.ts";
 
 export interface CheckUnit {
 	/** Which checker, and what it checks: one run at a time per key. */
@@ -98,23 +98,48 @@ function run(argv: string[], cwd: string, signal: AbortSignal, env?: NodeJS.Proc
 	});
 }
 
-function diag(file: string, line: number, column: number, message: string, code?: string): HarnessDiagnostic {
-	return { file, line, column, severity: "error", message: message.trim(), code };
+function diag(
+	file: string,
+	line: number,
+	column: number,
+	message: string,
+	code?: string,
+	severity: DiagnosticSeverity = "error",
+): HarnessDiagnostic {
+	return { file, line, column, severity, message: message.trim(), code };
 }
 
-/** Lines `file:line:col: error[code] message`, as ty and shuck print them with paths relative to `cwd`. */
-function parseColonErrors(text: string, cwd: string): HarnessDiagnostic[] {
+/**
+ * Lines `file:line:col: error[code] message` (also `warning[code]:`), as ty, shuck and selene print them with paths
+ * relative to `cwd`: the errors, and with `lint` the warnings too, as lint findings.
+ */
+function parseColonFindings(text: string, cwd: string, lint = false): HarnessDiagnostic[] {
 	const out: HarnessDiagnostic[] = [];
 	for (const line of text.split("\n")) {
-		const m = /^(.+?):(\d+):(\d+): error\[([^\]]+)\] (.*)$/.exec(line.trim());
-		if (m) out.push(diag(resolve(cwd, m[1]!), Number(m[2]), Number(m[3]), m[5]!, m[4]));
+		const m = /^(.+?):(\d+):(\d+): (error|warning)\[([^\]]+)\]:? (.*)$/.exec(line.trim());
+		if (!m || (m[4] === "warning" && !lint)) continue;
+		out.push(diag(resolve(cwd, m[1]!), Number(m[2]), Number(m[3]), m[6]!, m[5], m[4] as DiagnosticSeverity));
 	}
 	return out;
 }
 
+/** Whether a file at or above `dir` is one of `names`. */
+const configured = (dir: string, names: string[]) => findUp(dir, names) !== undefined;
+
+/** Whether `file` (at or above `dir`) holds `text`. */
+function mentions(dir: string, file: string, text: RegExp): boolean {
+	const found = findUp(dir, [file]);
+	if (!found) return false;
+	try {
+		return text.test(readFileSync(join(found, file), "utf-8"));
+	} catch {
+		return false;
+	}
+}
+
 const extension = (path: string) => path.slice(path.lastIndexOf(".") + 1).toLowerCase();
 
-// --------------------------------------------------------------------------------------------------- Rust: cargo check
+// ------------------------------------------------------------------------------------------ Rust: cargo check, clippy
 
 /** The Cargo package of a file (its nearest Cargo.toml) and the workspace above it, whose root cargo reports paths from. */
 function cargoProject(path: string): { manifest: string; root: string } | undefined {
@@ -126,6 +151,37 @@ function cargoProject(path: string): { manifest: string; root: string } | undefi
 		if (existsSync(manifest) && /^\s*\[workspace\]/m.test(readFileSync(manifest, "utf-8"))) root = dir;
 	}
 	return { manifest: join(pkg, "Cargo.toml"), root };
+}
+
+const clippyUse = new Map<string, boolean>();
+
+/**
+ * Whether the workspace at `root` lints with clippy: a clippy.toml, clippy lints in Cargo.toml, or `cargo clippy` in its
+ * CI. Then the background check is `cargo clippy`, which checks too, and its warnings are lint findings (Moebius's CI,
+ * for one, fails on them with `-D warnings`).
+ */
+function usesClippy(root: string): boolean {
+	if (!clippyUse.has(root)) {
+		let uses = ["clippy.toml", ".clippy.toml"].some((name) => existsSync(join(root, name)));
+		if (!uses) {
+			try {
+				uses = /lints\.clippy/.test(readFileSync(join(root, "Cargo.toml"), "utf-8"));
+			} catch {}
+		}
+		for (const ci of [
+			join(root, ".github", "workflows"),
+			join(root, ".forgejo", "workflows"),
+			join(root, ".gitlab-ci.yml"),
+		]) {
+			if (uses) break;
+			try {
+				const files = statSync(ci).isDirectory() ? readdirSync(ci).map((name) => join(ci, name)) : [ci];
+				uses = files.some((file) => /cargo\s+clippy/.test(readFileSync(file, "utf-8")));
+			} catch {}
+		}
+		clippyUse.set(root, uses);
+	}
+	return clippyUse.get(root)!;
 }
 
 const rust: Checker = {
@@ -145,8 +201,9 @@ const rust: Checker = {
 			process.env.PI_CHECKS_CARGO_TARGET === "shared"
 				? {}
 				: { CARGO_TARGET_DIR: join(unit.cwd, "target", "pi-check") };
+		const clippy = usesClippy(unit.cwd);
 		const ran = await run(
-			["cargo", "check", "--message-format=json", "--quiet", "--manifest-path", unit.file!],
+			["cargo", clippy ? "clippy" : "check", "--message-format=json", "--quiet", "--manifest-path", unit.file!],
 			unit.cwd,
 			signal,
 			env,
@@ -169,7 +226,10 @@ const rust: Checker = {
 				continue;
 			}
 			const message = event.message;
-			if (event.reason !== "compiler-message" || message?.level !== "error") continue;
+			if (event.reason !== "compiler-message") continue;
+			const level =
+				message?.level === "error" ? "error" : clippy && message?.level === "warning" ? "warning" : undefined;
+			if (!level || !message) continue;
 			const span = message.spans?.find((s) => s.is_primary) ?? message.spans?.[0];
 			if (!span) continue;
 			out.push(
@@ -179,6 +239,7 @@ const rust: Checker = {
 					span.column_start,
 					message.message ?? "",
 					message.code?.code,
+					level,
 				),
 			);
 		}
@@ -189,6 +250,24 @@ const rust: Checker = {
 // ------------------------------------------------------------------------------------------------------- Python: ty
 
 const PYTHON_ROOTS = ["pyproject.toml", "setup.py", "setup.cfg", "ty.toml", ".git"];
+
+/** ruff's findings in the file, as lint, where the project configures ruff (8 ms a file). */
+async function ruff(unit: CheckUnit, signal: AbortSignal): Promise<HarnessDiagnostic[]> {
+	const dir = dirname(unit.file!);
+	const uses = configured(dir, ["ruff.toml", ".ruff.toml"]) || mentions(dir, "pyproject.toml", /^\[tool\.ruff/m);
+	if (!uses || !onPath("ruff")) return [];
+	const ran = await run(
+		["ruff", "check", "--output-format", "concise", "--no-cache", "--quiet", unit.file!],
+		unit.cwd,
+		signal,
+	);
+	const out: HarnessDiagnostic[] = [];
+	for (const line of ran.stdout.split("\n")) {
+		const m = /^(.+?):(\d+):(\d+): (\S+) (?:\[\*\] )?(.*)$/.exec(line.trim());
+		if (m) out.push(diag(resolve(unit.cwd, m[1]!), Number(m[2]), Number(m[3]), m[5]!, m[4], "warning"));
+	}
+	return out;
+}
 
 const python: Checker = {
 	name: "python",
@@ -205,7 +284,8 @@ const python: Checker = {
 				unit.cwd,
 				signal,
 			);
-			return parseColonErrors(ran.stdout, unit.cwd).filter((d) => d.file === unit.file);
+			const found = parseColonFindings(ran.stdout, unit.cwd).filter((d) => d.file === unit.file);
+			return [...found, ...(await ruff(unit, signal))];
 		}
 		const python3 = onPath("python3");
 		if (!python3) return [];
@@ -306,10 +386,11 @@ const shell: Checker = {
 				if (m) out.push(diag(unit.file!, Number(m[1]), 1, m[2]!));
 			}
 		}
-		// shuck's errors (not its warnings), once the syntax is right.
+		// shuck's errors once the syntax is right, and its warnings where the project configures ShellCheck or shuck.
 		if (out.length === 0 && onPath("shuck")) {
+			const lint = configured(unit.cwd, [".shellcheckrc", "shuck.toml", ".shuck.toml"]);
 			const ran = await run(["shuck", "check", "--output-format", "concise", unit.file!], unit.cwd, signal);
-			out.push(...parseColonErrors(ran.stdout, unit.cwd));
+			out.push(...parseColonFindings(ran.stdout, unit.cwd, lint));
 		}
 		return out;
 	},
@@ -374,7 +455,194 @@ const json = dataChecker("json", ["json"], () => JSON.parse);
 const toml = dataChecker("toml", ["toml"], () => bunParser("TOML"));
 const yaml = dataChecker("yaml", ["yaml", "yml"], () => bunParser("YAML"));
 
-export const CHECKERS: Checker[] = [rust, python, typescript, javascript, shell, luau, json, toml, yaml];
+// ------------------------------------------------------------------- Linters, each where the project configures it
+
+/** The file's linter in a unit of its own, run from the folder its configuration is in; lint findings only. */
+function linter(
+	name: string,
+	extensions: string[],
+	setup: (path: string) => { cwd: string; argv: (file: string) => string[] } | undefined,
+	parse: (output: string, cwd: string) => HarnessDiagnostic[],
+): Checker {
+	const checker: Checker = {
+		name,
+		matches: (path) => extensions.includes(extension(path)),
+		unit(path) {
+			const found = setup(path);
+			if (!found) return undefined;
+			return { key: `${name}:${path}`, checker, cwd: found.cwd, file: path };
+		},
+		async run(unit, signal) {
+			const found = setup(unit.file!);
+			if (!found) return [];
+			const ran = await run(found.argv(unit.file!), unit.cwd, signal);
+			return parse(`${ran.stdout}\n${ran.stderr}`, unit.cwd).map((d) => ({ ...d, severity: "warning" as const }));
+		},
+	};
+	return checker;
+}
+
+/** The `tool` a project installed itself (node_modules/.bin) before the one on PATH. */
+function nodeTool(dir: string, tool: string): string | undefined {
+	const local = findUp(dir, [join("node_modules", ".bin", tool)]);
+	return local ? join(local, "node_modules", ".bin", tool) : onPath(tool);
+}
+
+const BIOME = ["biome.json", "biome.jsonc"];
+const OXLINT = [".oxlintrc.json", "oxlintrc.json"];
+const ESLINT = [
+	"eslint.config.js",
+	"eslint.config.mjs",
+	"eslint.config.cjs",
+	"eslint.config.ts",
+	".eslintrc",
+	".eslintrc.json",
+	".eslintrc.js",
+	".eslintrc.cjs",
+	".eslintrc.yml",
+	".eslintrc.yaml",
+];
+
+/**
+ * JavaScript and TypeScript: Biome where the project configures it (Moebius's web app does), else oxlint for an oxlint
+ * or ESLint configuration (31 ms a file; about 2-3x Biome and 50-100x ESLint).
+ */
+const jsLint = linter(
+	"js-lint",
+	["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"],
+	(path) => {
+		const dir = dirname(path);
+		const biomeDir = findUp(dir, BIOME);
+		const biome = biomeDir && nodeTool(biomeDir, "biome");
+		if (biomeDir && biome) {
+			return { cwd: biomeDir, argv: (file) => [biome, "lint", "--reporter=github", "--max-diagnostics=50", file] };
+		}
+		const oxDir = findUp(dir, [...OXLINT, ...ESLINT]);
+		const oxlint = oxDir && nodeTool(oxDir, "oxlint");
+		if (oxDir && oxlint) return { cwd: oxDir, argv: (file) => [oxlint, "--format=unix", file] };
+		return undefined;
+	},
+	(output, cwd) => {
+		const out: HarnessDiagnostic[] = [];
+		for (const line of output.split("\n")) {
+			const github =
+				/^::(error|warning|notice) title=([^,]+),file=([^,]+),line=(\d+),(?:endLine=\d+,)?col=(\d+)[^:]*::(.*)$/.exec(
+					line.trim(),
+				);
+			if (github) {
+				out.push(diag(resolve(cwd, github[3]!), Number(github[4]), Number(github[5]), github[6]!, github[2]));
+				continue;
+			}
+			const unix = /^(.+?):(\d+):(\d+): (.*) \[(?:Warning|Error)\/([^\]]+)\]$/.exec(line.trim());
+			if (unix) out.push(diag(resolve(cwd, unix[1]!), Number(unix[2]), Number(unix[3]), unix[4]!, unix[5]));
+		}
+		return out;
+	},
+);
+
+/** Markdown: rumdl (about 10x markdownlint-cli2) for a markdownlint or rumdl configuration. */
+const markdown = linter(
+	"markdown",
+	["md", "markdown"],
+	(path) => {
+		const names = [
+			".markdownlint.json",
+			".markdownlint.jsonc",
+			".markdownlint.yaml",
+			".markdownlint.yml",
+			".markdownlint-cli2.jsonc",
+			".markdownlint-cli2.yaml",
+			".rumdl.toml",
+			"rumdl.toml",
+		];
+		const cwd =
+			findUp(dirname(path), names) ??
+			(mentions(dirname(path), "pyproject.toml", /^\[tool\.rumdl/m)
+				? findUp(dirname(path), ["pyproject.toml"])
+				: undefined);
+		if (!cwd || !onPath("rumdl")) return undefined;
+		return { cwd, argv: (file) => ["rumdl", "check", file] };
+	},
+	(output, cwd) => {
+		const out: HarnessDiagnostic[] = [];
+		for (const line of output.split("\n")) {
+			const m = /^(.+?):(\d+):(\d+): \[(\w+)\] (.*?)(?: \[\*\])?$/.exec(line.trim());
+			if (m) out.push(diag(resolve(cwd, m[1]!), Number(m[2]), Number(m[3]), m[5]!, m[4]));
+		}
+		return out;
+	},
+);
+
+/** YAML: ryl (a Rust yamllint) for a yamllint or ryl configuration. */
+const yamlLint = linter(
+	"yaml-lint",
+	["yaml", "yml"],
+	(path) => {
+		const cwd = findUp(dirname(path), [".yamllint", ".yamllint.yaml", ".yamllint.yml", ".ryl.toml"]);
+		if (!cwd || !onPath("ryl")) return undefined;
+		return { cwd, argv: (file) => ["ryl", "check", "--format", "parsable", file] };
+	},
+	(output, cwd) => {
+		const out: HarnessDiagnostic[] = [];
+		for (const line of output.split("\n")) {
+			const m = /^(.+?):(\d+):(\d+): \[(?:error|warning)\] (.*?)(?: \(([\w-]+)\))?$/.exec(line.trim());
+			if (m) out.push(diag(resolve(cwd, m[1]!), Number(m[2]), Number(m[3]), m[4]!, m[5]));
+		}
+		return out;
+	},
+);
+
+/** Luau: selene (3 ms a file) for a selene.toml. */
+const luauLint = linter(
+	"luau-lint",
+	["luau", "lua"],
+	(path) => {
+		const cwd = findUp(dirname(path), ["selene.toml"]);
+		if (!cwd || !onPath("selene")) return undefined;
+		return { cwd, argv: (file) => ["selene", "--display-style", "quiet", file] };
+	},
+	(output, cwd) => parseColonFindings(output, cwd, true),
+);
+
+/** C and C++: clangd-tidy (clang-tidy's checks through clangd, about 10x clang-tidy) for a .clang-tidy and compile_commands.json. */
+const cppLint = linter(
+	"cpp-lint",
+	["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "hip", "cu"],
+	(path) => {
+		const cwd = findUp(dirname(path), [".clang-tidy"]);
+		const db = findUp(dirname(path), ["compile_commands.json", join("build", "compile_commands.json")]);
+		if (!cwd || !db || !onPath("clangd-tidy")) return undefined;
+		const dbDir = existsSync(join(db, "compile_commands.json")) ? db : join(db, "build");
+		return { cwd, argv: (file) => ["clangd-tidy", "-p", dbDir, file] };
+	},
+	(output, cwd) => {
+		const out: HarnessDiagnostic[] = [];
+		for (const line of output.split("\n")) {
+			const m = /^(.+?):(\d+):(\d+): (?:Warning|Error|Information|Hint): (.*?)(?: \[([\w.,-]+)\])?$/.exec(
+				line.trim(),
+			);
+			if (m) out.push(diag(resolve(cwd, m[1]!), Number(m[2]), Number(m[3]), m[4]!, m[5]));
+		}
+		return out;
+	},
+);
+
+export const CHECKERS: Checker[] = [
+	rust,
+	python,
+	typescript,
+	javascript,
+	shell,
+	luau,
+	json,
+	toml,
+	yaml,
+	jsLint,
+	markdown,
+	yamlLint,
+	luauLint,
+	cppLint,
+];
 
 /** The checkers `PI_CHECKS` allows: all by default, none for `off`, else the comma-separated names. */
 export function enabledCheckers(setting = process.env.PI_CHECKS): Checker[] {

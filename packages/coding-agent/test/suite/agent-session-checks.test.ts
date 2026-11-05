@@ -1,6 +1,9 @@
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { CHECK_REPORT_MESSAGE_TYPE } from "../../src/core/agent-session.ts";
+import { onPath } from "../../src/core/checks/checkers.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 function reports(harness: Harness): string[] {
@@ -36,11 +39,32 @@ describe("AgentSession background checks", () => {
 		expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
 	});
 
+	it.skipIf(!onPath("rumdl"))("reports lint findings only when the run would end, then goes on", async () => {
+		const harness = await createHarness({ initialActiveToolNames: ["write"] });
+		harnesses.push(harness);
+		writeFileSync(join(harness.tempDir, ".markdownlint.json"), "{}");
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("write", { path: "NOTES.md", content: "# Notes\n## Part\n" })], {
+				stopReason: "toolUse",
+			}),
+			fauxAssistantMessage("Done."),
+			fauxAssistantMessage("Fixed the heading spacing."),
+		]);
+		await harness.session.prompt("write notes");
+		expect(harness.getPendingResponseCount()).toBe(0);
+		const found = reports(harness);
+		expect(found).toHaveLength(1);
+		expect(found[0]).toMatch(/^Lint findings in what you changed \(markdown/);
+		expect(found[0]).toContain("NOTES.md:1:1 MD022");
+	});
+
 	it("ends the run as before when the edits check clean", async () => {
 		const harness = await createHarness({ initialActiveToolNames: ["write"] });
 		harnesses.push(harness);
 		harness.setResponses([
-			fauxAssistantMessage([fauxToolCall("write", { path: "ok.json", content: '{"a": 1}' })], { stopReason: "toolUse" }),
+			fauxAssistantMessage([fauxToolCall("write", { path: "ok.json", content: '{"a": 1}' })], {
+				stopReason: "toolUse",
+			}),
 			fauxAssistantMessage("Done."),
 			fauxAssistantMessage("never reached"),
 		]);

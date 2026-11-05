@@ -2328,12 +2328,26 @@ export class AgentSession {
 		return !this._agentRunAbortRequested && this.agent.hasQueuedMessages();
 	}
 
-	/** Before a run ends: the background checks of its edits, up to CHECKS_WAIT_MS, so their errors still reach it. */
+	/**
+	 * Before a run ends: the background checks of its edits, up to CHECKS_WAIT_MS, so their errors still reach it; with
+	 * none, the lint findings its changes brought, which wait until the run would end so as not to interrupt it.
+	 */
 	private async _waitForChecks(): Promise<void> {
-		if (!this._checks?.busy) return;
-		await this._checks.waitForIdle(CHECKS_WAIT_MS);
-		// A report is sent on a promise: let it reach the queue before the queue is looked at.
-		await new Promise<void>((resolve) => setImmediate(resolve));
+		const checks = this._checks;
+		if (!checks) return;
+		if (checks.busy) {
+			await checks.waitForIdle(CHECKS_WAIT_MS);
+			// A report is sent on a promise: let it reach the queue before the queue is looked at.
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+		if (this.agent.hasQueuedMessages()) return;
+		const lint = checks.takeLintReport();
+		if (lint) {
+			await this.sendCustomMessage(
+				{ customType: CHECK_REPORT_MESSAGE_TYPE, content: lint, display: true },
+				{ deliverAs: "steer" },
+			);
+		}
 	}
 
 	private async _runBeforeSettleBoundary(): Promise<boolean> {
