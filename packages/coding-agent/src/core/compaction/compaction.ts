@@ -27,7 +27,7 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import { completeSimple, isContextOverflow } from "@earendil-works/pi-ai/compat";
-import { convertToLlm } from "../messages.ts";
+import { compactionSummaryText, convertToLlm } from "../messages.ts";
 import {
 	buildSessionProjection,
 	type CompactionEntry,
@@ -378,9 +378,12 @@ export function estimateTokens(message: AgentMessage): number {
 			chars = message.command.length + message.output.length;
 			return Math.ceil(chars / 4);
 		}
-		case "branchSummary":
-		case "compactionSummary": {
+		case "branchSummary": {
 			chars = message.summary.length;
+			return Math.ceil(chars / 4);
+		}
+		case "compactionSummary": {
+			chars = compactionSummaryText(message).length;
 			return Math.ceil(chars / 4);
 		}
 	}

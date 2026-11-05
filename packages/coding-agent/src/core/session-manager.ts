@@ -547,6 +547,39 @@ export function buildSessionProjection(
 	return projectSessionPath(buildSessionPath(entries, leafId, byId));
 }
 
+/** Most characters of the user's compacted messages that a compaction summary carries verbatim. */
+const COMPACTED_USER_MESSAGES_MAX_CHARS = 16_000;
+/** A path's entries before a compaction's kept range do not change, so neither do its compacted user messages. */
+const compactedUserMessagesCache = new WeakMap<CompactionEntry, string[]>();
+
+/**
+ * The text of the user's own messages on `path` before what `compaction` kept, oldest first, within
+ * COMPACTED_USER_MESSAGES_MAX_CHARS (a message cut there says so). Harness and extension messages are not the user's.
+ */
+function compactedUserMessages(path: SessionEntry[], compaction: CompactionEntry): string[] {
+	const cached = compactedUserMessagesCache.get(compaction);
+	if (cached) return cached;
+	let end = path.findIndex((entry) => entry.id === compaction.firstKeptEntryId);
+	if (end < 0) end = path.indexOf(compaction);
+	const texts: string[] = [];
+	let room = COMPACTED_USER_MESSAGES_MAX_CHARS;
+	for (let i = 0; i < end && room > 0; i++) {
+		const entry = path[i];
+		if (entry.type !== "message" || entry.message.role !== "user") continue;
+		const content = entry.message.content;
+		const text = (
+			typeof content === "string"
+				? content
+				: (content ?? []).map((part) => (part.type === "text" ? part.text : "")).join("\n")
+		).trim();
+		if (!text) continue;
+		texts.push(text.length <= room ? text : `${text.slice(0, room)}\n[cut here: the rest is in the summary]`);
+		room -= text.length;
+	}
+	compactedUserMessagesCache.set(compaction, texts);
+	return texts;
+}
+
 /** The projection of a root-to-leaf path. Does not keep or return `path`. */
 function projectSessionPath(path: SessionEntry[]): SessionProjection {
 	const { thinkingLevel, model } = getSessionContextSettings(path);
@@ -567,6 +600,20 @@ function projectSessionPath(path: SessionEntry[]): SessionProjection {
 					: projectContextEntry(sourceEntry, edits.get(sourceEntry.id)),
 		}),
 	);
+	const first = projectedEntries[0];
+	// An extension's own compaction decides itself what it keeps.
+	if (
+		first?.sourceEntry.type === "compaction" &&
+		!first.sourceEntry.fromHook &&
+		process.env.PI_COMPACTION_USER_MESSAGES !== "off"
+	) {
+		const userRequests = compactedUserMessages(path, first.sourceEntry);
+		if (userRequests.length > 0) {
+			first.messages = first.messages.map((message) =>
+				message.role === "compactionSummary" ? { ...message, userRequests } : message,
+			);
+		}
+	}
 	return {
 		entries: projectedEntries,
 		messages: projectedEntries.flatMap((entry) => entry.messages),

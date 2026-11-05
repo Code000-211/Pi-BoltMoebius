@@ -64,6 +64,22 @@ export interface CompactionSummaryMessage {
 	summary: string;
 	tokensBefore: number;
 	timestamp: number;
+	/**
+	 * The user's own messages from the compacted history, verbatim and oldest first: a summary drops requirements
+	 * and constraints of the task (arXiv 2608.11242, 2606.22528), so the user's words stay beside it.
+	 */
+	userRequests?: string[];
+}
+
+/** The text a compaction summary message gives the model: the summary, then the user's compacted messages verbatim. */
+export function compactionSummaryText(message: CompactionSummaryMessage): string {
+	let text = COMPACTION_SUMMARY_PREFIX + message.summary + COMPACTION_SUMMARY_SUFFIX;
+	if (message.userRequests?.length) {
+		text += `\n\nThe user's messages from the compacted history, verbatim and oldest first:\n${message.userRequests
+			.map((request) => `<user-message>\n${request}\n</user-message>`)
+			.join("\n")}`;
+	}
+	return text;
 }
 
 // Extend CustomAgentMessages via declaration merging
@@ -176,9 +192,7 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 				case "compactionSummary":
 					return {
 						role: "user",
-						content: [
-							{ type: "text" as const, text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX },
-						],
+						content: [{ type: "text" as const, text: compactionSummaryText(m) }],
 						timestamp: m.timestamp,
 					};
 				case "system":
