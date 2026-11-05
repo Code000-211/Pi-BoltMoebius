@@ -896,6 +896,59 @@ def audit_solve(root: Path) -> None:
     sh(r"sed -i -E 's/legacy_hash\(record, salt=/stable_hash(record, seed=/; s/legacy_hash\(record\)/stable_hash(record)/' src/mod_*.py", root)
 
 
+# --------------------------------------------------------------------------- def_lookup
+
+DEF_RULES = '''__all__ = ["normalize_amount"]
+
+
+def normalize_amount(value):
+    """Rounds a money amount to whole cents."""
+    cents = int(value * 100)
+    return cents / 100
+'''
+
+
+def def_lookup_setup(root: Path) -> None:
+    files = {
+        "billing/__init__.py": "from billing._impl.r_rules import *  # noqa: F403\n",
+        "billing/_impl/__init__.py": "",
+        "billing/_impl/r_rules.py": DEF_RULES,
+        "README.md": "# shop\n\nAmounts go through `normalize_amount` before they are shown or stored.\n",
+    }
+    apps = ["orders", "refunds", "invoices", "carts", "coupons", "payouts", "fees", "taxes", "gifts", "loyalty"]
+    for app in apps:
+        for k in range(40):
+            files[f"apps/{app}/h{k}.py"] = f'''from billing import normalize_amount
+
+
+def total_{k}(items):
+    """Total of the {app} items of kind {k}."""
+    return normalize_amount(sum(items))
+'''
+    write(root, files)
+    git_init(root)
+
+
+def def_lookup_verify(root: Path) -> tuple[bool, str]:
+    code, diff = sh("git status --porcelain", root)
+    changed = sorted(line[3:] for line in diff.splitlines() if line.strip())
+    if changed != ["billing/_impl/r_rules.py"]:
+        return False, f"changed files: {changed}"
+    check = (
+        "from billing import normalize_amount as n; "
+        "cases = [(2.675, 2.68), (1.005, 1.01), (2.674, 2.67), (10, 10.0), (0.125, 0.13), (3.333, 3.33)]; "
+        "bad = [(v, n(v), w) for v, w in cases if abs(n(v) - w) > 1e-9]; print('OK' if not bad else bad)"
+    )
+    code, out = sh(f'python3 -c "{check}"', root)
+    return code == 0 and out.strip() == "OK", out
+
+
+def def_lookup_solve(root: Path) -> None:
+    replace_in(root, "billing/_impl/r_rules.py", "    cents = int(value * 100)\n    return cents / 100\n",
+               "    from decimal import ROUND_HALF_UP, Decimal\n\n"
+               "    return float(Decimal(str(value)).quantize(Decimal(\"0.01\"), rounding=ROUND_HALF_UP))\n")
+
+
 HARD_TASKS = [
     Task("py_api", "python", "Implement the behaviour docs/API.md describes for list_books, across the api, service and repo "
          "layers. The tests run with `python3 -m unittest discover -s tests -t .`.",
@@ -915,4 +968,8 @@ HARD_TASKS = [
     Task("py_twins", "python", TWINS_TASK, twins_setup, twins_verify, "2 of 40 near-identical functions", twins_solve),
     Task("long_audit", "python", AUDIT_TASK, audit_setup, audit_verify, "80 calls in 20 modules of 450 lines: context and many edits",
          audit_solve),
+    Task("def_lookup", "python",
+         "Money amounts come out wrong everywhere: 2.675 is shown as 2.67, and 1.005 as 1.0. normalize_amount must round "
+         "half up to whole cents (2.675 -> 2.68). Fix it where it is defined; change nothing else.",
+         def_lookup_setup, def_lookup_verify, "a function used in 400 files, defined behind a re-export", def_lookup_solve),
 ]

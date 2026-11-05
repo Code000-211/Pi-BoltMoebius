@@ -17,7 +17,8 @@
  * Install: packages/docsearch/install.sh, then `pi-bolt compile` (see packages/docsearch/README.md).
  */
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { Type } from "typebox";
@@ -135,6 +136,113 @@ function projectRoot(cwd: string): string | undefined {
 	return dir === homedir() || dir === "/" ? undefined : dir;
 }
 
+/**
+ * Up to this many files the project is small: Pi's system prompt lists them all, and ls, cat and rg find anything in
+ * it as fast, so the tool is left out (its schema and rules cost every request ~400 tokens). In 84 Terminal-Bench 2.1
+ * runs, all in small projects, glm-5.3-flash called it once against 1,920 bash calls.
+ */
+const SMALL_PROJECT_FILES = 150;
+
+/** The project's files, counted up to `limit + 1`: git's list where there is one, else a walk past hidden folders. */
+function countFiles(root: string, limit: number): number {
+	if (existsSync(join(root, ".git"))) {
+		const r = spawnSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], {
+			cwd: root,
+			encoding: "utf8",
+			timeout: 2000,
+			maxBuffer: 64 * 1024 * 1024,
+		});
+		if (r.status === 0) return r.stdout.split("\0").filter(Boolean).length;
+	}
+	let count = 0;
+	const walk = (dir: string, depth: number): void => {
+		if (count > limit || depth > 6) return;
+		let entries: import("node:fs").Dirent[];
+		try {
+			entries = readdirSync(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const e of entries) {
+			if (count > limit) return;
+			if (e.name.startsWith(".") || e.name === "node_modules" || e.name === "target") continue;
+			if (e.isDirectory()) walk(join(dir, e.name), depth + 1);
+			else if (e.isFile()) count++;
+		}
+	};
+	walk(root, 0);
+	return count;
+}
+
+const DEFINITION_KEYWORDS = /^(def|fn|class|struct|function|func|impl|type|interface|enum|trait|const|let|var|pub)$/;
+
+/** Splits a command into words, quotes removed; `|`, `;`, `&` and newlines become words of their own. */
+function shellWords(command: string): string[] {
+	const words: string[] = [];
+	let word = "";
+	let quote = "";
+	let inWord = false;
+	for (const ch of command) {
+		if (quote) {
+			if (ch === quote) quote = "";
+			else word += ch;
+		} else if (ch === "'" || ch === '"') {
+			quote = ch;
+			inWord = true;
+		} else if (/\s/.test(ch) || "|;&()".includes(ch)) {
+			if (inWord) words.push(word);
+			if (ch === "\n" || "|;&".includes(ch)) words.push(ch);
+			word = "";
+			inWord = false;
+		} else {
+			word += ch;
+			inWord = true;
+		}
+	}
+	if (inWord) words.push(word);
+	return words;
+}
+
+/** grep/rg options that take a value, which is not the pattern. */
+const SEARCH_VALUE_OPTIONS = new Set(["-g", "--glob", "-t", "--type", "-T", "--type-not", "-A", "-B", "-C", "-m", "--max-count", "--include", "--exclude", "--exclude-dir", "-f"]);
+
+/**
+ * The name a command searches for with rg, grep or git grep, when its pattern is one identifier (optionally after a
+ * definition keyword, as in `def foo` or `fn foo\(`): the case where a search lists every use and the definition is
+ * one line among them.
+ */
+export function searchedName(command: string): string | undefined {
+	const words = shellWords(command);
+	for (let i = 0; i < words.length; i++) {
+		const name = words[i]!.replace(/^.*\//, "");
+		const isSearch = name === "rg" || name === "grep" || name === "egrep" || (name === "git" && words[i + 1] === "grep");
+		if (!isSearch) continue;
+		let pattern: string | undefined;
+		for (let j = i + (name === "git" ? 2 : 1); j < words.length && !"|;&\n".includes(words[j]!); j++) {
+			const arg = words[j]!;
+			if (arg === "-e" || arg === "--regexp") {
+				pattern = words[j + 1];
+				break;
+			}
+			if (SEARCH_VALUE_OPTIONS.has(arg)) j++;
+			else if (!arg.startsWith("-")) {
+				pattern = arg;
+				break;
+			}
+		}
+		if (!pattern) continue;
+		// Regex decoration around a name: \b, ^, $, \s+, \( and a trailing ( or :.
+		const plain = pattern
+			.replace(/\\[bB<>]|\\s[+*]?|[\^$]/g, " ")
+			.replace(/\\?\(.*$|:$/, "")
+			.trim()
+			.split(/\s+/)
+			.filter((w) => w && !DEFINITION_KEYWORDS.test(w));
+		if (plain.length === 1 && /^[A-Za-z_][A-Za-z0-9_]{2,}$/.test(plain[0]!)) return plain[0];
+	}
+	return undefined;
+}
+
 export default function (pi: ExtensionAPI) {
 	// PI_DOCSEARCH=off leaves the extension out entirely (no tool, no recall), to measure without it.
 	if (process.env.PI_DOCSEARCH === "off" || !DocIndex) return;
@@ -143,6 +251,10 @@ export default function (pi: ExtensionAPI) {
 	let ready = false;
 	let base = "";
 	let config = DEFAULTS;
+	/** The project has at most SMALL_PROJECT_FILES files and no doc folders are configured: the tool is left out. */
+	let small = false;
+	/** This extension took project_search out of the active tools (for a small project). */
+	let leftOut = false;
 
 	const show = (p: string) => {
 		if (base && (p === base || p.startsWith(`${base}/`))) return relative(base, p) || ".";
@@ -159,6 +271,16 @@ export default function (pi: ExtensionAPI) {
 		const extensions = config.extensions ?? [...DOC_EXTENSIONS, ...(config.code ? CODE_EXTENSIONS : [])];
 		index = roots.length ? new DocIndex({ roots, extensions }) : undefined;
 		ready = false;
+		small = !!root && config.roots.length === 0 && countFiles(root, SMALL_PROJECT_FILES) <= SMALL_PROJECT_FILES;
+		const active = pi.getActiveTools();
+		if (small && active.includes("project_search")) {
+			pi.setActiveTools(active.filter((name) => name !== "project_search"));
+			leftOut = true;
+		} else if (!small && leftOut) {
+			// Only what this extension took out comes back (a session switched to a larger project).
+			pi.setActiveTools([...active, "project_search"]);
+			leftOut = false;
+		}
 		if (!index) {
 			ctx.ui.setStatus("docsearch", undefined);
 			return;
@@ -317,6 +439,27 @@ export default function (pi: ExtensionAPI) {
 				display: true,
 				details: { places: hits.map((h) => `${show(h.path)}:${h.lineStart}`), micros: r.micros },
 			},
+		};
+	});
+
+	// Definition hint: a search for one name with rg or grep lists every line that uses it, the definition one among
+	// many. In a large project the index knows where the name is defined: that place is added to the command's output,
+	// unless the output already shows it, without a call of its own. Only an index that is there (no waiting).
+	pi.on("tool_result", async (event) => {
+		if (event.toolName !== "bash" || small || !index) return;
+		const name = searchedName(String((event.input as { command?: unknown }).command ?? ""));
+		if (!name) return;
+		const r = await search(name, 5, 200, undefined, 0);
+		if (!r?.ready) return;
+		const output = event.content.map((c) => (c.type === "text" ? c.text : "")).join("\n");
+		const defs = r.hits
+			.filter((h) => isCode(h.path) && new RegExp(`(^|[^A-Za-z0-9_])${name}([^A-Za-z0-9_]|$)`).test(h.heading))
+			.filter((h) => !output.includes(`${show(h.path)}:${h.lineStart}:`))
+			.slice(0, 2);
+		if (!defs.length) return;
+		const places = defs.map((h) => `${show(h.path)}:${h.lineStart}-${h.lineEnd} · ${h.heading}`).join("\n");
+		return {
+			content: [...event.content, { type: "text" as const, text: `\n[project_search] Where ${name} is defined:\n${places}` }],
 		};
 	});
 
