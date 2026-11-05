@@ -449,6 +449,11 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
  */
 const OVERFLOW_RECOVERY_STEPS = 3;
 
+/** `customType` of the notice after a response cut off at the output limit with nothing done. */
+export const CUT_OFF_MESSAGE_TYPE = "cut-off-response";
+/** Such notices in a row before the run ends as before. */
+const MAX_CUT_OFF_NOTICES = 3;
+
 function getOverflowRecoveryStep(
 	settings: CompactionSettings,
 	step: number,
@@ -495,6 +500,8 @@ export class AgentSession {
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	/** Overflow recovery steps taken since the last user message or successful response */
 	private _overflowRecoveryAttempts = 0;
+	/** Responses in a row cut off at the output limit with nothing done, see {@link _answerCutOffResponse}. */
+	private _cutOffResponses = 0;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -1088,8 +1095,35 @@ export class AgentSession {
 			const previousDecision = await previousFinishTurn?.(turn, signal);
 			if (previousDecision?.action === "end") return previousDecision;
 			if (extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
+			if (await this._answerCutOffResponse(turn.message)) return { action: "continue" };
 			return undefined;
 		};
+	}
+
+	/**
+	 * A response cut off at the output limit with no tool call did nothing, and would end the run: the model is told and
+	 * goes on, up to {@link MAX_CUT_OFF_NOTICES} times in a row. In Terminal-Bench 2.1, glm-5.3-flash ended 2 of its first
+	 * 14 runs this way, after 65,536 tokens of thinking, with most of the time left.
+	 */
+	private async _answerCutOffResponse(message: AgentMessage): Promise<boolean> {
+		if (message.role !== "assistant") return false;
+		if (message.stopReason !== "length") {
+			this._cutOffResponses = 0;
+			return false;
+		}
+		if (message.content.some((c) => c.type === "toolCall")) return false;
+		if (this._cutOffResponses >= MAX_CUT_OFF_NOTICES) return false;
+		this._cutOffResponses++;
+		await this.sendCustomMessage(
+			{
+				customType: CUT_OFF_MESSAGE_TYPE,
+				content:
+					"Your last response reached the output limit while you were still working it out, so nothing was done. Think in shorter steps: take the next concrete step now (a tool call, or write the result), and decide the rest from what it shows.",
+				display: true,
+			},
+			{ deliverAs: "steer" },
+		);
+		return true;
 	}
 
 	private _installAgentNextTurnRefresh(): void {

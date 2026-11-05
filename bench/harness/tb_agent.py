@@ -101,7 +101,8 @@ class PiLightspeed(BaseInstalledAgent):
             environment,
             command=(
                 f"{time_env}PI_CODING_AGENT_DIR={AGENT_DIR} {HARNESS_DIR}/pi --mode json --no-session -ne -ns -np -nc --no-mcp "
-                f"{extension_args}--model {shlex.quote(self.model_name)} {shlex.quote(instruction)} "
+                # `--`: an instruction may start with "-" (a task's list of steps).
+                f"{extension_args}--model {shlex.quote(self.model_name)} -- {shlex.quote(instruction)} "
                 f"</dev/null 2>{shlex.quote(str(stderr))} | grep --line-buffered -v '\"type\":\"message_update\"' "
                 f"> {shlex.quote(str(events))}"
             ),

@@ -25,8 +25,12 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil
 import { Text } from "@earendil-works/pi-tui";
 
 // A literal path, so that `pi-bolt compile` embeds the addon in the executable; install.sh puts in the platform it
-// builds on (docsearch.darwin-arm64.node, docsearch.win32-x64.node, ...).
-const { DocIndex } = require("./docsearch.linux-x64.node");
+// builds on (docsearch.darwin-arm64.node, docsearch.win32-x64.node, ...). One that does not load here (built against a
+// newer C library than this system's, say) leaves the extension out instead of stopping Pi.
+let DocIndex: any;
+try {
+	({ DocIndex } = require("./docsearch.linux-x64.node"));
+} catch {}
 
 interface Hit {
 	path: string;
@@ -133,7 +137,7 @@ function projectRoot(cwd: string): string | undefined {
 
 export default function (pi: ExtensionAPI) {
 	// PI_DOCSEARCH=off leaves the extension out entirely (no tool, no recall), to measure without it.
-	if (process.env.PI_DOCSEARCH === "off") return;
+	if (process.env.PI_DOCSEARCH === "off" || !DocIndex) return;
 	let index: any;
 	/** The current index's first build is there: searches need not wait for it. */
 	let ready = false;
