@@ -383,7 +383,8 @@ const shell: Checker = {
 			const ran = await run(["bash", "-n", unit.file!], unit.cwd, signal, { LC_ALL: "C" });
 			for (const line of ran.stderr.split("\n")) {
 				const m = /: line (\d+): (.*)$/.exec(line);
-				if (m) out.push(diag(unit.file!, Number(m[1]), 1, m[2]!));
+				// Not the line bash quotes after the message (`if then').
+				if (m && !/^`.*'$/.test(m[2]!)) out.push(diag(unit.file!, Number(m[1]), 1, m[2]!));
 			}
 		}
 		// shuck's errors once the syntax is right, and its warnings where the project configures ShellCheck or shuck.
@@ -601,7 +602,11 @@ const luauLint = linter(
 		if (!cwd || !onPath("selene")) return undefined;
 		return { cwd, argv: (file) => ["selene", "--display-style", "quiet", file] };
 	},
-	(output, cwd) => parseColonFindings(output, cwd, true),
+	// A .luau file's syntax errors come from luau-analyze already.
+	(output, cwd) =>
+		parseColonFindings(output, cwd, true).filter(
+			(d) => !(d.code === "parse_error" && extension(d.file) === "luau" && onPath("luau-analyze")),
+		),
 );
 
 /** C and C++: clangd-tidy (clang-tidy's checks through clangd, about 10x clang-tidy) for a .clang-tidy and compile_commands.json. */
@@ -644,12 +649,12 @@ export const CHECKERS: Checker[] = [
 	cppLint,
 ];
 
-/** The checkers `PI_CHECKS` allows: all by default, none for `off`, else the comma-separated names. */
-export function enabledCheckers(setting = process.env.PI_CHECKS): Checker[] {
-	if (setting === undefined || setting.trim() === "" || setting === "on") return CHECKERS;
+/** The checkers of `all` that `PI_CHECKS` allows: all by default, none for `off`, else the comma-separated names. */
+export function enabledCheckers(setting = process.env.PI_CHECKS, all = CHECKERS): Checker[] {
+	if (setting === undefined || setting.trim() === "" || setting === "on") return all;
 	if (setting === "off" || setting === "0" || setting === "false") return [];
 	const names = new Set(setting.split(",").map((s) => s.trim()));
-	return CHECKERS.filter((c) => names.has(c.name));
+	return all.filter((c) => names.has(c.name));
 }
 
 /** `path` relative to `cwd` when it is under it. */

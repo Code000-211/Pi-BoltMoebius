@@ -103,6 +103,11 @@ export class BackgroundChecks {
 		return this.checkers.length > 0;
 	}
 
+	/** Whether the checker named `name` is on. */
+	runs(name: string): boolean {
+		return this.checkers.some((checker) => checker.name === name);
+	}
+
 	/** The units of every checker that takes `path` (a TypeScript file: its project's tsc, and its linter). */
 	private unitsFor(path: string): UnitState[] {
 		const states: UnitState[] = [];

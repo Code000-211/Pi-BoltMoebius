@@ -941,5 +941,4 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		);
 		expect(cppFlags.slice(0, 2)).toEqual(["-x", "c++-header"]);
 	});
-
 });

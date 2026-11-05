@@ -1,10 +1,11 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { BackgroundChecks } from "../src/core/checks/background-checks.ts";
 import { CHECKERS, type Checker, enabledCheckers, onPath } from "../src/core/checks/checkers.ts";
 import type { HarnessDiagnostic } from "../src/core/harness/file-state-tracker.ts";
+import { ClaudeHarnessManager } from "../src/core/harness/index.ts";
 
 /** A checker over `*.fake` files whose errors are what `errors` holds when it runs, after `delayMs`. */
 function fakeChecker(errors: Map<string, string[]>, delayMs = 0, runs: string[] = []): Checker {
@@ -174,6 +175,41 @@ describe("the checkers, with their tools where installed", () => {
 		return await checker.run(unit, new AbortController().signal);
 	}
 
+	it.skipIf(!existsSync(join(__dirname, "..", "native", "libclang", "prebuilds")))(
+		"checks C++ with the harness's libclang engine after the edit, which does not wait for it",
+		async () => {
+			const harness = new ClaudeHarnessManager();
+			const reports: string[] = [];
+			const checks = new BackgroundChecks({
+				cwd: dir,
+				report: (t) => reports.push(t),
+				checkers: [harness.cppChecker(dir)],
+			});
+			harness.setBackgroundChecks(checks);
+			const path = join(dir, "a.cpp");
+			const before = "int f() { return 1; }\n";
+			writeFileSync(path, before);
+			harness.onFileRead(path, before, statSync(path).mtimeMs, dir);
+			const after = 'int f() { return 1; }\nint g() { int x = "s"; return x; }\n';
+			writeFileSync(path, after);
+			const { newDiagnostics } = await harness.onFileModified({
+				absolutePath: path,
+				displayPath: "a.cpp",
+				newContent: after,
+				newMtimeMs: statSync(path).mtimeMs,
+				workspaceCwd: dir,
+			});
+			expect(newDiagnostics).toEqual([]);
+			expect(checks.busy).toBe(true);
+			await checks.waitForIdle(20_000);
+			expect(reports).toHaveLength(1);
+			expect(reports[0]).toMatch(/^New errors after your changes \(cpp check\):\n {2}a\.cpp:2:/);
+			checks.dispose();
+			harness.dispose();
+		},
+		30_000,
+	);
+
 	it("finds a JSON syntax error in the process", async () => {
 		const [d] = await errorsOf("a.json", '{"a": 1,}');
 		expect(d?.severity).toBe("error");
@@ -203,6 +239,8 @@ describe("the checkers, with their tools where installed", () => {
 	it.skipIf(!onPath("bash"))("finds a shell syntax error with bash -n", async () => {
 		const [d] = await errorsOf("a.sh", 'echo "unterminated\n');
 		expect(d?.line).toBeGreaterThan(0);
+		// One finding, not also the line bash quotes after it.
+		expect(await errorsOf("c.sh", "if then\n")).toEqual([expect.objectContaining({ line: 1 })]);
 		expect(await errorsOf("b.sh", "echo fine\n")).toEqual([]);
 	});
 
@@ -266,6 +304,7 @@ describe("the checkers, with their tools where installed", () => {
 	it.skipIf(!onPath("selene"))("lints Luau with selene for a selene.toml", async () => {
 		const found = await lintOf("a.luau", "local x = 1\nreturn 0\n", { "selene.toml": 'std = "luau"\n' });
 		expect(found).toEqual([expect.objectContaining({ code: "unused_variable", line: 1 })]);
+		if (onPath("luau-analyze")) expect(await lintOf("b.luau", "local x =\n", {})).toEqual([]);
 	});
 
 	it.skipIf(!onPath("clangd-tidy"))(

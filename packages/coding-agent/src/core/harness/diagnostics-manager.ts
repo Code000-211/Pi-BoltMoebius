@@ -2,6 +2,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, normalize, resolve } from "node:path";
 import { stripBom } from "../../utils/text.ts";
 import type { BackgroundChecks } from "../checks/background-checks.ts";
+import type { Checker } from "../checks/checkers.ts";
 import { notifySearchFileTouched } from "../tools/native-search.ts";
 import { CppHipDiagnosticsEngine } from "./cpp-hip-engine.ts";
 import {
@@ -154,6 +155,8 @@ export class ClaudeHarnessManager {
 	private checks?: BackgroundChecks;
 	private defaultEnableDiagnostics: boolean;
 	private inflightWarmups = new Map<string, Promise<void>>();
+	/** C, C++ and HIP files are checked in the background ({@link cppChecker}), not during the edit. */
+	private cppInBackground = false;
 
 	constructor(options?: { customProvider?: CustomDiagnosticsProvider; enableDiagnostics?: boolean }) {
 		this.cppHipEngine = new CppHipDiagnosticsEngine(this.stateTracker);
@@ -167,6 +170,26 @@ export class ClaudeHarnessManager {
 
 	setBackgroundChecks(checks: BackgroundChecks | undefined): void {
 		this.checks = checks;
+		this.cppInBackground = checks?.runs("cpp") ?? false;
+	}
+
+	/**
+	 * C, C++ and HIP through libclang as a background check (see checks/background-checks.ts), so that an edit does not
+	 * wait for the reparse: a tenth of a second on a warm translation unit, seconds on a large one. It uses this
+	 * manager's engine, which knows the files read and changed: a header is parsed in a source that includes it, with
+	 * the other headers the agent changed.
+	 */
+	cppChecker(workspaceCwd: string): Checker {
+		const checker: Checker = {
+			name: "cpp",
+			matches: (path) => isCppOrHipFile(path),
+			unit: (path) => ({ key: `cpp:${path}`, checker, cwd: workspaceCwd, file: path }),
+			run: async (unit) => {
+				const file = unit.file!;
+				return (await this.cppHipEngine.checkEditedFile(file, readFileSync(file, "utf8"), unit.cwd)).diagnostics;
+			},
+		};
+		return checker;
 	}
 
 	dispose(): void {
@@ -265,7 +288,8 @@ export class ClaudeHarnessManager {
 
 		// Fast path: only enter the async diagnostics pipeline for supported languages or custom providers
 		const shouldRunDiagnostics =
-			enableDiagnostics && (this.customProvider !== undefined || isCppOrHipFile(absolutePath));
+			enableDiagnostics &&
+			(this.customProvider !== undefined || (isCppOrHipFile(absolutePath) && !this.cppInBackground));
 
 		if (shouldRunDiagnostics) {
 			const pendingWarmup = this.inflightWarmups.get(normalizeWarmupKey(absolutePath));

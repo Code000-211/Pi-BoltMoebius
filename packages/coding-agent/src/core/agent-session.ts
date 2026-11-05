@@ -73,6 +73,7 @@ import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
 import { BackgroundChecks } from "./checks/background-checks.ts";
+import { CHECKERS, enabledCheckers } from "./checks/checkers.ts";
 import {
 	type CompactionPreparation,
 	type CompactionResult,
@@ -635,6 +636,8 @@ export class AgentSession {
 		this._cwd = config.cwd;
 		const checks = new BackgroundChecks({
 			cwd: this._cwd,
+			// C, C++ and HIP through the harness's libclang engine (see ClaudeHarnessManager.cppChecker).
+			checkers: enabledCheckers(undefined, [...CHECKERS, this._claudeHarness.cppChecker(this._cwd)]),
 			report: (text) => {
 				this.sendCustomMessage(
 					{ customType: CHECK_REPORT_MESSAGE_TYPE, content: text, display: true },

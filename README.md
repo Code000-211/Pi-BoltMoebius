@@ -17,7 +17,7 @@ ratio 0.69–0.92), with fewer turns (median 4 vs 5) and 20% lower cost. [Detail
 |---|---|---|
 | [Search](#finding-code) | `grep`/`find` keep the file tree and contents in memory and match with SIMD | `grep` 1.7–6× faster, `find` 7.5× (p50) |
 | [Search](#project_search) | `project_search`: code and docs search that finds a function's definition first | definition first 55% → **83%**; doc answer in top 3 40% → **83%** |
-| [Editing](#compiler-diagnostics-after-every-edit) | The compiler's new errors after every `edit`/`write`: C/C++/HIP in the edit, nine more languages in the background with no wait | Rust type error on Moebius: reported in **3 s** (rust-analyzer: none in 84 s) |
+| [Editing](#compiler-diagnostics-after-every-edit) | The compiler's new errors after every `edit`/`write`, from ten languages' checkers in the background with no wait | Rust type error on Moebius: reported in **3 s** (rust-analyzer: none in 84 s) |
 | [Editing](#fewer-refused-edits) | An exact edit applies even to a file seen only through bash | 21% of real edits were refused before |
 | [Editing](#edit-matching) | Edits that miss by indentation still apply; a miss shows the closest lines | |
 | [Editing](#no-edits-behind-the-edit-tools-back) | `sed -i` and text redirected into files are sent to `edit`/`write`, which check what they change | 65 of 2,615 real commands |
@@ -153,20 +153,21 @@ answer.</sub>
 
 ### Compiler diagnostics after every edit
 
-After `edit` or `write` on C, C++ or HIP, the tool result lists the compiler diagnostics **the edit introduced**, as
-a `<new-diagnostics>` block. Errors that were there before are left out: they are collected in the background when the
-file is read. The model sees its mistake in the same step instead of at the next build.
+After `edit` or `write`, the compiler's diagnostics **the edit introduced** come as a message before the model's next
+request (see [background checks](#background-checks)). Errors that were there before are left out: they are collected
+in the background when the file is read. The model sees its mistake in its next step instead of at the next build.
 
-- **C, C++, HIP**: libclang in process when a libclang library is found (`LIBCLANG_PATH`, ROCm's, or the system's), else
+- **C, C++, HIP**: checked in the background like the other languages (before, the edit waited for the reparse: 0.1 s
+  on a warm translation unit, 1 s right after the read, seconds on a large one). libclang in process when a libclang library is found (`LIBCLANG_PATH`, ROCm's, or the system's), else
   clangd (`CLANGD_PATH`, `/opt/rocm/llvm/bin/clangd`, or on `PATH`). libclang gets the builtin headers (`stddef.h`)
   from the folder next to the library it loaded. Flags come from `compile_commands.json` in the
   project or up to 5 parent folders (also `build/`, `out/`, `cmake-build-*`). A header is checked inside a source that
-  includes it, also through `-I` folders.
+  includes it, also through `-I` folders, with the other headers the agent changed.
 - Without these tools the edit goes through as before, with no diagnostics.
 
 #### Background checks
 
-Other languages are checked after the edit, in the background: `edit` and `write` (and a bash command that changed a
+Files are checked after the edit, in the background: `edit` and `write` (and a bash command that changed a
 file) return at once, and only errors that are new against the state before come as a message before the model's next
 request. When the model would end its run while a check of its edits still runs, Pi waits for it (`PI_CHECKS_WAIT`,
 default 30 s) and the run goes on with the errors. Edits in quick succession make one check, a unit runs one check at
@@ -174,6 +175,7 @@ a time, and a check an edit overtook runs again instead of reporting.
 
 | Language | Tool (the fastest found, each only when installed) | Checks | Time |
 |---|---|---|---:|
+| C, C++, HIP | libclang (above) | types, syntax | 0.1 s warm |
 | Rust | `cargo check` on the file's package, in `target/pi-check` | types | 1.4 s warm on Moebius |
 | Python | ty | types, undefined names | 24-31 ms a file |
 | TypeScript | `tsc` (TypeScript 7's native one before the project's) on the `tsconfig.json` project | types | 0.2 s small project |
@@ -427,7 +429,7 @@ Everything above is on by default.
 | `PI_PROJECT_SNAPSHOT=full` / `off` | The project listing with small files' contents / none |
 | `--remote <host>[:<folder>]`, `PI_REMOTE` | Start working on that machine (as `/remote`) |
 | `PI_SSH_COMMAND` | The ssh program (default `ssh`) |
-| `PI_CHECKS` | `off`, or the background checks to keep (`rust,python,typescript,javascript,shell,luau,json,toml,yaml`, and the linters `js-lint,markdown,yaml-lint,luau-lint,cpp-lint`) |
+| `PI_CHECKS` | `off`, or the background checks to keep (`cpp,rust,python,typescript,javascript,shell,luau,json,toml,yaml`, and the linters `js-lint,markdown,yaml-lint,luau-lint,cpp-lint`); without `cpp`, C/C++/HIP is checked in the edit as before |
 | `PI_CHECKS_WAIT` | Seconds a run that would end waits for the checks of its edits (default 30) |
 | `PI_CHECKS_CARGO_TARGET` | `shared` to let the background `cargo check` use the project's `target/` |
 | `LIBCLANG_PATH`, `CLANGD_PATH` | Where the C/C++ diagnostics tools are |
