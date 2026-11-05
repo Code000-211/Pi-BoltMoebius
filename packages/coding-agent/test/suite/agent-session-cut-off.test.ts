@@ -36,6 +36,26 @@ describe("AgentSession responses cut off at the output limit", () => {
 		expect(harness.getPendingResponseCount()).toBe(1);
 	});
 
+	it("thinks one level less after each cut-off response, and as before once one ends normally", async () => {
+		const harness = await createHarness({ models: [{ id: "faux-1", reasoning: true }] });
+		harnesses.push(harness);
+		harness.session.setThinkingLevel("medium");
+		const levels: Array<string | undefined> = [];
+		const recorded = (message: ReturnType<typeof cutOff>) => (_context: unknown, options: { reasoning?: string } | undefined) => {
+			levels.push(options?.reasoning);
+			return message;
+		};
+		harness.setResponses([
+			recorded(cutOff()),
+			recorded(cutOff()),
+			recorded(fauxAssistantMessage("Done.")),
+		] as never);
+		await harness.session.prompt("solve it");
+		harness.appendResponses([recorded(fauxAssistantMessage("Again."))] as never);
+		await harness.session.prompt("once more");
+		expect(levels).toEqual(["medium", "low", "minimal", "medium"]);
+	});
+
 	it("leaves a response that ends normally alone", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);

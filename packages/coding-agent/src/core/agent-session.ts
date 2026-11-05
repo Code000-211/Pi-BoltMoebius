@@ -453,6 +453,8 @@ const OVERFLOW_RECOVERY_STEPS = 3;
 export const CUT_OFF_MESSAGE_TYPE = "cut-off-response";
 /** Such notices in a row before the run ends as before. */
 const MAX_CUT_OFF_NOTICES = 3;
+/** The thinking levels a cut-off response steps down through ("off" is never chosen for the model). */
+const CUT_OFF_THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 function getOverflowRecoveryStep(
 	settings: CompactionSettings,
@@ -1013,7 +1015,7 @@ export class AgentSession {
 			};
 			let { previous, context } = await prepare();
 			const model = previous?.model ?? this.agent.state.model;
-			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
+			const thinkingLevel = previous?.thinkingLevel ?? this._requestThinkingLevel();
 			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
 
 			// The selection stays in agent state; only this request uses the routed model. A routing
@@ -1100,6 +1102,14 @@ export class AgentSession {
 		};
 	}
 
+	/** The session's thinking level, one level less for each response in a row cut off at the output limit (not below minimal). */
+	private _requestThinkingLevel(): ThinkingLevel {
+		const level = this.agent.state.thinkingLevel;
+		const at = (CUT_OFF_THINKING_LEVELS as readonly string[]).indexOf(level);
+		if (this._cutOffResponses === 0 || at <= 0) return level;
+		return CUT_OFF_THINKING_LEVELS[Math.max(0, at - this._cutOffResponses)];
+	}
+
 	/**
 	 * A response cut off at the output limit with no tool call did nothing, and would end the run: the model is told and
 	 * goes on, up to {@link MAX_CUT_OFF_NOTICES} times in a row. In Terminal-Bench 2.1, glm-5.3-flash ended 2 of its first
@@ -1113,6 +1123,7 @@ export class AgentSession {
 		}
 		if (message.content.some((c) => c.type === "toolCall")) return false;
 		if (this._cutOffResponses >= MAX_CUT_OFF_NOTICES) return false;
+		// The next requests think one level less per such response, until one ends normally (_requestThinkingLevel).
 		this._cutOffResponses++;
 		await this.sendCustomMessage(
 			{
