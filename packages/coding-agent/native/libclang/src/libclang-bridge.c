@@ -4,6 +4,9 @@
 // Runs all clang_parseTranslationUnit2 and clang_reparseTranslationUnit calls on a worker thread
 // via napi_async_work so the JS event loop and TUI never block and BUN_AOT_JIT=0 needs no FFI JIT.
 
+#ifndef _WIN32
+#define _GNU_SOURCE // dladdr
+#endif
 #include "../../../../tui/native/napi.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,7 +20,10 @@ static void mutex_init(mutex_type* m) { InitializeCriticalSection(m); }
 static void mutex_lock(mutex_type* m) { EnterCriticalSection(m); }
 static void mutex_unlock(mutex_type* m) { LeaveCriticalSection(m); }
 #else
+#include <dirent.h>
+#include <limits.h>
 #include <pthread.h>
+#include <sys/stat.h>
 typedef void* dylib_handle;
 typedef pthread_mutex_t mutex_type;
 static void mutex_init(mutex_type* m) { pthread_mutex_init(m, NULL); }
@@ -145,6 +151,8 @@ static struct {
     clang_getFileName_fn getFileName;
     clang_getCString_fn getCString;
     clang_disposeString_fn disposeString;
+    // The clang resource folder next to the loaded library (its builtin headers: stddef.h, stdarg.h), or NULL.
+    char* resource_dir;
 } g_clang;
 
 // --- Translation Unit Cache (FNV-1a Hash Table, the MAX_TUS used last) -------------------------------------------------
@@ -191,6 +199,44 @@ static void* dylib_sym(dylib_handle h, const char* name) {
     return (void*)GetProcAddress(h, name);
 #else
     return dlsym(h, name);
+#endif
+}
+
+// libclang looks for its builtin headers relative to the running executable, here Bun or Node, so it misses them
+// (every C file then reports "'stddef.h' file not found" and "unknown type name 'size_t'"). They sit next to the
+// library: <libdir>/clang/<version>/include.
+static char* find_resource_dir(void* symbol) {
+#ifdef _WIN32
+    (void)symbol;
+    return NULL;
+#else
+    Dl_info info;
+    if (!dladdr(symbol, &info) || !info.dli_fname) return NULL;
+    char lib[PATH_MAX];
+    if (!realpath(info.dli_fname, lib)) return NULL;
+    char* slash = strrchr(lib, '/');
+    if (!slash) return NULL;
+    *slash = '\0';
+    char clang_dir[PATH_MAX];
+    if (snprintf(clang_dir, sizeof clang_dir, "%s/clang", lib) >= (int)sizeof clang_dir) return NULL;
+    DIR* dir = opendir(clang_dir);
+    if (!dir) return NULL;
+    char* found = NULL;
+    struct dirent* entry;
+    while (!found && (entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        char header[PATH_MAX];
+        if (snprintf(header, sizeof header, "%s/%s/include/stddef.h", clang_dir, entry->d_name) >= (int)sizeof header)
+            continue;
+        struct stat st;
+        if (stat(header, &st) == 0) {
+            *strrchr(header, '/') = '\0';
+            *strrchr(header, '/') = '\0';
+            found = strdup(header);
+        }
+    }
+    closedir(dir);
+    return found;
 #endif
 }
 
@@ -253,6 +299,7 @@ static bool try_load_libclang(const char* custom_path) {
         if (g_clang.createIndex && g_clang.parseTU2 && g_clang.reparseTU &&
             g_clang.getNumDiagnostics && g_clang.getDiagnostic && g_clang.getCString) {
             g_clang.handle = h;
+            g_clang.resource_dir = find_resource_dir((void*)g_clang.createIndex);
             g_clang.index = g_clang.createIndex(0, 0);
             g_clang.available = (g_clang.index != NULL);
             return g_clang.available;
@@ -551,6 +598,21 @@ static void PI_NAPI_CALL execute_clang_work(napi_env env, void* data) {
         parse_num_args = entry->num_args;
     }
 
+    // The resource folder unless the arguments name one; kept out of the stored arguments, so their hash stays.
+    char** full_args = NULL;
+    if (g_clang.resource_dir) {
+        bool named = false;
+        for (int i = 0; i < parse_num_args; i++) {
+            if (strncmp(parse_args[i], "-resource-dir", 13) == 0) named = true;
+        }
+        if (!named) full_args = (char**)malloc((size_t)(parse_num_args + 2) * sizeof(char*));
+        if (full_args) {
+            for (int i = 0; i < parse_num_args; i++) full_args[i] = parse_args[i];
+            full_args[parse_num_args] = "-resource-dir";
+            full_args[parse_num_args + 1] = g_clang.resource_dir;
+        }
+    }
+
     unsigned parse_options = CXTranslationUnit_PrecompiledPreamble |
                              CXTranslationUnit_CreatePreambleOnFirstParse |
                              CXTranslationUnit_CacheCompletionResults |
@@ -575,8 +637,8 @@ static void PI_NAPI_CALL execute_clang_work(napi_env env, void* data) {
         enum CXErrorCode err = g_clang.parseTU2(
             g_clang.index,
             job->filename,
-            (const char* const*)parse_args,
-            parse_num_args,
+            (const char* const*)(full_args ? full_args : parse_args),
+            full_args ? parse_num_args + 2 : parse_num_args,
             unsaved_arr,
             job->num_unsaved,
             parse_options,
@@ -598,6 +660,7 @@ static void PI_NAPI_CALL execute_clang_work(napi_env env, void* data) {
         job->result_json = serialize_diagnostics(tu);
     }
     mutex_unlock(&g_clang.lock);
+    free(full_args);
     free(unsaved_arr);
 }
 

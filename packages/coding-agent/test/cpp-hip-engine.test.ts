@@ -59,6 +59,17 @@ describe.skipIf(!addon)("libclang bridge and C++ engine (real libclang)", () => 
 		expect(await messages(file, [], content)).toEqual([]);
 	});
 
+	it("finds the builtin headers next to libclang, so a clean C file reports nothing", async () => {
+		const file = join(dir, "builtin.c");
+		const content =
+			"#include <stddef.h>\n#include <stdarg.h>\nsize_t n(void) { return sizeof(va_list); }\nvoid *p(void) { return NULL; }\n";
+		writeFileSync(file, content);
+		const all = JSON.parse(await addon!.checkFileAsync(file, [], [{ filename: file, content }])) as Array<{
+			message: string;
+		}>;
+		expect(all.map((d) => d.message)).toEqual([]);
+	});
+
 	it("keeps the TUs used last and parses an evicted one again", async () => {
 		const content = '#if VALUE != 2\n#error "value is not 2"\n#endif\n';
 		const files = Array.from({ length: 10 }, (_, i) => join(dir, `f${i}.cpp`));

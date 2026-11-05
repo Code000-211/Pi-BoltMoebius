@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { constants, existsSync } from "node:fs";
-import { access as fsAccess } from "node:fs/promises";
-import { constants as osConstants } from "node:os";
+import { access as fsAccess, readFile as readFileAsync, stat as statAsync } from "node:fs/promises";
+import { homedir, constants as osConstants } from "node:os";
+import { resolve as resolvePath } from "node:path";
 import type { Writable } from "node:stream";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { type ChildProcess, spawn } from "child_process";
@@ -21,7 +22,8 @@ import {
 } from "../../utils/shell.ts";
 import type { BackgroundJobs } from "../background-jobs.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
-import { type FileWrite, fileWritesInCommand } from "./bash-file-writes.ts";
+import type { ClaudeHarnessManager } from "../harness/index.ts";
+import { type FileWrite, filesShownByCat, fileWritesInCommand } from "./bash-file-writes.ts";
 import { notifySearchExternalChange } from "./native-search.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
@@ -55,8 +57,7 @@ const bashSchema = Type.Object({
 	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
 	background: Type.Optional(
 		Type.Boolean({
-			description:
-				"Start the command in the background right away: the call returns at once, and a message reports when it ends",
+			description: "Start in the background at once; a message reports its end",
 		}),
 	),
 });
@@ -66,8 +67,7 @@ export const bashToolSystemPromptContribution = {
 	guidelines: [
 		"You can inspect PI_* environment variables for current model and session details.",
 		// From deepseek-harness and oh-my-pi. In Pi's sessions, 97 `sleep` calls waited 3.2 h for other commands.
-		"Change files with edit and write, not with sed -i, a shell redirection or a script that rewrites them: those skip the checks edit and write do.",
-		"A command still running after a minute goes on in the background as a job (background: true starts it there right away), and a message reports when it ends. Meanwhile, go on with work that does not depend on it; call wait only when nothing else is left. Do not wait with sleep or poll for it.",
+		"Commands still running after two minutes continue in the background and report when they end: do other work meanwhile, never sleep or poll.",
 	],
 } as const;
 
@@ -153,8 +153,11 @@ function untilBackground<T>(running: Promise<T>, ms: number): Promise<T | typeof
 	]).finally(() => clearTimeout(timer));
 }
 
-/** How long a command runs in the foreground before it goes on in the background, by default (oh-my-pi's value). */
-export const DEFAULT_AUTO_BACKGROUND_SECONDS = 60;
+/**
+ * How long a command runs in the foreground before it goes on in the background, by default. oh-my-pi takes 60 s;
+ * models rarely work on meanwhile, so a test run of 72 s cost two turns of waiting in harnessbench at 60 s.
+ */
+export const DEFAULT_AUTO_BACKGROUND_SECONDS = 120;
 
 /**
  * After how many ms a call's command goes to the background: 0 when asked, undefined when it never does (no jobs, turned
@@ -203,6 +206,10 @@ function fixedSleepRefusal(seconds: number): string {
 		"or `until ssh host 'grep -q EXIT build.log'; do sleep 10; done` for a job on another machine: the loop ends as soon as the condition holds, " +
 		`and goes on in the background after a minute. A sleep of up to ${MAX_FIXED_SLEEP_SECONDS} seconds runs.`
 	);
+}
+
+function expandHome(path: string): string {
+	return path === "~" || path.startsWith("~/") ? `${homedir()}${path.slice(1)}` : path;
 }
 
 /** Why a command that changes files as the edit and write tools would was not run, and what to do instead. */
@@ -631,6 +638,8 @@ export interface BashToolOptions {
 	 * into a file) is refused, see bash-file-writes.ts.
 	 */
 	editToolActive?: () => boolean;
+	/** Given, files a command printed whole with `cat` count as read for read-before-edit, as after the read tool. */
+	harness?: ClaudeHarnessManager;
 }
 
 export type BashRenderState = {
@@ -663,10 +672,13 @@ export function createShellToolDefinition(
 	return {
 		name: config.name,
 		label: config.label,
-		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output longer than ${DEFAULT_MAX_LINES} lines or ${BASH_MAX_BYTES / 1024}KB keeps its first ${BASH_HEAD_LINES} lines and its end; the full output is then saved to a temp file. Colors and progress-bar redraws are removed. Optionally provide a timeout in seconds, after which the command is ended.${jobs && autoBackgroundSeconds > 0 ? ` A command still running after ${autoBackgroundSeconds} seconds goes on in the background as a job, and a message reports when it ends.` : ""}`,
+		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr; long output keeps its first ${BASH_HEAD_LINES} lines and its end, the full output is saved to a file. Optional timeout in seconds.${jobs && autoBackgroundSeconds > 0 ? ` Commands running over ${autoBackgroundSeconds} s continue in the background and report their end.` : ""}`,
 		promptSnippet: config.promptSnippet,
 		promptGuidelines: exposeSessionEnvironment && config.promptGuidelines ? [...config.promptGuidelines] : undefined,
 		parameters: bashSchema,
+		// A response's calls run in order when one of them changes files or runs a command: an edit and the command that
+		// tests it can come in one response (see the system prompt's rule), which saves a turn.
+		executionMode: "sequential",
 		outputSchema: bashOutputSchema,
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(
@@ -801,7 +813,13 @@ export function createShellToolDefinition(
 			}
 			if (options?.editToolActive?.() && process.env.PI_BASH_EDIT_GUARD !== "off") {
 				// From oh-my-pi's bash interceptor. In Pi's sessions, 65 of 2615 commands changed files this way.
-				const writes = fileWritesInCommand(command);
+				// Only files that exist: a new file has nothing to read first and no compiler errors to compare. (On a
+				// remote machine their existence is not known here: every such write is refused.)
+				const writes = fileWritesInCommand(command).filter(
+					(w) =>
+						options.operations !== undefined ||
+						existsSync(resolvePath(spawnContext.cwd, expandHome(w.dir), expandHome(w.target))),
+				);
 				if (writes.length > 0) throw new Error(fileWriteRefusal(writes));
 			}
 			// The command's own abort: the tool call's, until the command goes to the background.
@@ -926,6 +944,18 @@ export function createShellToolDefinition(
 						structuredContent,
 						isError: true,
 					};
+				}
+				if (options?.harness && !snapshot.truncation.truncated) {
+					// The model saw these files whole: editing or rewriting them needs no extra read.
+					const shown = filesShownByCat(command);
+					const base = resolvePath(spawnContext.cwd, shown.dir);
+					for (const file of shown.files) {
+						const path = resolvePath(base, file);
+						try {
+							const [content, info] = await Promise.all([readFileAsync(path, "utf-8"), statAsync(path)]);
+							options.harness.onFileRead(path, content, info.mtimeMs, spawnContext.cwd);
+						} catch {}
+					}
 				}
 				return { content: [{ type: "text", text: outputText }], details, structuredContent };
 			} finally {

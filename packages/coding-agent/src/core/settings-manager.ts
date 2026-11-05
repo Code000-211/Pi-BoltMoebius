@@ -97,11 +97,12 @@ function deepMergeObjects(base: Record<string, unknown>, overrides: Record<strin
 
 /** Tools enabled at startup when `defaultTools` does not change them. */
 /**
- * Pi's default tools; in Pi-Bolt, grep and find too (searching in-process: core/tools/native-search.ts), and wait for
- * background jobs.
+ * Pi's default tools, and in Pi-Bolt wait for background jobs. grep and find (searching in-process:
+ * core/tools/native-search.ts) are there to turn on: every request carries their schemas, about 400 tokens, and models
+ * search with rg in bash anyway (19 calls in 108 benchmark runs).
  */
 export const DEFAULT_TOOL_NAMES: readonly string[] =
-	PIBOLT !== undefined ? ["read", "bash", "edit", "write", "grep", "find", "wait"] : ["read", "bash", "edit", "write"];
+	PIBOLT !== undefined ? ["read", "bash", "edit", "write", "wait"] : ["read", "bash", "edit", "write"];
 
 /** FFF's extension (opensec-pi-fff, @ff-labs/pi-fff), by the path it is loaded from: it brings search tools of its own. */
 const FFF_EXTENSION = /(?:^builtin:|[\\/]node_modules[\\/])(?:opensec-pi-fff|@ff-labs[\\/]pi-fff)(?:[\\/]|$)/;

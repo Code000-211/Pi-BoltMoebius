@@ -15,10 +15,11 @@ export interface WaitToolOptions {
 }
 
 /**
- * How long one wait blocks with nothing ending, from oh-my-pi: each wait right after an empty one blocks longer, so the
- * agent gets its turn back early while a job warms up, and a wait loop backs off.
+ * How long one wait blocks with nothing ending; each wait right after an empty one blocks longer, so a wait loop backs
+ * off. oh-my-pi starts at 5 s to give the agent its turn back early, but an agent calls wait when it has nothing else to
+ * do: short waits only cost turns.
  */
-export const WAIT_LADDER_MS = [5_000, 10_000, 30_000, 60_000, 300_000] as const;
+export const WAIT_LADDER_MS = [120_000, 300_000, 600_000] as const;
 /** A wait this long after the last empty one starts again at the bottom of the ladder: the agent worked in between. */
 const WAIT_LADDER_RESET_MS = 60_000;
 
@@ -28,7 +29,7 @@ export const waitToolSystemPromptContribution = {
 } as const;
 
 const DESCRIPTION =
-	"Wait until one of your background jobs ends, and get its report (exit code, end of its output). Call it only when nothing else is left to do: a job's report also comes on its own as a message. Returns at once when no job runs.";
+	"Wait for one of your background jobs to end and get its report. Only when nothing else is left to do.";
 
 export function createWaitToolDefinition(
 	options?: WaitToolOptions,

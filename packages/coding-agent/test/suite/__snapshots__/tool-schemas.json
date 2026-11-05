@@ -25,7 +25,7 @@
   },
   {
     "name": "bash",
-    "description": "Execute a bash command in the current working directory. Returns stdout and stderr. Output longer than 2000 lines or 32KB keeps its first 40 lines and its end; the full output is then saved to a temp file. Colors and progress-bar redraws are removed. Optionally provide a timeout in seconds, after which the command is ended. A command still running after 60 seconds goes on in the background as a job, and a message reports when it ends.",
+    "description": "Execute a bash command in the current working directory. Returns stdout and stderr; long output keeps its first 40 lines and its end, the full output is saved to a file. Optional timeout in seconds. Commands running over 120 s continue in the background and report their end.",
     "parameters": {
       "type": "object",
       "required": [
@@ -42,14 +42,14 @@
         },
         "background": {
           "type": "boolean",
-          "description": "Start the command in the background right away: the call returns at once, and a message reports when it ends"
+          "description": "Start in the background at once; a message reports its end"
         }
       }
     }
   },
   {
     "name": "edit",
-    "description": "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
+    "description": "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes. A command that tests the edit can follow it in the same response: the calls run in order.",
     "parameters": {
       "type": "object",
       "required": [

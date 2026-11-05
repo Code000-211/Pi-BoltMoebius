@@ -3,13 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createBashTool } from "../src/core/tools/bash.ts";
-import { fileWritesInCommand } from "../src/core/tools/bash-file-writes.ts";
+import { filesShownByCat, fileWritesInCommand } from "../src/core/tools/bash-file-writes.ts";
 
 describe("commands that change files as edit and write would", () => {
 	it.each([
 		["sed -i 's/a/b/' src/x.ts", "src/x.ts", "sed -i"],
 		["perl -pi -e 's/a/b/' a.c", "a.c", "perl -i"],
-		["sed -i.bak -e 's/x/y/' /tmp/a /etc/hosts", "/etc/hosts", "sed -i"],
+		["sed -i -e 's/a/b/' -e 's/c/d/' src/x.ts", "src/x.ts", "sed -i"],
 		["cat > src/new.py <<'EOF'\nprint(1) > other\nEOF\necho done", "src/new.py", "a redirection"],
 		["cat <<EOF > notes.md\nhi\nEOF", "notes.md", "a redirection"],
 		["echo hello > README.md", "README.md", "a redirection"],
@@ -17,11 +17,15 @@ describe("commands that change files as edit and write would", () => {
 		["tee notes.txt <<EOF\nx\nEOF", "notes.txt", "tee"],
 		["cd src && echo a > b.txt", "b.txt", "a redirection"],
 	])("finds %j", (command, target, how) => {
-		expect(fileWritesInCommand(command)).toEqual([{ how, target }]);
+		expect(fileWritesInCommand(command).map(({ how, target }) => ({ how, target }))).toEqual([{ how, target }]);
 	});
 
 	it.each([
 		"cd x && sed -n '1,20p' src/x.ts",
+		"sed -i 's/legacy_hash(/stable_hash(/' src/mod_*.py",
+		"sed -i -e 's/a/b/' src/a.py src/b.py",
+		"grep -rl old src | xargs sed -i 's/old/new/'",
+		"sed -i.bak -e 's/x/y/' /tmp/a /etc/hosts",
 		"echo hello >> /tmp/x.log",
 		"cat >> NOTES.md <<EOF\nx\nEOF",
 		"tee -a log.txt <<EOF\nx\nEOF",
@@ -49,11 +53,22 @@ describe("commands that change files as edit and write would", () => {
 			);
 			expect(readFileSync(join(dir, "a.txt"), "utf-8")).toBe("old\n");
 			await bash.execute("w2", { command: "echo log >> a.txt" });
+			// A new file has nothing to check: it is written.
+			await bash.execute("w2b", { command: "cat > b.txt <<'EOF'\nnew file\nEOF" });
+			expect(readFileSync(join(dir, "b.txt"), "utf-8")).toBe("new file\n");
 			editActive = false;
 			await bash.execute("w3", { command: "sed -i 's/old/new/' a.txt" });
 			expect(readFileSync(join(dir, "a.txt"), "utf-8")).toBe("new\nlog\n");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("finds files a command prints whole with cat", () => {
+		expect(filesShownByCat("cat a.py b.py")).toEqual({ dir: "", files: ["a.py", "b.py"] });
+		expect(filesShownByCat("cd src && cat -n x.c")).toEqual({ dir: "src", files: ["x.c"] });
+		for (const partial of ["cat a.py | head", "cat a.py > b", "cat *.py", "cat $F", "head a.py", "cat a; rm b"]) {
+			expect(filesShownByCat(partial).files).toEqual([]);
 		}
 	});
 });

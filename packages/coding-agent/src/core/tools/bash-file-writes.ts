@@ -17,6 +17,8 @@ export interface FileWrite {
 	how: string;
 	/** The file, as written in the command. */
 	target: string;
+	/** The folder a leading `cd` moved to, which a relative target is in; "" for the command's own. */
+	dir: string;
 }
 
 interface Segment {
@@ -183,10 +185,22 @@ export function fileWritesInCommand(command: string): FileWrite[] {
 				const inPlace = args.some(
 					(a) => a === "--in-place" || a.startsWith("--in-place=") || /^-[a-zA-Z]*i/.test(a),
 				);
-				// The files are the last arguments that are not options or the script.
-				const files = args.filter((a) => !a.startsWith("-"));
-				const target = files.at(-1);
-				if (inPlace && target && files.length >= 2 && !scratch(target)) writes.push({ how: `${name} -i`, target });
+				// The script comes with -e or -f, or else as the first word that is not an option; the rest are files.
+				const positional: string[] = [];
+				let script = false;
+				for (let k = 0; k < args.length; k++) {
+					const a = args[k]!;
+					if (a === "-e" || a === "-f" || a === "--expression" || a === "--file" || /^-[a-zA-Z]*e$/.test(a)) {
+						script = true;
+						k++;
+					} else if (!a.startsWith("-")) positional.push(a);
+				}
+				const files = script ? positional : positional.slice(1);
+				// One file is what edit is for. The same replacement over many files (a glob, a list) is sed's job.
+				const target = files[0];
+				if (inPlace && files.length === 1 && target && !/[*?[]/.test(target) && !scratch(target)) {
+					writes.push({ how: `${name} -i`, target, dir });
+				}
 			}
 		}
 		// Text the command spells out: the pipeline starts with echo or printf, or with cat or tee reading a heredoc
@@ -202,15 +216,43 @@ export function fileWritesInCommand(command: string): FileWrite[] {
 		for (const segment of pipeline) {
 			const { name, args } = commandName(segment.words);
 			for (const target of segment.redirects) {
-				if (!scratch(target)) writes.push({ how: "a redirection", target });
+				if (!scratch(target)) writes.push({ how: "a redirection", target, dir });
 			}
 			if (name === "tee") {
 				for (const target of args.filter((a) => !a.startsWith("-"))) {
 					if (!scratch(target) && !args.includes("-a") && !args.includes("--append"))
-						writes.push({ how: "tee", target });
+						writes.push({ how: "tee", target, dir });
 				}
 			}
 		}
 	}
 	return writes;
+}
+
+/**
+ * Files a command prints whole with `cat` (`cat a.py b.py`, also after `cd dir &&`): the model has seen them as a read
+ * would show them. Paths as written, with the folder a leading `cd` moved to; empty for anything else (pipes,
+ * redirections, globs, variables, options other than -n).
+ */
+export function filesShownByCat(command: string): { dir: string; files: string[] } {
+	const none = { dir: "", files: [] };
+	if (/[|<>$`*?[\n]|\(|\)/.test(command)) return none;
+	let dir = "";
+	const files: string[] = [];
+	for (const pipeline of parse(command)) {
+		const segment = pipeline[0]!;
+		if (pipeline.length !== 1 || segment.redirects.length > 0 || segment.heredoc) return none;
+		const { name, args } = commandName(segment.words);
+		if (name === "cd" && args.length === 1 && files.length === 0) {
+			dir = args[0]!;
+			continue;
+		}
+		if (name !== "cat") return none;
+		for (const arg of args) {
+			if (arg === "-n") continue;
+			if (arg.startsWith("-")) return none;
+			files.push(arg);
+		}
+	}
+	return { dir, files };
 }

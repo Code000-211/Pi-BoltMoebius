@@ -202,10 +202,11 @@ describe("Claude Harness (Read-Before-Edit, Pre-Warming, Diagnostics Diffing & H
 		).rejects.toThrow(/File has been modified since it was last read/);
 	});
 
-	it("tells the model to read before editing, the same for every edit tool", () => {
+	it("gives every edit tool the same guidelines, enforced or not", () => {
 		const guidelines = (enforce: boolean) =>
 			createEditToolDefinition(testDir, { enforceReadBeforeEdit: enforce }).promptGuidelines ?? [];
-		expect(guidelines(true).some((line) => line.startsWith("An edit of a file not read in this session"))).toBe(true);
+		// No rule about reading first: a refusal says so when it happens, the prompt need not carry it every request.
+		expect(guidelines(true).some((line) => line.includes("not read in this session"))).toBe(false);
 		// An extension re-registering the tool must not change the system prompt.
 		expect(guidelines(false)).toEqual(guidelines(true));
 	});
