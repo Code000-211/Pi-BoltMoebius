@@ -25,7 +25,7 @@ ratio 0.69–0.92), with fewer turns (median 4 vs 5) and 20% lower cost. [Detail
 | [Commands](#job-hub) | A job hub (`alt+j`): every background job, its live output, stop with `x` | |
 | [Commands](#bash-output-and-speed) | Output keeps the first error *and* the summary; read-only commands start while the model still writes | |
 | [Remote](#working-on-another-machine) | `/remote host:folder`: read, edit, write and bash work there over ssh, with the same checks | one ssh login, then a round trip per call |
-| [Context](#context-and-compaction) | Compaction at 128k at most, old tool results shortened, summaries from the prompt cache | compaction input 54k → **8.4k** new tokens |
+| [Context](#context-and-compaction) | Compaction at 128k at most, old tool results shortened, summaries from the prompt cache and made ahead | compaction input 54k → **8.4k** new tokens; no stop at the threshold (14–95 s before) |
 | [Turns](#fewer-turns) | A listing of the project in the prompt, an edit and its test in one response, a smaller prompt than Pi's | median 4 turns vs 5–6 |
 | [Provider](#melious-provider) | Melious built in, with live context windows and prices | |
 
@@ -345,7 +345,14 @@ Not measured on a real host yet: checked with an ssh stand-in that runs the remo
   context; on a 1M window it used to wait until 900,000.
 - **Old tool results shortened.** Once the context passes 40,000 tokens, tool results older than the latest 8 with 2,000
   characters or more (or an image) go to the model as a one-line note; the session keeps them. The boundary moves in steps
-  of 8, so the prompt cache is rebuilt once per step (`toolResultPruning`).
+  of 8, so the prompt cache is rebuilt once per step (`toolResultPruning`). The compaction threshold is checked against
+  the request as it is sent: a step that takes the context back below the threshold does not compact (it did before).
+- **Summaries made ahead.** From 15% (at most 40,000 tokens) below the threshold, the summary is made in the
+  background while the agent works, and the compaction at the threshold takes it. Until it is ready the agent goes on
+  above the threshold, by at most half the threshold and half the way to the window's limit; only there does it stop
+  to wait. Before, the agent stood still for each summary: 14, 56, 60 and 95 s in four real sessions. A session that
+  ends between the start and the threshold has paid for a summary it did not use. Not when an extension makes or vets
+  compactions; `PI_COMPACTION_AHEAD=off` turns it off.
 - **Summaries from the prompt cache.** The compaction summary is asked for as a continuation of the session's own
   request, so the provider reads the conversation from its cache (as deepseek-harness does). Before, all 4 compactions in
   real sessions read nothing from the cache (26k to 508k input tokens, 14 to 95 s each).
@@ -422,6 +429,7 @@ Everything above is on by default.
 | `compaction.maxContextTokens` | Cap for the compaction threshold (default 128000) |
 | `toolResultPruning` | Shortening old tool results: `enabled`, `triggerTokens` (40000), `keepRecent` (8), `minChars` (2000) |
 | `PI_COMPACTION_CACHED_PREFIX=off` | Ask for compaction summaries as a standalone request |
+| `PI_COMPACTION_AHEAD=off` | Make the compaction summary at the threshold, with the agent waiting, instead of ahead |
 | `PI_BASH_AUTO_BACKGROUND=off` | Keep commands in the foreground unless the call asks for `background: true` |
 | `PI_BASH_SLEEP_GUARD=off` | Run fixed sleeps over 10 s |
 | `PI_EARLY_BASH=off` | Start read-only commands only after the model's message |

@@ -142,9 +142,12 @@ describe("compaction scaled with the context window", () => {
 	// The standalone summary request's caps; the request on the cached prefix is in agent-session-compaction.test.ts.
 	beforeAll(() => {
 		process.env.PI_COMPACTION_CACHED_PREFIX = "off";
+		// The thresholds themselves: a summary made ahead would let the agent go on above them.
+		process.env.PI_COMPACTION_AHEAD = "off";
 	});
 	afterAll(() => {
 		delete process.env.PI_COMPACTION_CACHED_PREFIX;
+		delete process.env.PI_COMPACTION_AHEAD;
 	});
 
 	const harnesses: Harness[] = [];
