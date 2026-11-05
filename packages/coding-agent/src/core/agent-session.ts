@@ -1102,8 +1102,10 @@ export class AgentSession {
 			const extensionContinue = await this._dispatchTurnEndBoundary(turn.message, turn.toolResults);
 			const previousDecision = await previousFinishTurn?.(turn, signal);
 			if (previousDecision?.action === "end") return previousDecision;
-			if (extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
-			if (await this._answerCutOffResponse(turn.message)) return { action: "continue" };
+			// Before the other reasons to go on: a run that goes on anyway (a queued time notice, an extension) still
+			// needs the notice and the lower thinking level, or the next response thinks to the limit again.
+			const cutOff = await this._answerCutOffResponse(turn.message);
+			if (cutOff || extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
 			return undefined;
 		};
 	}
@@ -1135,15 +1137,16 @@ export class AgentSession {
 		if (this._cutOffResponses >= MAX_CUT_OFF_NOTICES) return false;
 		// The next requests think one level less per such response, until one ends normally (_requestThinkingLevel).
 		this._cutOffResponses++;
-		await this.sendCustomMessage(
-			{
-				customType: CUT_OFF_MESSAGE_TYPE,
-				content:
-					"Your last response reached the output limit while you were still working it out, so nothing was done. Think in shorter steps: take the next concrete step now (a tool call, or write the result), and decide the rest from what it shows.",
-				display: true,
-			},
-			{ deliverAs: "steer" },
-		);
+		// Ahead of other queued messages (a time notice): steering goes one message a turn, and a notice one turn late
+		// lets the next response think to the limit again.
+		this.agent.steerFirst({
+			role: "custom",
+			customType: CUT_OFF_MESSAGE_TYPE,
+			content:
+				"Your last response reached the output limit while you were still working it out, so nothing was done. Think in shorter steps: take the next concrete step now (a tool call, or write the result), and decide the rest from what it shows.",
+			display: true,
+			timestamp: Date.now(),
+		});
 		return true;
 	}
 

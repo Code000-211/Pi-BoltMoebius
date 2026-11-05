@@ -58,6 +58,39 @@ describe("AgentSession responses cut off at the output limit", () => {
 		expect(levels).toEqual(["medium", "low", "minimal", "medium"]);
 	});
 
+	it("puts the notice ahead of a message already queued, such as a time notice", async () => {
+		const harness = await createHarness({ models: [{ id: "faux-1", reasoning: true, maxTokens: MAX_TOKENS }] });
+		harnesses.push(harness);
+		harness.session.setThinkingLevel("medium");
+		const seen: string[] = [];
+		const levels: Array<string | undefined> = [];
+		const step =
+			(message: ReturnType<typeof cutOff>, queueTimeNotice = false) =>
+			(
+				context: { messages: Array<{ role: string; customType?: string }> },
+				options: { reasoning?: string } | undefined,
+			) => {
+				levels.push(options?.reasoning);
+				seen.push(context.messages.at(-1)?.role ?? "");
+				if (queueTimeNotice) {
+					void harness.session.sendCustomMessage(
+						{ customType: "time-limit", content: "Time: half left.", display: true },
+						{ deliverAs: "steer" },
+					);
+				}
+				return message;
+			};
+		harness.setResponses([
+			step(cutOff(), true),
+			step(fauxAssistantMessage("x")),
+			step(fauxAssistantMessage("Done.")),
+		] as never);
+		await harness.session.prompt("solve it");
+		const customs = harness.session.messages.filter((m) => m.role === "custom").map((m) => m.customType);
+		expect(customs).toEqual([CUT_OFF_MESSAGE_TYPE, "time-limit"]);
+		expect(levels).toEqual(["medium", "low", "medium"]);
+	});
+
 	it("leaves a response cut off below the output limit to compact-and-retry", async () => {
 		const harness = await createHarness({ models: [{ id: "faux-1", maxTokens: MAX_TOKENS }] });
 		harnesses.push(harness);

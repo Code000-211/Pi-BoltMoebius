@@ -160,6 +160,10 @@ class PendingMessageQueue {
 		this.messages.push(message);
 	}
 
+	enqueueFirst(message: AgentMessage): void {
+		this.messages.unshift(message);
+	}
+
 	hasItems(): boolean {
 		return this.messages.length > 0;
 	}
@@ -312,6 +316,11 @@ export class Agent {
 	/** Queue a message to be injected after the current assistant turn finishes. */
 	steer(message: AgentMessage): void {
 		this.steeringQueue.enqueue(message);
+	}
+
+	/** Like {@link steer}, but ahead of the messages already queued: delivered first, also one at a time. */
+	steerFirst(message: AgentMessage): void {
+		this.steeringQueue.enqueueFirst(message);
 	}
 
 	/** Queue a message to run only after the agent would otherwise stop. */
