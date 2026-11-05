@@ -24,6 +24,7 @@ import type { BackgroundJobs } from "../background-jobs.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import type { ClaudeHarnessManager } from "../harness/index.ts";
 import { type FileWrite, filesShownByCat, fileWritesInCommand } from "./bash-file-writes.ts";
+import { selfKillPattern, selfKillRefusal } from "./bash-self-kill.ts";
 import { notifySearchExternalChange } from "./native-search.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
@@ -821,6 +822,11 @@ export function createShellToolDefinition(
 						existsSync(resolvePath(spawnContext.cwd, expandHome(w.dir), expandHome(w.target))),
 				);
 				if (writes.length > 0) throw new Error(fileWriteRefusal(writes));
+			}
+			// On this machine only: a remote pkill does not reach this process.
+			if (options?.operations === undefined) {
+				const pattern = selfKillPattern(command);
+				if (pattern !== undefined) throw new Error(selfKillRefusal(pattern));
 			}
 			// The command's own abort: the tool call's, until the command goes to the background.
 			const commandAbort = new AbortController();

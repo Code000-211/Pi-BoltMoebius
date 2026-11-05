@@ -41,15 +41,12 @@ describe("AgentSession responses cut off at the output limit", () => {
 		harnesses.push(harness);
 		harness.session.setThinkingLevel("medium");
 		const levels: Array<string | undefined> = [];
-		const recorded = (message: ReturnType<typeof cutOff>) => (_context: unknown, options: { reasoning?: string } | undefined) => {
-			levels.push(options?.reasoning);
-			return message;
-		};
-		harness.setResponses([
-			recorded(cutOff()),
-			recorded(cutOff()),
-			recorded(fauxAssistantMessage("Done.")),
-		] as never);
+		const recorded =
+			(message: ReturnType<typeof cutOff>) => (_context: unknown, options: { reasoning?: string } | undefined) => {
+				levels.push(options?.reasoning);
+				return message;
+			};
+		harness.setResponses([recorded(cutOff()), recorded(cutOff()), recorded(fauxAssistantMessage("Done."))] as never);
 		await harness.session.prompt("solve it");
 		harness.appendResponses([recorded(fauxAssistantMessage("Again."))] as never);
 		await harness.session.prompt("once more");

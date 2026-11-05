@@ -21,7 +21,7 @@ export interface FileWrite {
 	dir: string;
 }
 
-interface Segment {
+export interface Segment {
 	words: string[];
 	/** Targets of `>`, `>|`, `&>` (not of appends, `>>`, or fd duplications such as `2>&1`). */
 	redirects: string[];
@@ -29,7 +29,7 @@ interface Segment {
 }
 
 /** Splits a command into pipelines of segments, skipping heredoc bodies; quotes are removed from words. */
-function parse(command: string): Segment[][] {
+export function parse(command: string): Segment[][] {
 	const pipelines: Segment[][] = [];
 	let pipeline: Segment[] = [];
 	let segment: Segment = { words: [], redirects: [], heredoc: false };
@@ -145,7 +145,7 @@ function parse(command: string): Segment[][] {
 }
 
 /** The command's name: past variable assignments and wrappers that run the next word. */
-function commandName(words: string[]): { name: string; args: string[] } {
+export function commandName(words: string[]): { name: string; args: string[] } {
 	let i = 0;
 	while (
 		i < words.length &&
