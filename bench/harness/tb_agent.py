@@ -17,7 +17,6 @@ import json
 import shlex
 import subprocess
 import tempfile
-import tomllib
 from pathlib import Path
 
 from harbor.agents.installed.base import BaseInstalledAgent, with_prompt_template
@@ -36,12 +35,9 @@ class PiLightspeed(BaseInstalledAgent):
         harness_dir: str | None = None,
         extensions: str = "",
         models_json: str = "~/.pi/agent/models.json",
-        time_limit: str = "true",
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        # PI_TIME_LIMIT from the task's agent timeout (off: "false", to measure without it).
-        self._tell_time_limit = str(time_limit).lower() not in ("false", "0", "no", "off")
         if not harness_dir:
             raise ValueError("PiLightspeed needs --ak harness_dir=<folder of the Pi build>")
         self._harness_dir = Path(harness_dir).expanduser()
@@ -80,28 +76,16 @@ class PiLightspeed(BaseInstalledAgent):
             await self.exec_as_root(environment, f"mkdir -p {AGENT_DIR}")
             await environment.upload_file(models, f"{AGENT_DIR}/models.json")
 
-    @staticmethod
-    def _time_limit(environment: BaseEnvironment) -> float | None:
-        """The task's agent timeout from its task.toml (beside its environment folder), as the run is given it."""
-        try:
-            task = tomllib.loads((Path(environment.environment_dir).parent / "task.toml").read_text())
-            return float(task["agent"]["timeout_sec"])
-        except (OSError, KeyError, ValueError, TypeError):
-            return None
-
     @with_prompt_template
     async def run(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
         extension_args = "".join(f"-e {EXTENSIONS_DIR}/{e.name}/index.ts " for e in self._extensions)
-        limit = self._time_limit(environment) if self._tell_time_limit else None
-        # Less a little for starting up and the last request: the notices come a bit early rather than late.
-        time_env = f"PI_TIME_LIMIT={int(limit * 0.95)} " if limit else ""
         events = self.environment_logs_dir / "pi.jsonl"
         stderr = self.environment_logs_dir / "pi.stderr"
         try:
             await self.exec_as_agent(
                 environment,
                 command=(
-                    f"{time_env}PI_CODING_AGENT_DIR={AGENT_DIR} {HARNESS_DIR}/pi --mode json --no-session -ne -ns -np -nc "
+                    f"PI_CODING_AGENT_DIR={AGENT_DIR} {HARNESS_DIR}/pi --mode json --no-session -ne -ns -np -nc "
                     # `--`: an instruction may start with "-" (a task's list of steps).
                     f"--no-mcp {extension_args}--model {shlex.quote(self.model_name)} -- {shlex.quote(instruction)} "
                     f"</dev/null 2>{shlex.quote(str(stderr))} | grep --line-buffered -v '\"type\":\"message_update\"' "

@@ -169,7 +169,6 @@ import {
 	type NormalizedBuildSystemPromptOptions,
 	normalizeBuildSystemPromptOptions,
 } from "./system-prompt.ts";
-import { parseTimeLimit, TIME_LIMIT_MESSAGE_TYPE, TimeLimitClock, timeLimitSection } from "./time-limit.ts";
 import { type BashOperations, createBashToolDefinition, createLocalBashOperations } from "./tools/bash.ts";
 import { isReadOnlyCommand } from "./tools/bash-read-only.ts";
 import { createEditToolDefinition } from "./tools/edit.ts";
@@ -1096,7 +1095,7 @@ export class AgentSession {
 			const extensionContinue = await this._dispatchTurnEndBoundary(turn.message, turn.toolResults);
 			const previousDecision = await previousFinishTurn?.(turn, signal);
 			if (previousDecision?.action === "end") return previousDecision;
-			// Before the other reasons to go on: a run that goes on anyway (a queued time notice, an extension) still
+			// Before the other reasons to go on: a run that goes on anyway (a queued job report, an extension) still
 			// needs the notice and the lower thinking level, or the next response thinks to the limit again.
 			const cutOff = await this._answerCutOffResponse(turn.message);
 			if (cutOff || extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
@@ -1131,7 +1130,7 @@ export class AgentSession {
 		if (this._cutOffResponses >= MAX_CUT_OFF_NOTICES) return false;
 		// The next requests think one level less per such response, until one ends normally (_requestThinkingLevel).
 		this._cutOffResponses++;
-		// Ahead of other queued messages (a time notice): steering goes one message a turn, and a notice one turn late
+		// Ahead of other queued messages (a job report): steering goes one message a turn, and a notice one turn late
 		// lets the next response think to the limit again.
 		this.agent.steerFirst({
 			role: "custom",
@@ -1686,7 +1685,6 @@ export class AgentSession {
 	 */
 	dispose(): void {
 		clearTimeout(this._jobReportTimer);
-		this._timeLimit?.stop();
 		this._remote?.ssh.close();
 		this._remote?.harness.dispose();
 		this._unsubscribeJobs();
@@ -2023,10 +2021,9 @@ export class AgentSession {
 				? {
 						remote: `read, edit, write and bash work on the machine ${remote.target.host} over ssh, in ${remote.dir}: paths are that machine's. grep, find and ls are off (they search this machine): search there with rg or find in bash. Edits there get no compiler diagnostics. Project context files and skills above are this machine's.`,
 					}
-				: {
-						...(project ? { project: project.text } : {}),
-						...(this._timeLimit ? { time_limit: timeLimitSection(this._timeLimit.limitMs) } : {}),
-					},
+				: project
+					? { project: project.text }
+					: undefined,
 			skills: loadedSkills,
 			contextFiles: loadedContextFiles,
 			customPrompt: loaderSystemPrompt,
@@ -2387,7 +2384,6 @@ export class AgentSession {
 			this._deferredSettledActions.push(async () => await this.prompt(text, options));
 			return;
 		}
-		this._timeLimit?.start();
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		// Handle extension commands first (execute immediately, even during streaming)
@@ -2692,19 +2688,6 @@ export class AgentSession {
 	private _askSecret: AskSecret | undefined;
 	/** The working folder's files (and small ones' contents) for the system prompt: taken once, so the prompt stays put. */
 	private _projectSnapshot: ProjectSnapshot | null | undefined;
-	/** With `PI_TIME_LIMIT`: started by the first prompt, it tells a running turn how much time is left. */
-	private _timeLimit = (() => {
-		const limitMs = parseTimeLimit(process.env.PI_TIME_LIMIT);
-		if (limitMs === undefined) return undefined;
-		return new TimeLimitClock(limitMs, (text) => {
-			// Between runs there is nothing to tell: the model sees no time pass.
-			if (!this.isStreaming) return;
-			this.sendCustomMessage(
-				{ customType: TIME_LIMIT_MESSAGE_TYPE, content: text, display: true },
-				{ deliverAs: "steer" },
-			).catch(() => {});
-		});
-	})();
 
 	private _getProjectSnapshot(): ProjectSnapshot | undefined {
 		if (this._projectSnapshot === undefined) {

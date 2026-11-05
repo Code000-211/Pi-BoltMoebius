@@ -58,23 +58,23 @@ describe("AgentSession responses cut off at the output limit", () => {
 		expect(levels).toEqual(["medium", "low", "minimal", "medium"]);
 	});
 
-	it("puts the notice ahead of a message already queued, such as a time notice", async () => {
+	it("puts the notice ahead of a message already queued, such as a job report", async () => {
 		const harness = await createHarness({ models: [{ id: "faux-1", reasoning: true, maxTokens: MAX_TOKENS }] });
 		harnesses.push(harness);
 		harness.session.setThinkingLevel("medium");
 		const seen: string[] = [];
 		const levels: Array<string | undefined> = [];
 		const step =
-			(message: ReturnType<typeof cutOff>, queueTimeNotice = false) =>
+			(message: ReturnType<typeof cutOff>, queueJobReport = false) =>
 			(
 				context: { messages: Array<{ role: string; customType?: string }> },
 				options: { reasoning?: string } | undefined,
 			) => {
 				levels.push(options?.reasoning);
 				seen.push(context.messages.at(-1)?.role ?? "");
-				if (queueTimeNotice) {
+				if (queueJobReport) {
 					void harness.session.sendCustomMessage(
-						{ customType: "time-limit", content: "Time: half left.", display: true },
+						{ customType: "background-job", content: "Background job bg1 ended.", display: true },
 						{ deliverAs: "steer" },
 					);
 				}
@@ -87,7 +87,7 @@ describe("AgentSession responses cut off at the output limit", () => {
 		] as never);
 		await harness.session.prompt("solve it");
 		const customs = harness.session.messages.filter((m) => m.role === "custom").map((m) => m.customType);
-		expect(customs).toEqual([CUT_OFF_MESSAGE_TYPE, "time-limit"]);
+		expect(customs).toEqual([CUT_OFF_MESSAGE_TYPE, "background-job"]);
 		expect(levels).toEqual(["medium", "low", "medium"]);
 	});
 
