@@ -3,8 +3,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import { CUT_OFF_MESSAGE_TYPE } from "../../src/core/agent-session.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
-function cutOff() {
-	return fauxAssistantMessage([fauxThinking("Let me consider every case before acting...")], { stopReason: "length" });
+/** The faux model's output limit: the faux provider counts about four characters a token. */
+const MAX_TOKENS = 100;
+
+/** A response of thinking only, cut off at the output limit (or, `short`, below it: the context ran out). */
+function cutOff(short = false) {
+	const thinking = short ? "Let me think." : "Let me consider every case before acting. ".repeat(12);
+	return fauxAssistantMessage([fauxThinking(thinking)], { stopReason: "length" });
 }
 
 function notices(harness: Harness): number {
@@ -18,7 +23,7 @@ describe("AgentSession responses cut off at the output limit", () => {
 	});
 
 	it("tells the model and goes on instead of ending the run", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({ models: [{ id: "faux-1", maxTokens: MAX_TOKENS }] });
 		harnesses.push(harness);
 		harness.setResponses([cutOff(), fauxAssistantMessage("Done.")]);
 		await harness.session.prompt("solve it");
@@ -28,7 +33,7 @@ describe("AgentSession responses cut off at the output limit", () => {
 	});
 
 	it("ends the run after three such responses in a row", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({ models: [{ id: "faux-1", maxTokens: MAX_TOKENS }] });
 		harnesses.push(harness);
 		harness.setResponses([cutOff(), cutOff(), cutOff(), cutOff(), fauxAssistantMessage("never reached")]);
 		await harness.session.prompt("solve it");
@@ -37,7 +42,7 @@ describe("AgentSession responses cut off at the output limit", () => {
 	});
 
 	it("thinks one level less after each cut-off response, and as before once one ends normally", async () => {
-		const harness = await createHarness({ models: [{ id: "faux-1", reasoning: true }] });
+		const harness = await createHarness({ models: [{ id: "faux-1", reasoning: true, maxTokens: MAX_TOKENS }] });
 		harnesses.push(harness);
 		harness.session.setThinkingLevel("medium");
 		const levels: Array<string | undefined> = [];
@@ -53,8 +58,16 @@ describe("AgentSession responses cut off at the output limit", () => {
 		expect(levels).toEqual(["medium", "low", "minimal", "medium"]);
 	});
 
+	it("leaves a response cut off below the output limit to compact-and-retry", async () => {
+		const harness = await createHarness({ models: [{ id: "faux-1", maxTokens: MAX_TOKENS }] });
+		harnesses.push(harness);
+		harness.setResponses([cutOff(true), fauxAssistantMessage("Done.")]);
+		await harness.session.prompt("solve it");
+		expect(notices(harness)).toBe(0);
+	});
+
 	it("leaves a response that ends normally alone", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({ models: [{ id: "faux-1", maxTokens: MAX_TOKENS }] });
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("Done.")]);
 		await harness.session.prompt("solve it");

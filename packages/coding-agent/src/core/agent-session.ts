@@ -169,7 +169,13 @@ import {
 	type NormalizedBuildSystemPromptOptions,
 	normalizeBuildSystemPromptOptions,
 } from "./system-prompt.ts";
-import { parseTimeLimit, TIME_LIMIT_MESSAGE_TYPE, TimeLimitClock, timeLimitSection } from "./time-limit.ts";
+import {
+	maxOutputTokens,
+	parseTimeLimit,
+	TIME_LIMIT_MESSAGE_TYPE,
+	TimeLimitClock,
+	timeLimitSection,
+} from "./time-limit.ts";
 import { type BashOperations, createBashToolDefinition, createLocalBashOperations } from "./tools/bash.ts";
 import { isReadOnlyCommand } from "./tools/bash-read-only.ts";
 import { createEditToolDefinition } from "./tools/edit.ts";
@@ -1121,7 +1127,11 @@ export class AgentSession {
 			this._cutOffResponses = 0;
 			return false;
 		}
-		if (message.content.some((c) => c.type === "toolCall")) return false;
+		// Only a response that did nothing but think: one cut off in its answer text ends as before (Pi's behaviour).
+		if (message.content.some((c) => c.type === "toolCall" || (c.type === "text" && c.text.trim()))) return false;
+		// Cut off below the output limit: the context ran out, which compact-and-retry handles (_checkCompaction).
+		const model = this.agent.state.model;
+		if (model && isRecoverableLength(message, maxOutputTokens(model.maxTokens))) return false;
 		if (this._cutOffResponses >= MAX_CUT_OFF_NOTICES) return false;
 		// The next requests think one level less per such response, until one ends normally (_requestThinkingLevel).
 		this._cutOffResponses++;
@@ -3623,7 +3633,9 @@ export class AgentSession {
 			((explicitOverflow && assistantRetainedForExplicitRecovery) ||
 				(assistantUsageMatchesProjection && isContextOverflow(assistantMessage, contextWindow)));
 		const recoverableLength =
-			sameModel && assistantIsProjected && isRecoverableLength(assistantMessage, messageModel.maxTokens);
+			sameModel &&
+			assistantIsProjected &&
+			isRecoverableLength(assistantMessage, maxOutputTokens(messageModel.maxTokens));
 		if (contextOverflow || recoverableLength) {
 			const willRetry = assistantMessage.stopReason !== "stop";
 

@@ -15,6 +15,16 @@ export const TIME_LIMIT_MESSAGE_TYPE = "time-limit";
  */
 export const TIME_LIMIT_MAX_OUTPUT_TOKENS = 32_768;
 
+/**
+ * The output limit a response gets: the model's (`modelMax`), and with `PI_TIME_LIMIT` at most
+ * {@link TIME_LIMIT_MAX_OUTPUT_TOKENS}. A response cut off below it ran out of context (compact-and-retry); one that
+ * reached it was cut off by this limit (the agent session's notice).
+ */
+export function maxOutputTokens(modelMax: number): number {
+	if (parseTimeLimit(process.env.PI_TIME_LIMIT) === undefined) return modelMax;
+	return Math.min(modelMax || TIME_LIMIT_MAX_OUTPUT_TOKENS, TIME_LIMIT_MAX_OUTPUT_TOKENS);
+}
+
 /** When the model is told, as a share of the limit. */
 const NOTICE_AT = [0.5, 0.75, 0.9] as const;
 
