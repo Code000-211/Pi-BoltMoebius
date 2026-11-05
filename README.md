@@ -272,16 +272,21 @@ a way to wait that ends exactly when the job does (as [oh-my-pi](https://github.
 
 - **Automatic background.** A command still running after 120 s goes on in the background as a job (`bg1`, `bg2`, …);
   `background: true` starts it there right away. The call returns the output so far, the pid and the output file. A
-  `timeout` still ends the command, in the background too.
+  command still running at its `timeout` goes there too instead of being ended: in Terminal-Bench, 7 of 8 timeouts had
+  ended a loop waiting for a build (915 s of waiting lost), and in Pi's sessions 16 had ended builds and runs after 7
+  minutes on average. Only a command started with `background: true` is ended by its timeout (and any command where
+  background jobs are off).
 - **The agent is woken.** When a job ends, the agent gets its exit code and the last 2 KB of its output: before its next
   request while it works, or as a new turn when it is idle. Jobs that end within 1.5 s come in one report.
 - **`wait` tool.** Blocks until one of the session's jobs ends and returns its report; with nothing running it returns
   at once. It blocks up to 2 min, then 5 and 10 (oh-my-pi starts at 5 s, which only cost turns), and from the second empty one on tells the model to do other
   work. A message from the user ends a wait.
-- **No fixed sleeps.** A command that sleeps more than 10 s outside a loop is not run; the error tells the model to call
-  `wait`, or to loop on the condition itself (`until curl -sf …; do sleep 2; done`, also over ssh for a job on another
-  machine). Short sleeps, sleeps inside a loop and commands started in the background run. Of the 97 real `sleep` calls,
-  it would have refused 28.
+- **Sleeps that end with the job.** A command that starts with a sleep of more than 10 s (`sleep 45; tail build.log`)
+  while jobs run: Pi sleeps for it, stops early when a job ends, and then runs the rest. Before, such a command was
+  refused, which cost a turn 22 times in 230 Terminal-Bench runs, after which the model looked at once and again later.
+- **No long fixed sleeps.** A command that sleeps longer than a command runs before it goes to the background (120 s)
+  outside a loop is not run; the error tells the model to call `wait`, or to loop on the condition itself
+  (`until curl -sf …; do sleep 2; done`, also over ssh for a job on another machine).
 - Jobs end with Pi and never keep `pi -p` running; `pi -p` waits for running jobs and gives their reports a turn first.
 
 Not measured yet: how much time this saves with real models.
@@ -431,7 +436,7 @@ Everything above is on by default.
 | `PI_COMPACTION_CACHED_PREFIX=off` | Ask for compaction summaries as a standalone request |
 | `PI_COMPACTION_AHEAD=off` | Make the compaction summary at the threshold, with the agent waiting, instead of ahead |
 | `PI_BASH_AUTO_BACKGROUND=off` | Keep commands in the foreground unless the call asks for `background: true` |
-| `PI_BASH_SLEEP_GUARD=off` | Run fixed sleeps over 10 s |
+| `PI_BASH_SLEEP_GUARD=off` | Run fixed sleeps over 120 s, and leave sleeps that start a command to the shell |
 | `PI_EARLY_BASH=off` | Start read-only commands only after the model's message |
 | `PI_BASH_EDIT_GUARD=off` | Run `sed -i` and text redirected into files |
 | `PI_PROJECT_SNAPSHOT=full` / `off` | The project listing with small files' contents / none |

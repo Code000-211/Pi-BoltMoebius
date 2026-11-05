@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { type BackgroundJob, BackgroundJobs, formatJobReport } from "../src/core/background-jobs.ts";
-import { createBashTool, fixedSleepSeconds } from "../src/core/tools/bash.ts";
+import { createBashTool, fixedSleepSeconds, leadingSleep } from "../src/core/tools/bash.ts";
 import { createWaitTool, WAIT_LADDER_MS } from "../src/core/tools/wait.ts";
 
 function getText(result: { content?: Array<{ type: string; text?: string }> }): string {
@@ -77,19 +77,30 @@ describe("background jobs", () => {
 		expect(await ended(jobs, "bg1")).toMatchObject({ status: "done", tail: "late\n" });
 	});
 
-	it("keeps a command in the foreground when its timeout comes before the time to background it", async () => {
+	it("moves a command to the background at its timeout, instead of ending it", async () => {
 		const jobs = new BackgroundJobs();
 		const bash = createBashTool(dir, { backgroundJobs: jobs, autoBackgroundSeconds: 5 });
-		await expect(bash.execute("bg-3", { command: "sleep 3", timeout: 0.2 })).rejects.toThrow(
-			"Command timed out after 0.2 seconds",
+		const start = performance.now();
+		const result = await bash.execute("bg-3", { command: "echo waiting; sleep 0.6; echo built", timeout: 0.2 });
+		expect(performance.now() - start).toBeLessThan(500);
+		expect(getText(result)).toContain(
+			"Command still running at its timeout of 0.2 seconds: moved to the background as job bg1",
 		);
-		expect(jobs.list()).toEqual([]);
+		expect(getText(result)).not.toContain("still ends it");
+		expect(await ended(jobs, "bg1")).toMatchObject({ status: "done", exitCode: 0, tail: "waiting\nbuilt\n" });
 	});
 
-	it("ends a background job at its timeout, and as killed when stopped", async () => {
+	it("ends at its timeout a command without background jobs", async () => {
+		const bash = createBashTool(dir);
+		await expect(bash.execute("bg-3b", { command: "sleep 3", timeout: 0.2 })).rejects.toThrow(
+			"Command timed out after 0.2 seconds",
+		);
+	});
+
+	it("ends a job started in the background at its timeout, and as killed when stopped", async () => {
 		const jobs = new BackgroundJobs();
 		const bash = createBashTool(dir, { backgroundJobs: jobs, autoBackgroundSeconds: 0.1 });
-		const timed = await bash.execute("bg-4", { command: "sleep 5", timeout: 0.6 });
+		const timed = await bash.execute("bg-4", { command: "sleep 5", timeout: 0.6, background: true });
 		expect(getText(timed)).toContain("its timeout of 0.6 seconds still ends it");
 		await bash.execute("bg-5", { command: "sleep 5", background: true });
 		expect(jobs.kill("bg2")).toBe(true);
@@ -209,14 +220,41 @@ describe("fixed sleeps", () => {
 		expect(fixedSleepSeconds("time.sleep(30)")).toBe(0);
 	});
 
-	it("does not run a command that sleeps a fixed time longer than 10 s, unless in the background", async () => {
+	it("finds a sleep the command starts with", () => {
+		expect(leadingSleep("sleep 45; tail -5 build.log")).toEqual({ seconds: 45, rest: "tail -5 build.log" });
+		expect(leadingSleep("  sleep 2m && make")).toEqual({ seconds: 120, rest: "make" });
+		expect(leadingSleep("sleep 20\nls")).toEqual({ seconds: 20, rest: "ls" });
+		expect(leadingSleep("sleep 30")).toEqual({ seconds: 30, rest: "" });
+		expect(leadingSleep("sleep 30 & echo started")).toBeUndefined();
+		expect(leadingSleep("cd x; sleep 30; ls")).toBeUndefined();
+	});
+
+	it("sleeps for a command that looks at a job after a while, and stops when a job ends", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "pi-sleep-"));
 		try {
 			const jobs = new BackgroundJobs();
+			const job = fakeJob(jobs, "make");
 			const bash = createBashTool(dir, { backgroundJobs: jobs });
+			setTimeout(() => job.end("done", 0, ""), 200);
+			const start = performance.now();
+			const result = await bash.execute("s0", { command: "sleep 45; echo looked" });
+			expect(performance.now() - start).toBeLessThan(2000);
+			expect(getText(result)).toMatch(
+				/^\[The sleep of 45 s ended after 0\.\d s: a background job ended\.\]\nlooked\n$/,
+			);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not run a command that sleeps longer than a command runs before it goes to the background", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-sleep-"));
+		try {
+			const jobs = new BackgroundJobs();
+			const bash = createBashTool(dir, { backgroundJobs: jobs, autoBackgroundSeconds: 20 });
 			const start = performance.now();
 			await expect(bash.execute("s1", { command: "sleep 30; echo checked" })).rejects.toThrow(
-				/^Not run: the command sleeps 30 seconds, a fixed time\. To wait for a background job, call wait/,
+				/^Not run: the command sleeps 30 seconds, a fixed time longer than a command runs before it goes to the background \(20 s\)\. To wait for a background job, call wait/,
 			);
 			expect(performance.now() - start).toBeLessThan(500);
 			expect(getText(await bash.execute("s2", { command: "sleep 0.1; echo short" }))).toBe("short\n");

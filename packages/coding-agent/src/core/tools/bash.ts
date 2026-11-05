@@ -55,7 +55,12 @@ function resolveTimeoutMs(timeout: number | undefined): number | undefined {
 
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Shell command to execute" }),
-	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+	timeout: Type.Optional(
+		Type.Number({
+			description:
+				"Seconds to wait for the command (optional, no default). Where background jobs are, a command still running then goes on in the background and reports its end; otherwise it is ended",
+		}),
+	),
 	background: Type.Optional(
 		Type.Boolean({
 			description: "Start in the background at once; a message reports its end",
@@ -161,8 +166,10 @@ function untilBackground<T>(running: Promise<T>, ms: number): Promise<T | typeof
 export const DEFAULT_AUTO_BACKGROUND_SECONDS = 120;
 
 /**
- * After how many ms a call's command goes to the background: 0 when asked, undefined when it never does (no jobs, turned
- * off, or a timeout that ends it first).
+ * After how many ms a call's command goes to the background: 0 when asked, undefined when it never does (no jobs, or
+ * turned off). A timeout before the time to background it moves it then, rather than ending it: in Terminal-Bench 7 of
+ * 8 timeouts ended a loop waiting for a build (915 s of waiting lost), and in Pi's sessions 16 timeouts ended builds and
+ * runs after 7 minutes on average.
  */
 function backgroundAfterMs(
 	jobs: BackgroundJobs | undefined,
@@ -173,13 +180,50 @@ function backgroundAfterMs(
 	if (!jobs) return undefined;
 	if (background) return 0;
 	if (process.env.PI_BASH_AUTO_BACKGROUND === "off" || autoBackgroundSeconds <= 0) return undefined;
-	if (timeout !== undefined && timeout > 0 && timeout <= autoBackgroundSeconds) return undefined;
-	return autoBackgroundSeconds * 1000;
+	return (
+		(timeout !== undefined && timeout > 0 ? Math.min(timeout, autoBackgroundSeconds) : autoBackgroundSeconds) * 1000
+	);
 }
 
-/** A fixed `sleep` up to this long runs: waiting a moment for a server or a file is fine. */
+/** A fixed `sleep` up to this long runs as it is: waiting a moment for a server or a file is fine. */
 export const MAX_FIXED_SLEEP_SECONDS = 10;
 const SLEEP_UNIT_SECONDS: Record<string, number> = { "": 1, s: 1, m: 60, h: 3600, d: 86400 };
+
+/** A command that starts with a fixed `sleep`: its seconds and the rest of the command (maybe empty). */
+export function leadingSleep(command: string): { seconds: number; rest: string } | undefined {
+	const match = /^\s*sleep\s+(\d+(?:\.\d+)?)([smhd]?)[ \t]*(?:;|&&|\n|$)([\s\S]*)$/.exec(command);
+	if (!match) return undefined;
+	return { seconds: Number(match[1]) * SLEEP_UNIT_SECONDS[match[2]!]!, rest: match[3]!.trim() };
+}
+
+/**
+ * Sleeps up to `ms`, and less when a background job ends (or one ended that was not reported yet): what a fixed sleep
+ * before looking at a job's progress waits for. Returns the ms slept, and whether a job ended.
+ */
+async function sleepUntilJobEnds(
+	jobs: BackgroundJobs,
+	ms: number,
+	signal: AbortSignal | undefined,
+): Promise<{ sleptMs: number; jobEnded: boolean }> {
+	const start = performance.now();
+	if (jobs.hasUnreported()) return { sleptMs: 0, jobEnded: true };
+	const jobEnded = await new Promise<boolean>((resolve) => {
+		const timer = setTimeout(() => done(false), ms);
+		const unsubscribe = jobs.subscribe((event) => {
+			if (event.type === "end") done(true);
+		});
+		const onAbort = () => done(false);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		function done(ended: boolean) {
+			clearTimeout(timer);
+			unsubscribe();
+			signal?.removeEventListener("abort", onAbort);
+			resolve(ended);
+		}
+	});
+	if (signal?.aborted) throw new Error("Command aborted");
+	return { sleptMs: performance.now() - start, jobEnded };
+}
 
 /**
  * The longest fixed `sleep` in a command, in seconds, outside a loop (a loop waits on a condition, which is what to do);
@@ -200,12 +244,12 @@ export function fixedSleepSeconds(command: string): number {
 }
 
 /** Why a command with a long fixed sleep was not run, and what to do instead. */
-function fixedSleepRefusal(seconds: number): string {
+function fixedSleepRefusal(seconds: number, autoBackgroundSeconds: number): string {
 	return (
-		`Not run: the command sleeps ${seconds} seconds, a fixed time. To wait for a background job, call wait: it returns when the job ends. ` +
+		`Not run: the command sleeps ${seconds} seconds, a fixed time longer than a command runs before it goes to the background (${autoBackgroundSeconds} s). To wait for a background job, call wait: it returns when the job ends. ` +
 		"To wait for something else, wait for the thing itself in a loop, such as `until curl -sf localhost:8000; do sleep 2; done`, " +
 		"or `until ssh host 'grep -q EXIT build.log'; do sleep 10; done` for a job on another machine: the loop ends as soon as the condition holds, " +
-		`and goes on in the background after a minute. A sleep of up to ${MAX_FIXED_SLEEP_SECONDS} seconds runs.`
+		"and goes on in the background after a while."
 	);
 }
 
@@ -744,6 +788,20 @@ export function createShellToolDefinition(
 			onUpdate?,
 			ctx?: ExtensionContext,
 		) {
+			// A command that sleeps a while before looking at a job's progress: Pi sleeps for it, and stops when a job ends.
+			// Refusing it, as before, cost a turn 22 times in 230 Terminal-Bench runs, after which the model looked at once
+			// and again later.
+			let sleptNote = "";
+			if (jobs && !background && jobs.running().length > 0 && process.env.PI_BASH_SLEEP_GUARD !== "off") {
+				const sleep = leadingSleep(command);
+				if (sleep && sleep.seconds > MAX_FIXED_SLEEP_SECONDS && sleep.seconds <= autoBackgroundSeconds) {
+					const { sleptMs, jobEnded } = await sleepUntilJobEnds(jobs, sleep.seconds * 1000, signal);
+					if (jobEnded) {
+						sleptNote = `[The sleep of ${sleep.seconds} s ended after ${(sleptMs / 1000).toFixed(1)} s: a background job ended.]\n`;
+					}
+					command = sleep.rest || "true";
+				}
+			}
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
 			const spawnContext = resolveSpawnContext(
 				resolvedCommand,
@@ -805,6 +863,7 @@ export function createShellToolDefinition(
 			if (onUpdate) {
 				onUpdate({ content: [], details: undefined });
 			}
+			if (sleptNote) output.append(Buffer.from(sleptNote));
 
 			const handleData = (data: Buffer) => {
 				if (!acceptingOutput) return;
@@ -864,8 +923,10 @@ export function createShellToolDefinition(
 			const backgroundAfter = backgroundAfterMs(jobs, background, timeout, autoBackgroundSeconds);
 			if (jobs && !background && process.env.PI_BASH_SLEEP_GUARD !== "off") {
 				const sleep = fixedSleepSeconds(command);
-				// From oh-my-pi's "NEVER poll". Of the 97 sleep calls in Pi's sessions, 28 slept more than 10 s outside a loop.
-				if (sleep > MAX_FIXED_SLEEP_SECONDS) throw new Error(fixedSleepRefusal(sleep));
+				// From oh-my-pi's "NEVER poll": a sleep that would only go on in the background.
+				if (sleep > Math.max(MAX_FIXED_SLEEP_SECONDS, autoBackgroundSeconds)) {
+					throw new Error(fixedSleepRefusal(sleep, autoBackgroundSeconds));
+				}
 			}
 			/** Existing files the command changes as edit and write would, with their content before it ran. */
 			const watched: WatchedFile[] = [];
@@ -913,7 +974,8 @@ export function createShellToolDefinition(
 					const running = ops.exec(spawnContext.command, spawnContext.cwd, {
 						onData: handleData,
 						signal: backgroundAfter !== undefined ? commandAbort.signal : signal,
-						timeout,
+						// A command the call starts in the background keeps its timeout; another one goes there at it.
+						timeout: backgroundAfter === undefined || background ? timeout : undefined,
 						env: spawnContext.env,
 						onSpawn: (child) => {
 							spawned = child;
@@ -963,16 +1025,19 @@ export function createShellToolDefinition(
 						const stop = pid
 							? ` (pid ${pid}; stop it with: ${process.platform === "win32" ? `taskkill /T /F /PID ${pid}` : `kill -- -${pid}`})`
 							: "";
+						const atTimeout = !background && timeout !== undefined && backgroundAfter === timeout * 1000;
 						const status = background
 							? `Started in the background as job ${id}${stop}.`
-							: `Command still running after ${backgroundAfter! / 1000} seconds: moved to the background as job ${id}${stop}.`;
+							: atTimeout
+								? `Command still running at its timeout of ${timeout} seconds: moved to the background as job ${id}${stop}, not stopped.`
+								: `Command still running after ${backgroundAfter! / 1000} seconds: moved to the background as job ${id}${stop}.`;
 						return {
 							content: [
 								{
 									type: "text",
 									text: appendStatus(
 										text,
-										`${status} Its output goes ${background ? "" : "on "}into ${file ?? "memory"}${timeout ? `; its timeout of ${timeout} seconds still ends it` : ""}. ` +
+										`${status} Its output goes ${background ? "" : "on "}into ${file ?? "memory"}${background && timeout ? `; its timeout of ${timeout} seconds still ends it` : ""}. ` +
 											"A message reports when it ends, with its exit code and the end of its output: go on with other work, and call wait only when nothing else is left.",
 									),
 								},
