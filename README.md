@@ -17,7 +17,7 @@ ratio 0.69–0.92), with fewer turns (median 4 vs 5) and 20% lower cost. [Detail
 |---|---|---|
 | [Search](#finding-code) | `grep`/`find` keep the file tree and contents in memory and match with SIMD | `grep` 1.7–6× faster, `find` 7.5× (p50) |
 | [Search](#project_search) | `project_search`: code and docs search that finds a function's definition first | definition first 55% → **83%**; doc answer in top 3 40% → **83%** |
-| [Editing](#compiler-diagnostics-after-every-edit) | The compiler's new errors come back with every `edit`/`write` (C, C++, HIP, Rust) | Rust edit without errors 401 → **104 ms** |
+| [Editing](#compiler-diagnostics-after-every-edit) | The compiler's new errors after every `edit`/`write`: C/C++/HIP in the edit, nine more languages in the background with no wait | Rust type error on Moebius: reported in **3 s** (rust-analyzer: none in 84 s) |
 | [Editing](#fewer-refused-edits) | An exact edit applies even to a file seen only through bash | 21% of real edits were refused before |
 | [Editing](#edit-matching) | Edits that miss by indentation still apply; a miss shows the closest lines | |
 | [Editing](#no-edits-behind-the-edit-tools-back) | `sed -i` and text redirected into files are sent to `edit`/`write`, which check what they change | 65 of 2,615 real commands |
@@ -153,7 +153,7 @@ answer.</sub>
 
 ### Compiler diagnostics after every edit
 
-After `edit` or `write` on C, C++, HIP or Rust, the tool result lists the compiler diagnostics **the edit introduced**, as
+After `edit` or `write` on C, C++ or HIP, the tool result lists the compiler diagnostics **the edit introduced**, as
 a `<new-diagnostics>` block. Errors that were there before are left out: they are collected in the background when the
 file is read. The model sees its mistake in the same step instead of at the next build.
 
@@ -162,10 +162,30 @@ file is read. The model sees its mistake in the same step instead of at the next
   from the folder next to the library it loaded. Flags come from `compile_commands.json` in the
   project or up to 5 parent folders (also `build/`, `out/`, `cmake-build-*`). A header is checked inside a source that
   includes it, also through `-I` folders.
-- **Rust**: rust-analyzer with cargo check on save. The wait ends when the check of the saved file ends. Measured on a
-  400-function crate: an edit without errors 401 → **104 ms**. cargo check runs in `target/rust-analyzer`, so it does not
-  hold the lock of the agent's own `cargo build` and `cargo test`.
 - Without these tools the edit goes through as before, with no diagnostics.
+
+#### Background checks
+
+Other languages are checked after the edit, in the background: `edit` and `write` (and a bash command that changed a
+file) return at once, and only errors that are new against the state before come as a message before the model's next
+request. When the model would end its run while a check of its edits still runs, Pi waits for it (`PI_CHECKS_WAIT`,
+default 30 s) and the run goes on with the errors. Edits in quick succession make one check, a unit runs one check at
+a time, and a check an edit overtook runs again instead of reporting.
+
+| Language | Tool (the fastest found, each only when installed) | Checks | Time |
+|---|---|---|---:|
+| Rust | `cargo check` on the file's package, in `target/pi-check` | types | 1.4 s warm on Moebius |
+| Python | ty | types, undefined names | 24-31 ms a file |
+| TypeScript | `tsc` (TypeScript 7's native one before the project's) on the `tsconfig.json` project | types | 0.2 s small project |
+| JavaScript | `node --check` | syntax | |
+| Shell | `bash -n`, then shuck's errors | syntax, errors | 2-4 ms |
+| Luau | luau-analyze | syntax; types under `--!strict` | 5 ms |
+| JSON, TOML, YAML | Bun's parsers, in the process | syntax | ~1 ms all three |
+
+On Moebius (443 Rust files), a type error the model wrote was reported 3 s after the edit, before the run ended, and
+fixed; rust-analyzer, which Pi used before, reported nothing within 84 s and took 3.2 GB. `PI_CHECKS=off` turns the
+checks off (for a harness that runs its own, as Moebius's lens), `PI_CHECKS=rust,python` keeps those named, and
+`PI_CHECKS_CARGO_TARGET=shared` lets cargo check use the project's `target/`.
 
 <details>
 <summary>Limits and details</summary>
@@ -174,8 +194,8 @@ file is read. The model sees its mistake in the same step instead of at the next
 |---|---:|
 | Diagnostics listed per edit | 15, then "and N more" |
 | C/C++/HIP, clangd: wait for an edit / for the baseline on read | 350 ms / 1.5 s |
-| Rust: wait for an edit / for the baseline on read, at most | 400 ms / 0.8 s |
-| Rust: cargo check results that arrive later | settled 0.3 s after the check ends, or after 2 s without news; then added to the next tool result (up to 10 per file) |
+| Background checks: errors listed in one report | 15, then "and N more" |
+| Background checks: wait before a run ends, at most | 30 s (`PI_CHECKS_WAIT`) |
 | Error limit passed to the compiler | 20 |
 | libclang translation units kept | the 8 used last (before: all, for the whole session) |
 
@@ -392,8 +412,10 @@ Everything above is on by default.
 | `PI_PROJECT_SNAPSHOT=full` / `off` | The project listing with small files' contents / none |
 | `--remote <host>[:<folder>]`, `PI_REMOTE` | Start working on that machine (as `/remote`) |
 | `PI_SSH_COMMAND` | The ssh program (default `ssh`) |
-| `PI_RUST_ANALYZER_TARGET_DIR` | `shared` to let cargo check use `target/`, or a folder |
-| `LIBCLANG_PATH`, `CLANGD_PATH`, `RUST_ANALYZER_PATH` | Where the diagnostics tools are |
+| `PI_CHECKS` | `off`, or the background checks to keep (`rust,python,typescript,javascript,shell,luau,json,toml,yaml`) |
+| `PI_CHECKS_WAIT` | Seconds a run that would end waits for the checks of its edits (default 30) |
+| `PI_CHECKS_CARGO_TARGET` | `shared` to let the background `cargo check` use the project's `target/` |
+| `LIBCLANG_PATH`, `CLANGD_PATH` | Where the C/C++ diagnostics tools are |
 | `HCC_AMDGPU_TARGET`, `HIP_OFFLOAD_ARCH` | GPU target for HIP diagnostics (default `gfx1100`) |
 | `app.jobs.hub` keybinding | Opens the job hub (default `alt+j`) |
 
@@ -401,7 +423,7 @@ Everything above is on by default.
 
 Pi-Lightspeed's own tests, in `packages/coding-agent` unless noted:
 
-- `test/claude-harness.test.ts`: diagnostics with mock clangd and rust-analyzer, read before edit, nested instruction
+- `test/claude-harness.test.ts`: diagnostics with mock clangd, read before edit, nested instruction
   files, the search caches, the bash fast paths and the edit fallback.
 - `test/cpp-hip-engine.test.ts`: against real libclang (skipped when the bridge is not built).
 - `test/background-jobs.test.ts`, `test/suite/agent-session-bash-background.test.ts`, `test/job-hub.test.ts`: jobs,

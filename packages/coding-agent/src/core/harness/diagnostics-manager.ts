@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join, normalize, resolve } from "node:path";
 import { stripBom } from "../../utils/text.ts";
+import type { BackgroundChecks } from "../checks/background-checks.ts";
 import { notifySearchFileTouched } from "../tools/native-search.ts";
 import { CppHipDiagnosticsEngine } from "./cpp-hip-engine.ts";
 import {
@@ -8,9 +9,7 @@ import {
 	FileStateTracker,
 	type HarnessDiagnostic,
 	isCppOrHipFile,
-	isRustFile,
 } from "./file-state-tracker.ts";
-import { type LateRustDiagnosticBatch, RustDiagnosticsEngine } from "./rust-engine.ts";
 
 function normalizeWarmupKey(filePath: string): string {
 	const norm = normalize(resolve(filePath));
@@ -58,7 +57,7 @@ export interface ClaudeHarnessOptions {
 	enforceReadBeforeEdit?: boolean;
 	/** Append a compact line-numbered context snippet around the edited region. */
 	includePostEditSnippet?: boolean;
-	/** Enable C++/HIP (libclang) and Rust (rust-analyzer) automatic diagnostics. Default: true */
+	/** Enable C++/HIP (libclang) automatic diagnostics during an edit. Default: true */
 	enableDiagnostics?: boolean;
 	/** Optional custom diagnostics provider (used for testing or custom toolchains). */
 	customProvider?: CustomDiagnosticsProvider;
@@ -147,34 +146,17 @@ export function formatNewDiagnosticsBlock(
 	return `\n\n<new-diagnostics>\nThe following new diagnostic issues were introduced by your edit in ${displayPath}:\n${formattedItems.join("\n")}\n</new-diagnostics>`;
 }
 
-/**
- * Format late borrow-checker diagnostics into a `<system-reminder>` block for the next turn.
- */
-export function formatLateDiagnosticsReminder(batches: LateRustDiagnosticBatch[]): string {
-	if (batches.length === 0) return "";
-	const sections: string[] = [];
-	for (const batch of batches) {
-		const items = batch.diagnostics.slice(0, 10).map((d) => {
-			const sevLabel = d.severity === "error" ? "Error" : "Warning";
-			const codePart = d.code ? ` (${d.code})` : "";
-			return `  Line ${d.line}, Col ${d.column} [${sevLabel}]${codePart}: ${d.message}`;
-		});
-		sections.push(`Late Rust borrow-checker / cargo diagnostics for ${batch.filePath}:\n${items.join("\n")}`);
-	}
-	return `\n\n<system-reminder>\n<new-diagnostics>\n${sections.join("\n\n")}\n</new-diagnostics>\n</system-reminder>`;
-}
-
 export class ClaudeHarnessManager {
 	readonly stateTracker = new FileStateTracker();
 	readonly cppHipEngine: CppHipDiagnosticsEngine;
-	readonly rustEngine: RustDiagnosticsEngine;
 	private customProvider?: CustomDiagnosticsProvider;
+	/** The checks other languages get in the background after an edit (see checks/background-checks.ts). */
+	private checks?: BackgroundChecks;
 	private defaultEnableDiagnostics: boolean;
 	private inflightWarmups = new Map<string, Promise<void>>();
 
 	constructor(options?: { customProvider?: CustomDiagnosticsProvider; enableDiagnostics?: boolean }) {
 		this.cppHipEngine = new CppHipDiagnosticsEngine(this.stateTracker);
-		this.rustEngine = new RustDiagnosticsEngine(this.stateTracker);
 		this.customProvider = options?.customProvider;
 		this.defaultEnableDiagnostics = options?.enableDiagnostics ?? true;
 	}
@@ -183,16 +165,19 @@ export class ClaudeHarnessManager {
 		this.customProvider = provider;
 	}
 
+	setBackgroundChecks(checks: BackgroundChecks | undefined): void {
+		this.checks = checks;
+	}
+
 	dispose(): void {
 		this.cppHipEngine.dispose();
-		this.rustEngine.dispose();
 		this.inflightWarmups.clear();
 	}
 
 	/**
 	 * Called by `read.ts` as soon as a file is read.
-	 * Records the file's mtime & content, starts background LSP/libclang warmup (0ms blocking),
-	 * and returns any pending late Rust `<system-reminder>` block.
+	 * Records the file's mtime & content, starts the background libclang warmup and the file's background check
+	 * (its baseline), and returns the nested instruction files found on the way.
 	 * Pass `contentComplete: false` when `content` is only a prefix of a large file.
 	 */
 	onFileRead(
@@ -206,6 +191,7 @@ export class ClaudeHarnessManager {
 		this.stateTracker.recordFileRead(absolutePath, content, mtimeMs, contentComplete);
 		if (contentComplete) {
 			notifySearchFileTouched(absolutePath, rawBuffer ?? content, mtimeMs);
+			this.checks?.onRead(absolutePath);
 		}
 
 		// Fire-and-forget pre-warming on background worker / LSP so `read` returns in 0ms!
@@ -213,7 +199,7 @@ export class ClaudeHarnessManager {
 		if (
 			contentComplete &&
 			this.defaultEnableDiagnostics &&
-			(this.customProvider !== undefined || isCppOrHipFile(absolutePath) || isRustFile(absolutePath))
+			(this.customProvider !== undefined || isCppOrHipFile(absolutePath))
 		) {
 			const key = normalizeWarmupKey(absolutePath);
 			const p: Promise<void> = this.runWarmupInBackground(absolutePath, content, workspaceCwd).finally(() => {
@@ -228,8 +214,7 @@ export class ClaudeHarnessManager {
 			workspaceCwd,
 			loadInstructionFileFromDir,
 		);
-		const nestedReminder = formatNestedInstructionsReminder(nestedFiles);
-		return `${nestedReminder}${this.drainPendingSystemReminder()}`;
+		return formatNestedInstructionsReminder(nestedFiles);
 	}
 
 	/**
@@ -280,8 +265,7 @@ export class ClaudeHarnessManager {
 
 		// Fast path: only enter the async diagnostics pipeline for supported languages or custom providers
 		const shouldRunDiagnostics =
-			enableDiagnostics &&
-			(this.customProvider !== undefined || isCppOrHipFile(absolutePath) || isRustFile(absolutePath));
+			enableDiagnostics && (this.customProvider !== undefined || isCppOrHipFile(absolutePath));
 
 		if (shouldRunDiagnostics) {
 			const pendingWarmup = this.inflightWarmups.get(normalizeWarmupKey(absolutePath));
@@ -305,6 +289,7 @@ export class ClaudeHarnessManager {
 			result?.complete === false ? "merge" : "replace",
 		);
 		notifySearchFileTouched(absolutePath, newContent, newMtimeMs);
+		this.checks?.onEdited(absolutePath);
 
 		let suffix = "";
 		if (includePostEditSnippet && firstChangedLine !== undefined) {
@@ -313,14 +298,8 @@ export class ClaudeHarnessManager {
 		if (newDiagnostics.length > 0) {
 			suffix += formatNewDiagnosticsBlock(displayPath, displayContent, newDiagnostics);
 		}
-		suffix += this.drainPendingSystemReminder();
 
 		return { suffix, newDiagnostics };
-	}
-
-	drainPendingSystemReminder(): string {
-		const lateRust = this.rustEngine.drainLateDiagnostics();
-		return formatLateDiagnosticsReminder(lateRust);
 	}
 
 	private async runWarmupInBackground(absolutePath: string, content: string, workspaceCwd: string): Promise<void> {
@@ -350,11 +329,6 @@ export class ClaudeHarnessManager {
 			return isWarmup
 				? await this.cppHipEngine.warmupFile(absolutePath, content, workspaceCwd)
 				: await this.cppHipEngine.checkEditedFile(absolutePath, content, workspaceCwd);
-		}
-		if (isRustFile(absolutePath)) {
-			return isWarmup
-				? await this.rustEngine.warmupFile(absolutePath, content, workspaceCwd)
-				: await this.rustEngine.checkEditedFile(absolutePath, content, workspaceCwd);
 		}
 		return { diagnostics: [], complete: true };
 	}

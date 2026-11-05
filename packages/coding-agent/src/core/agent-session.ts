@@ -72,6 +72,7 @@ import {
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
+import { BackgroundChecks } from "./checks/background-checks.ts";
 import {
 	type CompactionPreparation,
 	type CompactionResult,
@@ -448,6 +449,14 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
  */
 const OVERFLOW_RECOVERY_STEPS = 3;
 
+/** `customType` of the message that reports new errors from the background checks. */
+export const CHECK_REPORT_MESSAGE_TYPE = "check-report";
+/**
+ * How long a run that would end waits for the checks of its edits (`PI_CHECKS_WAIT`, seconds): long enough for a
+ * warm `cargo check` or `tsc`, short enough that a cold one on a large project does not hold the run.
+ */
+const CHECKS_WAIT_MS = (Number(process.env.PI_CHECKS_WAIT) || 30) * 1000;
+
 /** `customType` of the notice after a response cut off at the output limit with nothing done. */
 export const CUT_OFF_MESSAGE_TYPE = "cut-off-response";
 /** Such notices in a row before the run ends as before. */
@@ -570,6 +579,11 @@ export class AgentSession {
 	private _modelRuntime: ModelRuntime;
 	private _cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed">;
 	private _claudeHarness = new ClaudeHarnessManager();
+	/**
+	 * Checks after an edit in the background (checks/background-checks.ts): new errors come as a message before the
+	 * next request, and a run waits for those still running before it ends (see _waitForChecks).
+	 */
+	private _checks: BackgroundChecks | undefined;
 	/** Commands the bash tool let run on in the background. Their ends are reported to the agent (see _reportJobs). */
 	readonly backgroundJobs = new BackgroundJobs();
 	private _jobReportTimer: ReturnType<typeof setTimeout> | undefined;
@@ -619,6 +633,19 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		const checks = new BackgroundChecks({
+			cwd: this._cwd,
+			report: (text) => {
+				this.sendCustomMessage(
+					{ customType: CHECK_REPORT_MESSAGE_TYPE, content: text, display: true },
+					{ deliverAs: "steer" },
+				).catch(() => {});
+			},
+		});
+		if (checks.enabled) {
+			this._checks = checks;
+			this._claudeHarness.setBackgroundChecks(checks);
+		}
 		this._modelRuntime = config.modelRuntime;
 		this._cacheWarmer = config.cacheWarmer;
 		if (this._cacheWarmer) {
@@ -861,13 +888,7 @@ export class AgentSession {
 				})
 			: undefined;
 
-		const resultContent = hookResult?.content ?? result.content ?? [];
-		// Late Rust borrow-checker diagnostics otherwise only reach the model with the next
-		// read/edit/write; attach them to whichever tool result comes first.
-		const lateDiagnostics = this._claudeHarness.drainPendingSystemReminder().trimStart();
-		const content = lateDiagnostics
-			? [...resultContent, { type: "text" as const, text: lateDiagnostics }]
-			: resultContent;
+		const content = hookResult?.content ?? result.content ?? [];
 		// Runs after the extension hook so images injected or replaced by extensions are normalized too.
 		const resizeOptions = this._limitsModel()?.inputLimits?.images?.resize;
 		const normalizedContent = await normalizeToolResultImages(content, {
@@ -875,7 +896,7 @@ export class AgentSession {
 			...(resizeOptions ? { resizeOptions } : {}),
 		});
 
-		if (!hookResult && !lateDiagnostics && normalizedContent === content) {
+		if (!hookResult && normalizedContent === content) {
 			return undefined;
 		}
 
@@ -1708,7 +1729,8 @@ export class AgentSession {
 			this._cacheWarmer.onWarmed = undefined;
 			this._cacheWarmer.cancel();
 		}
-		// Stop rust-analyzer / clangd so replaced sessions do not leak language-server processes.
+		// Stop clangd and the background checks so replaced sessions do not leak processes.
+		this._checks?.dispose();
 		this._claudeHarness.dispose();
 		cleanupSessionResources(this.sessionId);
 	}
@@ -2193,6 +2215,8 @@ export class AgentSession {
 					await this.agent.continue();
 					continue;
 				}
+				// Errors the checks of this run's edits report come as queued messages, which make the run go on.
+				await this._waitForChecks();
 				if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
 				if (this._agentRunAbortRequested) break;
 				await this.agent.continue();
@@ -2302,6 +2326,14 @@ export class AgentSession {
 		// The low-level loop drains both queues before agent_end. Messages queued by
 		// agent_end handlers require a fresh run before pre-settlement handlers fire.
 		return !this._agentRunAbortRequested && this.agent.hasQueuedMessages();
+	}
+
+	/** Before a run ends: the background checks of its edits, up to CHECKS_WAIT_MS, so their errors still reach it. */
+	private async _waitForChecks(): Promise<void> {
+		if (!this._checks?.busy) return;
+		await this._checks.waitForIdle(CHECKS_WAIT_MS);
+		// A report is sent on a promise: let it reach the queue before the queue is looked at.
+		await new Promise<void>((resolve) => setImmediate(resolve));
 	}
 
 	private async _runBeforeSettleBoundary(): Promise<boolean> {
