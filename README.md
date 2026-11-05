@@ -158,7 +158,8 @@ a `<new-diagnostics>` block. Errors that were there before are left out: they ar
 file is read. The model sees its mistake in the same step instead of at the next build.
 
 - **C, C++, HIP**: libclang in process when a libclang library is found (`LIBCLANG_PATH`, ROCm's, or the system's), else
-  clangd (`CLANGD_PATH`, `/opt/rocm/llvm/bin/clangd`, or on `PATH`). Flags come from `compile_commands.json` in the
+  clangd (`CLANGD_PATH`, `/opt/rocm/llvm/bin/clangd`, or on `PATH`). libclang gets the builtin headers (`stddef.h`)
+  from the folder next to the library it loaded. Flags come from `compile_commands.json` in the
   project or up to 5 parent folders (also `build/`, `out/`, `cmake-build-*`). A header is checked inside a source that
   includes it, also through `-I` folders.
 - **Rust**: rust-analyzer with cargo check on save. The wait ends when the check of the saved file ends. Measured on a
@@ -346,19 +347,22 @@ run's time was the model's. So:
 
 [harnessbench](bench/harness): 14 small projects (Python, C, Rust, TypeScript), each with hidden tests that decide
 whether the task is solved; every harness runs with no extensions, skills or instruction files, the same provider config,
-and its own agent folder. Pi 1.4.0 from npm (Node 24) against Pi-Lightspeed, 4 November 2026:
+and its own agent folder. Pi 1.4.0 from npm (Node 24) against Pi-Lightspeed, 10 runs of each task, 5 November 2026:
 
 | Model | | Solved | Time, sum | Turns, median | Cost |
 |---|---|---:|---:|---:|---:|
-| glm-5.3-flash | Pi 1.4.0 | 70/70 | 1,211 s | 6 | $0.11 |
-| | Pi-Lightspeed | 69/70 | **1,009 s** | 5 | $0.09 |
-| deepseek-v4.1-flash | Pi 1.4.0 | 68/70 | 888 s | 5 | $0.15 |
-| | Pi-Lightspeed | 68/70 | **731 s** | 4 | $0.12 |
+| glm-5.3-flash | Pi 1.4.0 | 140/140 | 2,215 s | 6 | $0.23 |
+| | Pi-Lightspeed | 138/140 | **1,883 s** | 5 | $0.17 |
+| deepseek-v4.1-flash | Pi 1.4.0 | 137/140 | 1,745 s | 5 | $0.30 |
+| | Pi-Lightspeed | 137/140 | **1,466 s** | 4 | $0.25 |
 
-<sub>Time ratio 0.829 (95% CI 0.690–0.923, bootstrap over task/model pairs and runs); geometric mean of the 28 per-pair
-ratios 0.749 (0.657–0.852). Two earlier runs of nearly the same build gave 0.896 (0.780–0.994) and 0.836 (0.680–0.951).
-Failures are the same rounding case for both harnesses, plus one C task. The 72 s test suite of one task takes the same
-time in both. Provider latency varies by run: compare within a run, not across.</sub>
+<sub>Time ratio 0.846 (95% CI 0.709–0.934, bootstrap over task/model pairs and runs); geometric mean of the 28 per-pair
+ratios 0.781 (0.701–0.867); 26 of the 28 pairs faster by median. The run before (an older build) gave 0.855
+(0.755–0.931). With glm the same task takes 4 to 44 s, by how long the model thinks: which one or two glm pairs come out
+slower changes from run to run, and over all 5 runs of this build (up to 55 per pair) glm is faster in every pair by
+median and mean. Failures: a rounding case for both harnesses, and twice glm printing the program name with the
+arguments in a C task. The 75 s test suite of one task takes the same time in both. Provider latency varies by run:
+compare within a run, not across.</sub>
 
 ## System prompt
 
