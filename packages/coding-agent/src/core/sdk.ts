@@ -25,6 +25,7 @@ import {
 	SettingsManager,
 } from "./settings-manager.ts";
 import { BUILTIN_PATH_PREFIX } from "./source-info.ts";
+import { parseTimeLimit, TIME_LIMIT_MAX_OUTPUT_TOKENS } from "./time-limit.ts";
 import { time } from "./timings.ts";
 import { pruneToolResults } from "./tool-result-pruning.ts";
 import {
@@ -418,6 +419,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {
 			const requestOptions = buildRequestOptions(options);
+			if (parseTimeLimit(process.env.PI_TIME_LIMIT) !== undefined) {
+				const wanted = requestOptions.maxTokens || model.maxTokens || TIME_LIMIT_MAX_OUTPUT_TOKENS;
+				requestOptions.maxTokens = Math.min(wanted, TIME_LIMIT_MAX_OUTPUT_TOKENS);
+			}
 			if (requestOptions.onPayload === transformProviderPayload) {
 				// The payload hook only while an extension handles before_provider_request, read when the request is
 				// built (a cache-warming replay builds it later). Without a hook the providers may reuse the request

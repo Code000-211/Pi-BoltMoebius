@@ -8,6 +8,13 @@
 /** `customType` of the message that tells how much time is left. */
 export const TIME_LIMIT_MESSAGE_TYPE = "time-limit";
 
+/**
+ * With a limit, a response stops at this many output tokens (or the model's own, if lower). glm-5.3-flash streams about
+ * 128 a second: its 65,536 took 8.5 minutes of thinking in one response, over half of a 15-minute task, before the run
+ * went on. This is still room for writing a large file in one call.
+ */
+export const TIME_LIMIT_MAX_OUTPUT_TOKENS = 32_768;
+
 /** When the model is told, as a share of the limit. */
 const NOTICE_AT = [0.5, 0.75, 0.9] as const;
 
