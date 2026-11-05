@@ -38,7 +38,7 @@
         },
         "timeout": {
           "type": "number",
-          "description": "Timeout in seconds (optional, no default timeout)"
+          "description": "Seconds to wait for the command (optional, no default). Where background jobs are, a command still running then goes on in the background and reports its end; otherwise it is ended"
         },
         "background": {
           "type": "boolean",
