@@ -108,6 +108,10 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	// Explicit retry guidance emitted mid-stream by OpenAI Responses and Bedrock
 	// stream exceptions (#6019).
 	"you can retry your request",
+
+	// Melious reserves the request's cost ("energy") before it runs. The reservation fails now and then with credit
+	// left, and the same request a second later goes through; a run ended on it before.
+	"failed to create energy hold",
 	"try your request again",
 	"please retry your request",
 

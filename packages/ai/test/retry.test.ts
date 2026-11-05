@@ -113,6 +113,14 @@ describe("provider retry classification", () => {
 		).toBe(true);
 	});
 
+	it("retries Melious's failed cost reservation", () => {
+		expect(
+			isRetryableAssistantError(
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "Failed to create energy hold" }),
+			),
+		).toBe(true);
+	});
+
 	it("keeps provider limit errors non-retryable", () => {
 		expect(
 			isRetryableAssistantError(
