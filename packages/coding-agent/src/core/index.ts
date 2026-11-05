@@ -103,11 +103,9 @@ export {
 	type CustomDiagnosticsProvider,
 	defaultClaudeHarnessManager,
 	FileStateTracker,
-	formatLateDiagnosticsReminder,
 	formatNewDiagnosticsBlock,
 	formatPostEditSnippet,
 	type HarnessDiagnostic,
-	RustDiagnosticsEngine,
 	sanitizeCompileFlags,
 	splitCompileCommand,
 } from "./harness/index.ts";

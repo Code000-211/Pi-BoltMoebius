@@ -61,10 +61,13 @@ describe("Copilot request-size overflow recovery", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
+		delete process.env.PI_COMPACTION_AHEAD;
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
 	});
 
 	it("compacts an image-heavy history and retries after the real 413", async () => {
+		// The history is just below the threshold, where a summary would start ahead and take a scripted response.
+		process.env.PI_COMPACTION_AHEAD = "off";
 		const harness = await createHarness({
 			provider: "github-copilot",
 			models: [{ id: "faux-copilot", contextWindow: 1_000_000 }],

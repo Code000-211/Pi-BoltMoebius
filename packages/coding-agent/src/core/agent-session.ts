@@ -72,6 +72,8 @@ import {
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
+import { BackgroundChecks } from "./checks/background-checks.ts";
+import { CHECKERS, enabledCheckers } from "./checks/checkers.ts";
 import {
 	type CompactionPreparation,
 	type CompactionResult,
@@ -85,6 +87,7 @@ import {
 	estimateProjectedContextTokens,
 	estimateTokens,
 	generateBranchSummary,
+	getCompactionThreshold,
 	prepareCompaction,
 	shouldCompact,
 	truncateContentForContext,
@@ -169,6 +172,7 @@ import {
 	type NormalizedBuildSystemPromptOptions,
 	normalizeBuildSystemPromptOptions,
 } from "./system-prompt.ts";
+import { prunedTokens } from "./tool-result-pruning.ts";
 import { type BashOperations, createBashToolDefinition, createLocalBashOperations } from "./tools/bash.ts";
 import { isReadOnlyCommand } from "./tools/bash-read-only.ts";
 import { createEditToolDefinition } from "./tools/edit.ts";
@@ -448,6 +452,41 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
  */
 const OVERFLOW_RECOVERY_STEPS = 3;
 
+/**
+ * How far below the compaction threshold the summary starts in the background (see `_compactAhead`): a share of the
+ * threshold, up to a number of tokens. Started closer, the agent works on above the threshold for longer (a summary
+ * takes 15 to 90 seconds); started earlier, more of the context stays after the compaction, and a session that ends
+ * below the threshold paid for a summary it never used. `PI_COMPACTION_AHEAD=off` turns it off.
+ */
+const COMPACTION_AHEAD_SHARE = 0.15;
+const COMPACTION_AHEAD_MAX_TOKENS = 40_000;
+/**
+ * How far above the threshold the agent goes on while the summary made ahead is not ready yet, as a share of the
+ * threshold: at most halfway to the context's limit (the window less `reserveTokens`).
+ */
+const COMPACTION_AHEAD_OVERRUN = 0.5;
+
+/** A compaction summary made in the background before the threshold was reached, see `_compactAhead`. */
+interface CompactionAhead {
+	sessionManager: SessionManager;
+	/** The branch's last entry when it started: the summary covers the entries before the cut point up to it. */
+	leafId: string;
+	firstKeptEntryId: string;
+	keepRecentTokens: number;
+	controller: AbortController;
+	/** Undefined when it failed or was cancelled. */
+	result: Promise<CompactionResult | undefined>;
+	done: boolean;
+}
+
+/** `customType` of the message that reports new errors from the background checks. */
+export const CHECK_REPORT_MESSAGE_TYPE = "check-report";
+/**
+ * How long a run that would end waits for the checks of its edits (`PI_CHECKS_WAIT`, seconds): long enough for a
+ * warm `cargo check` or `tsc`, short enough that a cold one on a large project does not hold the run.
+ */
+const CHECKS_WAIT_MS = (Number(process.env.PI_CHECKS_WAIT) || 30) * 1000;
+
 /** `customType` of the notice after a response cut off at the output limit with nothing done. */
 export const CUT_OFF_MESSAGE_TYPE = "cut-off-response";
 /** Such notices in a row before the run ends as before. */
@@ -499,6 +538,7 @@ export class AgentSession {
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
+	private _compactionAhead: CompactionAhead | undefined = undefined;
 	/** Overflow recovery steps taken since the last user message or successful response */
 	private _overflowRecoveryAttempts = 0;
 	/** Responses in a row cut off at the output limit with nothing done, see {@link _answerCutOffResponse}. */
@@ -516,7 +556,13 @@ export class AgentSession {
 	 */
 	private _failedResponse: AssistantMessage | undefined;
 	private _contextEstimate:
-		| { sessionManager: SessionManager; revision: number; tokens: number; knownAfterCompaction: boolean }
+		| {
+				sessionManager: SessionManager;
+				revision: number;
+				tokens: number;
+				nextRequestTokens: number;
+				knownAfterCompaction: boolean;
+		  }
 		| undefined;
 
 	// Bash execution state
@@ -570,6 +616,11 @@ export class AgentSession {
 	private _modelRuntime: ModelRuntime;
 	private _cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed">;
 	private _claudeHarness = new ClaudeHarnessManager();
+	/**
+	 * Checks after an edit in the background (checks/background-checks.ts): new errors come as a message before the
+	 * next request, and a run waits for those still running before it ends (see _waitForChecks).
+	 */
+	private _checks: BackgroundChecks | undefined;
 	/** Commands the bash tool let run on in the background. Their ends are reported to the agent (see _reportJobs). */
 	readonly backgroundJobs = new BackgroundJobs();
 	private _jobReportTimer: ReturnType<typeof setTimeout> | undefined;
@@ -619,6 +670,21 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		const checks = new BackgroundChecks({
+			cwd: this._cwd,
+			// C, C++ and HIP through the harness's libclang engine (see ClaudeHarnessManager.cppChecker).
+			checkers: enabledCheckers(undefined, [...CHECKERS, this._claudeHarness.cppChecker(this._cwd)]),
+			report: (text) => {
+				this.sendCustomMessage(
+					{ customType: CHECK_REPORT_MESSAGE_TYPE, content: text, display: true },
+					{ deliverAs: "steer" },
+				).catch(() => {});
+			},
+		});
+		if (checks.enabled) {
+			this._checks = checks;
+			this._claudeHarness.setBackgroundChecks(checks);
+		}
 		this._modelRuntime = config.modelRuntime;
 		this._cacheWarmer = config.cacheWarmer;
 		if (this._cacheWarmer) {
@@ -861,13 +927,7 @@ export class AgentSession {
 				})
 			: undefined;
 
-		const resultContent = hookResult?.content ?? result.content ?? [];
-		// Late Rust borrow-checker diagnostics otherwise only reach the model with the next
-		// read/edit/write; attach them to whichever tool result comes first.
-		const lateDiagnostics = this._claudeHarness.drainPendingSystemReminder().trimStart();
-		const content = lateDiagnostics
-			? [...resultContent, { type: "text" as const, text: lateDiagnostics }]
-			: resultContent;
+		const content = hookResult?.content ?? result.content ?? [];
 		// Runs after the extension hook so images injected or replaced by extensions are normalized too.
 		const resizeOptions = this._limitsModel()?.inputLimits?.images?.resize;
 		const normalizedContent = await normalizeToolResultImages(content, {
@@ -875,7 +935,7 @@ export class AgentSession {
 			...(resizeOptions ? { resizeOptions } : {}),
 		});
 
-		if (!hookResult && !lateDiagnostics && normalizedContent === content) {
+		if (!hookResult && normalizedContent === content) {
 			return undefined;
 		}
 
@@ -933,7 +993,7 @@ export class AgentSession {
 	private _exceedsCompactionThreshold(model: Model<any>): boolean {
 		if (model.contextWindow <= 0) return false;
 		return shouldCompact(
-			this._contextTokenEstimate().tokens,
+			this._contextTokenEstimate().nextRequestTokens,
 			model.contextWindow,
 			this.settingsManager.getCompactionSettings(this.model, model.contextWindow),
 		);
@@ -943,9 +1003,10 @@ export class AgentSession {
 	 * The context size estimate of the current projection, kept until the projection changes: the compaction check
 	 * runs before every request and the footer asks after every entry, and each estimate walks the whole context.
 	 * `knownAfterCompaction` is false when the latest compaction has no projected assistant response with usage after it
-	 * (the size is unknown until the next response).
+	 * (the size is unknown until the next response). `nextRequestTokens` is what the next request sends, which the
+	 * compaction threshold is checked against (see {@link _afterPruning}).
 	 */
-	private _contextTokenEstimate(): { tokens: number; knownAfterCompaction: boolean } {
+	private _contextTokenEstimate(): { tokens: number; nextRequestTokens: number; knownAfterCompaction: boolean } {
 		const sessionManager = this.sessionManager;
 		const revision = sessionManager.getProjectionRevision();
 		const cached = this._contextEstimate;
@@ -972,16 +1033,45 @@ export class AgentSession {
 			const compactionIndex = branch.findIndex((entry) => entry.id === latestCompaction.id);
 			knownAfterCompaction = branch.slice(compactionIndex + 1).some((entry) => projectedAssistants.has(entry.id));
 		}
-		const tokens = estimateProjectedContextTokens(projection, branch).tokens;
-		this._contextEstimate = { sessionManager, revision, tokens, knownAfterCompaction };
+		const estimate = estimateProjectedContextTokens(projection, branch);
+		const nextRequestTokens = this._afterPruning(estimate.tokens, projection.messages, estimate.lastUsageIndex);
+		this._contextEstimate = {
+			sessionManager,
+			revision,
+			tokens: estimate.tokens,
+			nextRequestTokens,
+			knownAfterCompaction,
+		};
 		return this._contextEstimate;
+	}
+
+	/**
+	 * `tokens` of `messages` as the next request sends them: less what tool-result pruning (tool-result-pruning.ts)
+	 * clears in it beyond what it cleared in the request whose usage `tokens` counts (the one before the response at
+	 * `usageIndex`; without one, `tokens` is the estimate of all of `messages`). Pruning clears in steps, so a step can
+	 * take a context back below the compaction threshold that the size of the last request was above.
+	 */
+	private _afterPruning(tokens: number, messages: AgentMessage[], usageIndex: number | null): number {
+		const settings = this.settingsManager.getToolResultPruningSettings();
+		if (!settings.enabled) return tokens;
+		const cleared =
+			prunedTokens(convertToLlm(messages), settings) -
+			(usageIndex === null ? 0 : prunedTokens(convertToLlm(messages.slice(0, usageIndex)), settings));
+		return Math.max(0, tokens - Math.max(0, cleared));
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
 		const projection = this.sessionManager.buildSessionProjection();
 		// A virtual selection is checked in prepareRequest, against the model the request is routed to.
 		const model = this.model;
-		if (!model || isVirtualModel(model) || !this._exceedsCompactionThreshold(model)) {
+		if (
+			!model ||
+			isVirtualModel(model) ||
+			model.contextWindow <= 0 ||
+			// Above the threshold too, while a summary is being made ahead and the context is below its limit.
+			this._compactAhead(this._contextTokenEstimate().nextRequestTokens, model.contextWindow) ||
+			!this._exceedsCompactionThreshold(model)
+		) {
 			return { ...context, messages: projection.messages };
 		}
 		await this._runAutoCompaction("threshold", false, undefined, model.contextWindow);
@@ -1692,6 +1782,7 @@ export class AgentSession {
 		try {
 			this.abortRetry();
 			this.abortCompaction();
+			this._compactionAhead?.controller.abort();
 			this.abortBranchSummary();
 			this.abortBash();
 			this.agent.abort();
@@ -1708,7 +1799,8 @@ export class AgentSession {
 			this._cacheWarmer.onWarmed = undefined;
 			this._cacheWarmer.cancel();
 		}
-		// Stop rust-analyzer / clangd so replaced sessions do not leak language-server processes.
+		// Stop clangd and the background checks so replaced sessions do not leak processes.
+		this._checks?.dispose();
 		this._claudeHarness.dispose();
 		cleanupSessionResources(this.sessionId);
 	}
@@ -2193,6 +2285,8 @@ export class AgentSession {
 					await this.agent.continue();
 					continue;
 				}
+				// Errors the checks of this run's edits report come as queued messages, which make the run go on.
+				await this._waitForChecks();
 				if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
 				if (this._agentRunAbortRequested) break;
 				await this.agent.continue();
@@ -2302,6 +2396,28 @@ export class AgentSession {
 		// The low-level loop drains both queues before agent_end. Messages queued by
 		// agent_end handlers require a fresh run before pre-settlement handlers fire.
 		return !this._agentRunAbortRequested && this.agent.hasQueuedMessages();
+	}
+
+	/**
+	 * Before a run ends: the background checks of its edits, up to CHECKS_WAIT_MS, so their errors still reach it; with
+	 * none, the lint findings its changes brought, which wait until the run would end so as not to interrupt it.
+	 */
+	private async _waitForChecks(): Promise<void> {
+		const checks = this._checks;
+		if (!checks) return;
+		if (checks.busy) {
+			await checks.waitForIdle(CHECKS_WAIT_MS);
+			// A report is sent on a promise: let it reach the queue before the queue is looked at.
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+		if (this.agent.hasQueuedMessages()) return;
+		const lint = checks.takeLintReport();
+		if (lint) {
+			await this.sendCustomMessage(
+				{ customType: CHECK_REPORT_MESSAGE_TYPE, content: lint, display: true },
+				{ deliverAs: "steer" },
+			);
+		}
 	}
 
 	private async _runBeforeSettleBoundary(): Promise<boolean> {
@@ -3274,11 +3390,14 @@ export class AgentSession {
 		customInstructions: string | undefined,
 		signal: AbortSignal,
 		reason: "manual" | "threshold" | "overflow",
+		/** Made ahead, while the agent works: its retries are not shown. */
+		ahead = false,
 	): Promise<CompactionResult> {
 		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
 		const request = await this._getSummarizationRequestAuth(model, signal);
+		const callbacks = ahead ? undefined : this._summarizationRetryCallbacks({ source: "compaction", reason });
 		if (reason !== "overflow" && process.env.PI_COMPACTION_CACHED_PREFIX !== "off") {
-			const cached = await this._compactOnCachedPrefix(preparation, request, customInstructions, signal, reason);
+			const cached = await this._compactOnCachedPrefix(preparation, request, customInstructions, signal, callbacks);
 			if (cached) return cached;
 			if (signal.aborted) throw new Error("Compaction cancelled");
 		}
@@ -3293,7 +3412,7 @@ export class AgentSession {
 			this.agent.streamFunction,
 			request.env,
 			this.settingsManager.getRetrySettings(),
-			this._summarizationRetryCallbacks({ source: "compaction", reason }),
+			callbacks,
 			undefined, // sessionId
 		);
 	}
@@ -3309,7 +3428,7 @@ export class AgentSession {
 		request: Awaited<ReturnType<AgentSession["_getSummarizationRequestAuth"]>>,
 		customInstructions: string | undefined,
 		signal: AbortSignal,
-		reason: "manual" | "threshold",
+		callbacks: RetryCallbacks | undefined,
 	): Promise<CompactionResult | undefined> {
 		const sessionModel = this.agent.state.model;
 		const thinkingLevel = this.agent.state.thinkingLevel;
@@ -3345,7 +3464,7 @@ export class AgentSession {
 				},
 				streamFn: this.agent.streamFunction,
 				retry: this.settingsManager.getRetrySettings(),
-				callbacks: this._summarizationRetryCallbacks({ source: "compaction", reason }),
+				callbacks,
 			},
 			keptMessage ? describeKeptMessage(keptMessage) : undefined,
 			customInstructions,
@@ -3656,8 +3775,10 @@ export class AgentSession {
 		const projection = currentProjection;
 		const hasContextEdits = projection.entries.some((entry) => entry.sourceEntry.type === "context_edit");
 		const directContextTokens = assistantMessage.usage ? calculateContextTokens(assistantMessage.usage) : 0;
+		// What the next request sends: tool-result pruning may clear more of it than of the last one.
 		if (hasContextEdits) {
-			contextTokens = estimateProjectedContextTokens(projection, branch).tokens;
+			const estimate = estimateProjectedContextTokens(projection, branch);
+			contextTokens = this._afterPruning(estimate.tokens, projection.messages, estimate.lastUsageIndex);
 		} else if (assistantMessage.stopReason === "error" || directContextTokens === 0) {
 			const messages = this.agent.state.messages;
 			const estimate = estimateContextTokens(messages);
@@ -3676,14 +3797,121 @@ export class AgentSession {
 					return false;
 				}
 			}
-			contextTokens = estimate.tokens;
+			contextTokens = this._afterPruning(estimate.tokens, messages, estimate.lastUsageIndex);
 		} else {
-			contextTokens = directContextTokens;
+			const messages = this.agent.state.messages;
+			const index = messages.lastIndexOf(assistantMessage);
+			contextTokens = index < 0 ? directContextTokens : this._afterPruning(directContextTokens, messages, index);
 		}
+		// Near the threshold when a run ends, the summary is made while the user reads and writes; above it, while the
+		// agent goes on.
+		if (sameModel && this._compactAhead(contextTokens, contextWindow)) return false;
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
 			return await this._runAutoCompaction("threshold", false, undefined, contextWindow);
 		}
 		return false;
+	}
+
+	/**
+	 * Near the compaction threshold, the summary of what the compaction would cut is made in the background, and the
+	 * threshold compaction takes it ({@link _takeCompactionAhead}) instead of stopping the agent for the summary request.
+	 * The threshold is not the context's limit: while the summary is still being made, the agent goes on above it, and
+	 * stops to wait for it only some way above (see {@link COMPACTION_AHEAD_OVERRUN}). The entries the summary covers
+	 * stay as they are: later ones are appended, and kept by the compaction. Not when an extension makes or vets
+	 * compactions (`session_before_compact`), nor for a context so small that the kept part alone would be near the
+	 * threshold again.
+	 *
+	 * Returns whether the compaction is to wait: a summary is being made, and the context is below where it stops.
+	 */
+	private _compactAhead(contextTokens: number, contextWindow: number): boolean {
+		if (process.env.PI_COMPACTION_AHEAD === "off" || !this.settingsManager.getCompactionEnabled()) return false;
+		const model = this.model;
+		if (!model || this._extensionRunner.hasHandlers("session_before_compact")) return false;
+		const settings = this.settingsManager.getCompactionSettings(model, contextWindow);
+		const threshold = getCompactionThreshold(contextWindow, settings);
+		const start = threshold - Math.min(threshold * COMPACTION_AHEAD_SHARE, COMPACTION_AHEAD_MAX_TOKENS);
+		if (contextTokens <= start || start < 2 * settings.keepRecentTokens) return false;
+		const limit = contextWindow - settings.reserveTokens;
+		const goesOn =
+			contextTokens <= threshold + Math.min((limit - threshold) / 2, threshold * COMPACTION_AHEAD_OVERRUN);
+		const branch = this.sessionManager.getBranch();
+		const current = this._compactionAhead;
+		if (current) {
+			if (this._compactionAheadValid(current, branch, settings)) return goesOn && !current.done;
+			current.controller.abort();
+			this._compactionAhead = undefined;
+		}
+		const leafId = branch.at(-1)?.id;
+		const preparation = prepareCompaction(branch, settings);
+		if (
+			!leafId ||
+			!preparation ||
+			(preparation.messagesToSummarize.length === 0 && preparation.turnPrefixMessages.length === 0)
+		) {
+			return false;
+		}
+		const controller = new AbortController();
+		const ahead: CompactionAhead = {
+			sessionManager: this.sessionManager,
+			leafId,
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			keepRecentTokens: settings.keepRecentTokens,
+			controller,
+			done: false,
+			result: this._runDefaultCompaction(preparation, model, undefined, controller.signal, "threshold", true)
+				.catch(() => undefined)
+				.finally(() => {
+					ahead.done = true;
+				}),
+		};
+		this._compactionAhead = ahead;
+		return goesOn;
+	}
+
+	/** Whether a summary made ahead still fits `branch`: nothing it covers was compacted, edited or left since. */
+	private _compactionAheadValid(
+		ahead: CompactionAhead,
+		branch: SessionEntry[],
+		settings: CompactionSettings,
+	): boolean {
+		if (ahead.sessionManager !== this.sessionManager || ahead.keepRecentTokens !== settings.keepRecentTokens) {
+			return false;
+		}
+		if (ahead.controller.signal.aborted) return false;
+		const leafIndex = branch.findIndex((entry) => entry.id === ahead.leafId);
+		const keptIndex = branch.findIndex((entry) => entry.id === ahead.firstKeptEntryId);
+		if (leafIndex < 0 || keptIndex < 0) return false;
+		return branch.slice(leafIndex + 1).every((entry) => {
+			if (entry.type === "compaction") return false;
+			if (entry.type !== "context_edit") return true;
+			const target = branch.findIndex((other) => other.id === entry.targetId);
+			return target >= keptIndex;
+		});
+	}
+
+	/**
+	 * The summary made ahead for a threshold compaction of `branch`, waited for when it is still being made (the wait
+	 * ends with `signal`); undefined when there is none, it does not fit, or it failed. Taken once.
+	 */
+	private async _takeCompactionAhead(
+		branch: SessionEntry[],
+		settings: CompactionSettings,
+		signal: AbortSignal,
+	): Promise<CompactionResult | undefined> {
+		const ahead = this._compactionAhead;
+		if (!ahead) return undefined;
+		this._compactionAhead = undefined;
+		if (!this._compactionAheadValid(ahead, branch, settings)) {
+			ahead.controller.abort();
+			return undefined;
+		}
+		const cancel = () => ahead.controller.abort();
+		signal.addEventListener("abort", cancel, { once: true });
+		try {
+			return await ahead.result;
+		} finally {
+			signal.removeEventListener("abort", cancel);
+		}
 	}
 
 	private async _emitOverflowRecoveryFailure(errorMessage: string): Promise<void> {
@@ -3833,17 +4061,19 @@ export class AgentSession {
 				usage = extensionCompaction.usage;
 				details = extensionCompaction.details;
 			} else {
-				// Shared default summary generator, also used by manual compaction.
-				const compactResult = await this._runDefaultCompaction(
-					preparation,
-					model,
-					undefined,
-					abortController.signal,
-					reason,
-				);
+				// The summary made ahead keeps more (what came after it started); the default one otherwise, which is
+				// shared with manual compaction.
+				const ahead =
+					reason === "threshold" && recovery === undefined
+						? await this._takeCompactionAhead(pathEntries, settings, abortController.signal)
+						: undefined;
+				abortController.signal.throwIfAborted();
+				const compactResult =
+					ahead ??
+					(await this._runDefaultCompaction(preparation, model, undefined, abortController.signal, reason));
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;
-				tokensBefore = compactResult.tokensBefore;
+				tokensBefore = ahead ? preparation.tokensBefore : compactResult.tokensBefore;
 				usage = compactResult.usage;
 				details = compactResult.details;
 			}

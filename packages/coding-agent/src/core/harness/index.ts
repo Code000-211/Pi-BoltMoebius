@@ -10,7 +10,6 @@ export {
 	type ClaudeHarnessOptions,
 	type CustomDiagnosticsProvider,
 	defaultClaudeHarnessManager,
-	formatLateDiagnosticsReminder,
 	formatNestedInstructionsReminder,
 	formatNewDiagnosticsBlock,
 	formatPostEditSnippet,
@@ -33,4 +32,3 @@ export {
 	StaleFileError,
 	type TrackedFileState,
 } from "./file-state-tracker.ts";
-export { type LateRustDiagnosticBatch, RustDiagnosticsEngine } from "./rust-engine.ts";

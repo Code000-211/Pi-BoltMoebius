@@ -62,7 +62,7 @@ export interface WriteToolOptions {
 	harness?: ClaudeHarnessManager;
 	/** Enforce that an existing file was read first and not modified externally before overwriting. */
 	enforceReadBeforeEdit?: boolean;
-	/** Run C++/HIP (libclang) and Rust (rust-analyzer) diagnostics and append <new-diagnostics>. Default: true */
+	/** Run C++/HIP (libclang) diagnostics and append <new-diagnostics> (other languages are checked in the background). Default: true */
 	enableDiagnostics?: boolean;
 }
 

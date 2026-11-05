@@ -116,7 +116,7 @@ export interface EditToolOptions {
 	enforceReadBeforeEdit?: boolean;
 	/** Include a compact line-numbered context snippet around the edited lines in the tool result. */
 	includePostEditSnippet?: boolean;
-	/** Run C++/HIP (libclang) and Rust (rust-analyzer) diagnostics and append <new-diagnostics>. Default: true */
+	/** Run C++/HIP (libclang) diagnostics and append <new-diagnostics> (other languages are checked in the background). Default: true */
 	enableDiagnostics?: boolean;
 }
 

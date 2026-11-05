@@ -93,3 +93,14 @@ export function pruneToolResults(messages: Message[], settings: ToolResultPrunin
 	});
 	return changed ? result : messages;
 }
+
+/** The estimated tokens `pruneToolResults` clears from `messages`. */
+export function prunedTokens(messages: Message[], settings: ToolResultPruningSettings): number {
+	const pruned = pruneToolResults(messages, settings);
+	if (pruned === messages) return 0;
+	let tokens = 0;
+	for (let i = 0; i < messages.length; i++) {
+		if (pruned[i] !== messages[i]) tokens += estimate(messages[i]) - estimate(pruned[i]);
+	}
+	return tokens;
+}
