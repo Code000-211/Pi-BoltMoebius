@@ -20,7 +20,7 @@ import {
 	trackDetachedChildPid,
 	untrackDetachedChildPid,
 } from "../../utils/shell.ts";
-import type { BackgroundJobs } from "../background-jobs.ts";
+import { type BackgroundJobs, formatJobReport } from "../background-jobs.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import type { ClaudeHarnessManager } from "../harness/index.ts";
 import { type FileWrite, filesShownByCat, fileWritesInCommand } from "./bash-file-writes.ts";
@@ -197,32 +197,22 @@ export function leadingSleep(command: string): { seconds: number; rest: string }
 }
 
 /**
- * Sleeps up to `ms`, and less when a background job ends (or one ended that was not reported yet): what a fixed sleep
- * before looking at a job's progress waits for. Returns the ms slept, and whether a job ended.
+ * Sleeps up to `ms` for a command, and less when a background job ends (as `wait` does): what a fixed sleep before a
+ * look at a job's progress waits for. The note to put before the command's output: how long it slept, and the report of
+ * the jobs that ended, which the call gives rather than a message after it (the model called `wait` for them before).
  */
 async function sleepUntilJobEnds(
 	jobs: BackgroundJobs,
-	ms: number,
+	seconds: number,
 	signal: AbortSignal | undefined,
-): Promise<{ sleptMs: number; jobEnded: boolean }> {
+): Promise<string> {
 	const start = performance.now();
-	if (jobs.hasUnreported()) return { sleptMs: 0, jobEnded: true };
-	const jobEnded = await new Promise<boolean>((resolve) => {
-		const timer = setTimeout(() => done(false), ms);
-		const unsubscribe = jobs.subscribe((event) => {
-			if (event.type === "end") done(true);
-		});
-		const onAbort = () => done(false);
-		signal?.addEventListener("abort", onAbort, { once: true });
-		function done(ended: boolean) {
-			clearTimeout(timer);
-			unsubscribe();
-			signal?.removeEventListener("abort", onAbort);
-			resolve(ended);
-		}
-	});
-	if (signal?.aborted) throw new Error("Command aborted");
-	return { sleptMs: performance.now() - start, jobEnded };
+	const outcome = await jobs.waitForEnd(seconds * 1000, signal);
+	if (outcome === "aborted") throw new Error("Command aborted");
+	const ended = jobs.takeUnreported();
+	if (ended.length === 0) return "";
+	const slept = ((performance.now() - start) / 1000).toFixed(1);
+	return `[The sleep of ${seconds} s ended after ${slept} s: a background job ended.]\n${formatJobReport(ended)}\n\n`;
 }
 
 /**
@@ -795,10 +785,7 @@ export function createShellToolDefinition(
 			if (jobs && !background && jobs.running().length > 0 && process.env.PI_BASH_SLEEP_GUARD !== "off") {
 				const sleep = leadingSleep(command);
 				if (sleep && sleep.seconds > MAX_FIXED_SLEEP_SECONDS && sleep.seconds <= autoBackgroundSeconds) {
-					const { sleptMs, jobEnded } = await sleepUntilJobEnds(jobs, sleep.seconds * 1000, signal);
-					if (jobEnded) {
-						sleptNote = `[The sleep of ${sleep.seconds} s ended after ${(sleptMs / 1000).toFixed(1)} s: a background job ended.]\n`;
-					}
+					sleptNote = await sleepUntilJobEnds(jobs, sleep.seconds, signal);
 					command = sleep.rest || "true";
 				}
 			}

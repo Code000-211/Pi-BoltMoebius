@@ -239,9 +239,11 @@ describe("fixed sleeps", () => {
 			const start = performance.now();
 			const result = await bash.execute("s0", { command: "sleep 45; echo looked" });
 			expect(performance.now() - start).toBeLessThan(2000);
+			// The report of the job comes with the result, not as a message after it.
 			expect(getText(result)).toMatch(
-				/^\[The sleep of 45 s ended after 0\.\d s: a background job ended\.\]\nlooked\n$/,
+				/^\[The sleep of 45 s ended after \d\.\d s: a background job ended\.\]\nBackground job bg1 \(`make`\) ended with exit code 0[\s\S]*\n\nlooked\n$/,
 			);
+			expect(jobs.takeUnreported()).toEqual([]);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
