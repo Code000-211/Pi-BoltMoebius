@@ -222,6 +222,61 @@ function fileWriteRefusal(writes: FileWrite[]): string {
 	);
 }
 
+interface WatchedFile {
+	/** As the command names it. */
+	target: string;
+	path: string;
+	/** Undefined when it could not be read. */
+	before: string | undefined;
+}
+
+/** The first and last line (1-based) where `after` differs from `before`. */
+function changedLineRange(before: string, after: string): [number, number] {
+	const a = before.split("\n");
+	const b = after.split("\n");
+	let start = 0;
+	while (start < a.length && start < b.length && a[start] === b[start]) start++;
+	let endA = a.length - 1;
+	let endB = b.length - 1;
+	while (endA > start && endB > start && a[endA] === b[endB]) {
+		endA--;
+		endB--;
+	}
+	return [start + 1, Math.max(start + 1, endB + 1)];
+}
+
+/**
+ * For each watched file the command changed, what the edit tool reports after an edit: the lines that changed, and
+ * the compiler's new errors (the harness, which also takes the new content as read, so an edit after it needs no
+ * read). Empty when nothing changed.
+ */
+async function checkChangedFiles(
+	watched: WatchedFile[],
+	harness: ClaudeHarnessManager | undefined,
+	cwd: string,
+): Promise<string> {
+	let report = "";
+	for (const file of watched) {
+		const after = await readFileAsync(file.path, "utf-8").catch(() => undefined);
+		if (after === undefined || after === file.before) continue;
+		const [first, last] = changedLineRange(file.before ?? "", after);
+		report += `\n\n${file.target} changed${first === last ? ` at line ${first}` : ` in lines ${first}-${last}`}.`;
+		if (!harness) continue;
+		try {
+			const info = await statAsync(file.path);
+			const { suffix } = await harness.onFileModified({
+				absolutePath: file.path,
+				displayPath: file.target,
+				newContent: after,
+				newMtimeMs: info.mtimeMs,
+				workspaceCwd: cwd,
+			});
+			report += suffix;
+		} catch {}
+	}
+	return report;
+}
+
 /** How much of a background job's output its report carries. */
 const BACKGROUND_DONE_TAIL_CHARS = 2048;
 
@@ -812,16 +867,28 @@ export function createShellToolDefinition(
 				// From oh-my-pi's "NEVER poll". Of the 97 sleep calls in Pi's sessions, 28 slept more than 10 s outside a loop.
 				if (sleep > MAX_FIXED_SLEEP_SECONDS) throw new Error(fixedSleepRefusal(sleep));
 			}
+			/** Existing files the command changes as edit and write would, with their content before it ran. */
+			const watched: WatchedFile[] = [];
 			if (options?.editToolActive?.() && process.env.PI_BASH_EDIT_GUARD !== "off") {
-				// From oh-my-pi's bash interceptor. In Pi's sessions, 65 of 2615 commands changed files this way.
-				// Only files that exist: a new file has nothing to read first and no compiler errors to compare. (On a
-				// remote machine their existence is not known here: every such write is refused.)
-				const writes = fileWritesInCommand(command).filter(
-					(w) =>
-						options.operations !== undefined ||
-						existsSync(resolvePath(spawnContext.cwd, expandHome(w.dir), expandHome(w.target))),
-				);
-				if (writes.length > 0) throw new Error(fileWriteRefusal(writes));
+				// From oh-my-pi's bash interceptor. In Pi's sessions, 65 of 2615 commands changed files this way. On this
+				// machine the command runs and gets the edit tool's checks afterwards (see checkChangedFiles): refusing it
+				// cost a turn each time, 35 times in 142 Terminal-Bench runs, mostly followed by the same change as an
+				// edit. On a remote machine what changed is not known here: such a command is refused.
+				const writes = fileWritesInCommand(command);
+				if (options.operations !== undefined) {
+					if (writes.length > 0) throw new Error(fileWriteRefusal(writes));
+				} else {
+					for (const w of writes) {
+						// Only files that exist: a new file has no compiler errors to compare.
+						const path = resolvePath(spawnContext.cwd, expandHome(w.dir), expandHome(w.target));
+						if (!existsSync(path) || watched.some((f) => f.path === path)) continue;
+						watched.push({
+							target: w.target,
+							path,
+							before: await readFileAsync(path, "utf-8").catch(() => undefined),
+						});
+					}
+				}
 			}
 			// On this machine only: a remote pkill does not reach this process.
 			if (options?.operations === undefined) {
@@ -943,9 +1010,12 @@ export function createShellToolDefinition(
 					exit_code: exitCode,
 					wall_time_seconds: wallTimeSeconds,
 				};
+				const changes = await checkChangedFiles(watched, options?.harness, spawnContext.cwd);
 				if (exitCode !== 0) {
 					return {
-						content: [{ type: "text", text: appendStatus(outputText, `Command exited with code ${exitCode}`) }],
+						content: [
+							{ type: "text", text: appendStatus(outputText, `Command exited with code ${exitCode}`) + changes },
+						],
 						details,
 						structuredContent,
 						isError: true,
@@ -963,7 +1033,7 @@ export function createShellToolDefinition(
 						} catch {}
 					}
 				}
-				return { content: [{ type: "text", text: outputText }], details, structuredContent };
+				return { content: [{ type: "text", text: outputText + changes }], details, structuredContent };
 			} finally {
 				clearUpdateTimer();
 				signal?.removeEventListener("abort", forwardAbort);

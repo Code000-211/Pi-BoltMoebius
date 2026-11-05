@@ -42,23 +42,25 @@ describe("commands that change files as edit and write would", () => {
 		expect(fileWritesInCommand(command)).toEqual([]);
 	});
 
-	it("refuses them in the bash tool while edit is there, and runs them otherwise", async () => {
+	it("runs them in the bash tool while edit is there, and reports what changed as an edit does", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "pi-writes-"));
+		const text = (r: { content: Array<{ type: string; text?: string }> }) => r.content[0]?.text ?? "";
 		try {
-			writeFileSync(join(dir, "a.txt"), "old\n");
+			writeFileSync(join(dir, "a.txt"), "one\ntwo\nthree\nfour\n");
 			let editActive = true;
 			const bash = createBashTool(dir, { editToolActive: () => editActive });
-			await expect(bash.execute("w1", { command: "sed -i 's/old/new/' a.txt" })).rejects.toThrow(
-				/^Not run: the command changes a\.txt \(sed -i\)\. Change files with edit/,
-			);
-			expect(readFileSync(join(dir, "a.txt"), "utf-8")).toBe("old\n");
-			await bash.execute("w2", { command: "echo log >> a.txt" });
-			// A new file has nothing to check: it is written.
-			await bash.execute("w2b", { command: "cat > b.txt <<'EOF'\nnew file\nEOF" });
+			const changed = await bash.execute("w1", { command: "sed -i 's/two/2/; s/three/3/' a.txt" });
+			expect(readFileSync(join(dir, "a.txt"), "utf-8")).toBe("one\n2\n3\nfour\n");
+			expect(text(changed)).toMatch(/a\.txt changed in lines 2-3\.$/);
+			// Nothing changed: nothing to report.
+			expect(text(await bash.execute("w2", { command: "sed -i 's/absent/x/' a.txt" }))).not.toMatch(/changed/);
+			// An append and a new file are not watched.
+			expect(text(await bash.execute("w3", { command: "echo log >> a.txt" }))).not.toMatch(/changed/);
+			await bash.execute("w4", { command: "cat > b.txt <<'EOF'\nnew file\nEOF" });
 			expect(readFileSync(join(dir, "b.txt"), "utf-8")).toBe("new file\n");
 			editActive = false;
-			await bash.execute("w3", { command: "sed -i 's/old/new/' a.txt" });
-			expect(readFileSync(join(dir, "a.txt"), "utf-8")).toBe("new\nlog\n");
+			expect(text(await bash.execute("w5", { command: "sed -i 's/one/1/' a.txt" }))).not.toMatch(/changed/);
+			expect(readFileSync(join(dir, "a.txt"), "utf-8")).toBe("1\n2\n3\nfour\nlog\n");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
