@@ -693,6 +693,8 @@ function resolveSpawnContext(
 	delete env.PI_PROVIDER;
 	delete env.PI_MODEL;
 	delete env.PI_REASONING_LEVEL;
+	// The session's remote machine (--remote): a Pi a command starts works here unless told otherwise.
+	delete env.PI_REMOTE;
 	if (exposeSessionEnvironment && ctx) {
 		const model = ctx.model;
 		env.PI_SESSION_ID = ctx.sessionManager.getSessionId();

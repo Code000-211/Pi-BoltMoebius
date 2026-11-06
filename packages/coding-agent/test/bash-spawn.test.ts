@@ -13,7 +13,7 @@ function script(path: string, output: string): void {
 	chmodSync(path, 0o755);
 }
 
-describe.skipIf(process.platform === "win32")("a simple command started without a shell", () => {
+describe.skipIf(process.platform === "win32")("how bash starts a command", () => {
 	let dir: string;
 	let path: string | undefined;
 	beforeEach(() => {
@@ -59,5 +59,17 @@ describe.skipIf(process.platform === "win32")("a simple command started without 
 		const missing = await bash.execute("d3", { command: "gone-tool" });
 		expect(missing.isError).toBe(true);
 		expect(getText(missing)).toMatch(/Command exited with code 127$/);
+	});
+
+	it("does not hand the session's remote machine to the commands it runs", async () => {
+		const remote = process.env.PI_REMOTE;
+		process.env.PI_REMOTE = "host:/srv/app";
+		try {
+			const bash = createBashTool(dir);
+			expect(getText(await bash.execute("r1", { command: 'echo "[$PI_REMOTE]"' }))).toBe("[]\n");
+		} finally {
+			if (remote === undefined) delete process.env.PI_REMOTE;
+			else process.env.PI_REMOTE = remote;
+		}
 	});
 });
