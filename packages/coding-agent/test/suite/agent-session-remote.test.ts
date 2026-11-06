@@ -1,8 +1,9 @@
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { clearNativeSearchCache, contentCacheStats } from "../../src/core/tools/native-search.ts";
 import { writeFakeSsh } from "../fake-ssh.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
@@ -29,6 +30,32 @@ describe("AgentSession on a remote machine", () => {
 		harness.session.messages
 			.filter((m) => m.role === "toolResult")
 			.map((m) => ({ text: getMessageText(m), error: m.isError }));
+
+	it("keeps the files there out of this machine's search caches and nested instructions", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		mkdirSync(join(remoteDir, "sub"));
+		writeFileSync(join(remoteDir, "sub", "AGENTS.md"), "Rules of this machine's folder at the same path.\n");
+		writeFileSync(join(remoteDir, "sub", "x.txt"), "there\n");
+		await harness.session.setRemote({ host: "fake", dir: remoteDir });
+		clearNativeSearchCache();
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("read", { path: "sub/x.txt" })], { stopReason: "toolUse" }),
+			fauxAssistantMessage(
+				[fauxToolCall("edit", { path: "sub/x.txt", edits: [{ oldText: "there", newText: "here" }] })],
+				{
+					stopReason: "toolUse",
+				},
+			),
+			fauxAssistantMessage("Done."),
+		]);
+		await harness.session.prompt("look there");
+		const results = toolResults(harness);
+		expect(results[0]?.text).toContain("there");
+		expect(results[0]?.text).not.toContain("Rules of this machine");
+		expect(results[1]).toMatchObject({ error: false });
+		expect(contentCacheStats().files).toBe(0);
+	});
 
 	it("lets go of the connections it no longer uses, also when a folder there cannot be reached", async () => {
 		const harness = await createHarness();

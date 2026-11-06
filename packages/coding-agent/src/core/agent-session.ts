@@ -2857,7 +2857,7 @@ export class AgentSession {
 				else ssh.close();
 				throw error;
 			}
-			const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
+			const harness = new ClaudeHarnessManager({ enableDiagnostics: false, local: false });
 			const bashOptions = {
 				operations: createRemoteBashOperations(ssh, () => dir),
 				backgroundJobs: this.backgroundJobs,
