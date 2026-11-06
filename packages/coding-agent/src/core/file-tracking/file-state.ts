@@ -18,6 +18,11 @@ export function pathKey(filePath: string): string {
 	return process.platform === "win32" ? norm.toLowerCase() : norm;
 }
 
+/** Whether `mtimeMs` is newer than the file's when the agent last read or wrote it, with 10 ms for timestamp rounding. */
+function changedSinceRead(state: TrackedFileState, mtimeMs: number): boolean {
+	return mtimeMs > state.lastReadMtimeMs + 10;
+}
+
 /** An existing file changed on disk since the agent last read or wrote it. */
 export class StaleFileError extends Error {
 	constructor() {
@@ -53,8 +58,7 @@ export class FileStateTracker {
 			throw new Error("File has not been read yet. Read it first before writing to it.");
 		}
 		const sameContent = currentContent !== undefined && state.contentComplete && currentContent === state.content;
-		// Allow a 10ms tolerance for filesystem timestamp quantization across platforms
-		if (currentMtimeMs !== undefined && currentMtimeMs > state.lastReadMtimeMs + 10) {
+		if (currentMtimeMs !== undefined && changedSinceRead(state, currentMtimeMs)) {
 			if (!sameContent) throw new StaleFileError();
 			state.lastReadMtimeMs = currentMtimeMs;
 		}
@@ -104,6 +108,15 @@ export class FileStateTracker {
 		if (isCppOrHipSource(normalizedPath)) {
 			this.indexLocalIncludes(normalizedPath, newContent);
 		}
+	}
+
+	/**
+	 * Whether `mtimeMs` is newer than when the agent last read or wrote the file, whose whole content it knows: the
+	 * content then decides whether it changed (assertCanModifyExistingFile).
+	 */
+	needsContentCompare(absolutePath: string, mtimeMs: number): boolean {
+		const state = this.files.get(pathKey(absolutePath));
+		return state?.contentComplete === true && changedSinceRead(state, mtimeMs);
 	}
 
 	hasBeenRead(absolutePath: string): boolean {

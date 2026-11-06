@@ -18,6 +18,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import random
 import shlex
 import shutil
 import statistics
@@ -660,7 +661,8 @@ class GatewayClient:
 
 def search_verify(root: Path) -> tuple[bool, str]:
     code, diff = sh("git status --porcelain", root)
-    changed = sorted(line[3:] for line in diff.splitlines() if line.strip())
+    # Bytecode caches Python wrote when the agent ran the code are not changes.
+    changed = sorted(line[3:] for line in diff.splitlines() if line.strip() and "__pycache__" not in line)
     want = ["services/payments/client.py", "services/payments/config.py"]
     if changed != want:
         return False, f"changed files: {changed}, want {want}"
@@ -822,10 +824,30 @@ def error_kind(tool: str, text: str) -> str:
     return "other"
 
 
+# One task for each part of the harness a change may touch, the fast ones where there is a choice: what to run before
+# each pull request (about 5 minutes with its defaults). It finds a failure or a large slowdown, not a 10% change:
+# for that, `--suite all --reps 5`.
+QUICK_TASKS = [
+    "py_bugs",  # Python edits and a test run
+    "c_strjoin",  # C, with the libclang checks
+    "c_name_ptr",  # C over six files, headers in include/ (Makefile -I)
+    "rust_durations",  # Rust, with cargo check
+    "ts_coupons",  # TypeScript
+    "c_tabs_ring",  # one precise edit in a tab-indented file
+    "search_large",  # search in 320 files
+    "def_lookup",  # a definition behind a re-export
+    "py_slow_suite",  # a 72 s command: the background and waiting
+]
+# What `--suite quick` runs with, unless given: reps, parallel runs, and seconds before a run is stopped.
+QUICK_DEFAULTS = {"reps": 2, "parallel": 8, "run_timeout": 300}
+
+
 def tool_suites() -> dict[str, list[Task]]:
     from hard_tasks import HARD_TASKS  # noqa: PLC0415 - hard_tasks imports this module
 
-    return {"easy": list(TASKS.values()), "hard": HARD_TASKS, "all": list(TASKS.values()) + HARD_TASKS}
+    everything = list(TASKS.values()) + HARD_TASKS
+    quick = [t for name in QUICK_TASKS for t in everything if t.name == name]
+    return {"easy": list(TASKS.values()), "hard": HARD_TASKS, "all": everything, "quick": quick}
 
 
 def parse_events(stdout: str) -> dict:
@@ -943,6 +965,12 @@ def run_one(task: Task, harness: str, cmd: list[str], agent_dir: Path, model: st
 
 
 def cmd_run(a: argparse.Namespace) -> None:
+    global RUN_TIMEOUT_S
+    defaults = QUICK_DEFAULTS if a.suite == "quick" else {"reps": 3, "parallel": 1, "run_timeout": 900}
+    for key, value in defaults.items():
+        if getattr(a, key) is None:
+            setattr(a, key, value)
+    RUN_TIMEOUT_S = a.run_timeout
     harnesses: dict[str, list[str]] = {}
     for spec in a.harness:
         name, _, command = spec.partition("=")
@@ -992,6 +1020,29 @@ def cmd_run(a: argparse.Namespace) -> None:
     report(out_dir)
 
 
+def paired_comparison(runs: list[dict], base: str, new: str) -> list[str]:
+    """`new` against `base` over the runs of the same task, model and repetition: the ratios of their sums, with a
+    bootstrap 95% interval. Above 1, `new` took longer (cost more, needed more turns)."""
+    by_key: dict[tuple, dict[str, dict]] = {}
+    for r in runs:
+        by_key.setdefault((r["task"], r["model"], r["rep"]), {})[r["harness"]] = r
+    pairs = [(v[base], v[new]) for v in by_key.values() if base in v and new in v]
+    if len(pairs) < 2:
+        return []
+    rng = random.Random(1)
+    lines = ["", f"{new} against {base}, {len(pairs)} paired runs (ratio of sums, bootstrap 95% interval):", ""]
+    for key, label in [("wall", "wall time"), ("cost", "cost"), ("turns", "turns")]:
+        def ratio(sample):
+            below = sum(b[key] for b, _ in sample)
+            return sum(n[key] for _, n in sample) / below if below else float("nan")
+        boot = sorted(ratio([rng.choice(pairs) for _ in pairs]) for _ in range(2000))
+        lines.append(f"- {label}: {ratio(pairs):.2f} [{boot[50]:.2f}, {boot[1949]:.2f}]")
+    solved_base = sum(b["solved"] for b, _ in pairs)
+    solved_new = sum(n["solved"] for _, n in pairs)
+    lines.append(f"- solved: {solved_new} against {solved_base} of {len(pairs)}")
+    return lines
+
+
 def report(out_dir: Path) -> None:
     runs = [json.loads(l) for l in (out_dir / "runs.jsonl").read_text().splitlines() if l.strip()]
     harnesses = list(dict.fromkeys(r["harness"] for r in runs))
@@ -1022,6 +1073,8 @@ def report(out_dir: Path) -> None:
                          f"{med([r['turns'] for r in rs]):.0f} | {kinds(rs)} | "
                          f"{sum(r['input'] + r['cache_write'] for r in rs) / 1000:.0f}k | {sum(r['cache_read'] for r in rs) / 1000:.0f}k | "
                          f"{sum(r['output'] for r in rs) / 1000:.0f}k | ${sum(r['cost'] for r in rs):.2f} |")
+    if len(harnesses) == 2:
+        lines += paired_comparison(runs, harnesses[0], harnesses[1])
     for m in models:
         lines += ["", f"Per task, {m} (solved, median wall time, median turns):", ""]
         lines.append("| Task | " + " | ".join(harnesses) + " |")
@@ -1076,10 +1129,11 @@ def main() -> None:
     run = sub.add_parser("run")
     run.add_argument("--harness", action="append", required=True, help="name=command, e.g. pi='node /x/pi'")
     run.add_argument("--model", action="append", required=True, help="repeatable; providers from --models-json")
-    run.add_argument("--suite", choices=["easy", "hard", "all"], default="easy")
-    run.add_argument("--parallel", type=int, default=1)
+    run.add_argument("--suite", choices=["easy", "hard", "all", "quick"], default="easy")
+    run.add_argument("--parallel", type=int, help="runs at once (default 1; quick: 8)")
     run.add_argument("--models-json", default="~/.pi/agent/models.json", help="where the model's provider is defined")
-    run.add_argument("--reps", type=int, default=3)
+    run.add_argument("--reps", type=int, help="repetitions of each task (default 3; quick: 2)")
+    run.add_argument("--run-timeout", type=int, help="seconds before a run is stopped (default 900; quick: 300)")
     run.add_argument("--task", action="append")
     run.add_argument("--out")
     run.set_defaults(func=cmd_run)
@@ -1087,7 +1141,7 @@ def main() -> None:
     rep.add_argument("dir")
     rep.set_defaults(func=lambda a: report(Path(a.dir)))
     st = sub.add_parser("selftest")
-    st.add_argument("--suite", choices=["easy", "hard", "all"], default="all")
+    st.add_argument("--suite", choices=["easy", "hard", "all", "quick"], default="all")
     st.set_defaults(func=cmd_selftest)
     a = parser.parse_args()
     a.func(a)
