@@ -25,6 +25,20 @@ describe.skipIf(process.platform === "win32")("a simple command started without 
 		rmSync(dir, { recursive: true, force: true });
 	});
 
+	it("runs a command in the warm shell with the environment as it is now, not as it was when the shell started", async () => {
+		// First in this file: the warm shell waits for its own folder, and a later test's folder would leave it unused.
+		const bash = createBashTool(dir);
+		process.env.PI_TEST_WARM_VARIABLE = "then";
+		try {
+			await bash.execute("w1", { command: 'echo "[$PI_TEST_WARM_VARIABLE]"' });
+			// The next warm shell starts after the call, with the variable.
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		} finally {
+			delete process.env.PI_TEST_WARM_VARIABLE;
+		}
+		expect(getText(await bash.execute("w2", { command: 'echo "[$PI_TEST_WARM_VARIABLE]"' }))).toBe("[]\n");
+	});
+
 	it("runs a program named by a path from the working directory, not one under a PATH folder", async () => {
 		mkdirSync(join(dir, "work", "bin"), { recursive: true });
 		mkdirSync(join(dir, "prefix", "bin"), { recursive: true });

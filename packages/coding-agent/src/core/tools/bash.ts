@@ -426,6 +426,8 @@ interface WarmBashProcess {
 	child: ChildProcess;
 	shellExe: string;
 	cwd: string;
+	/** The environment it started with: a command's own is applied as the difference to it. */
+	env: NodeJS.ProcessEnv;
 	msys?: { bash: string; group: string };
 }
 
@@ -507,7 +509,7 @@ function spawnWarmBashCandidate(
 			if (warmBashProcess?.child === child) warmBashProcess = undefined;
 		});
 		holdWarmShell(child, false);
-		return { child, shellExe, cwd, msys };
+		return { child, shellExe, cwd, env: baseEnv, msys };
 	} catch {
 		return undefined;
 	}
@@ -578,7 +580,7 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 					child = taken.child;
 					msys = taken.msys;
 					holdWarmShell(child, true);
-					const envPrefix = env ? buildEnvDiffScript(defaultShellEnv, shellEnv) : "";
+					const envPrefix = buildEnvDiffScript(taken.env, shellEnv);
 					const input = warmCommandInput(child);
 					input?.on("error", () => {});
 					input?.end(envPrefix ? `${envPrefix}${command}` : command);
