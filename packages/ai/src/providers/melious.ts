@@ -40,17 +40,10 @@ export interface MeliousModelEntry {
 }
 
 function parsePerMillionRate(value: string | number | undefined, fallback: number): number {
-	if (typeof value === "number") {
-		if (!Number.isFinite(value) || value < 0) return fallback;
-		// Values < 0.01 are per-token rates; convert to $/1M tokens.
-		return value > 0 && value < 0.01 ? Number((value * 1_000_000).toFixed(6)) : value;
-	}
-	if (typeof value === "string") {
-		const parsed = Number.parseFloat(value);
-		if (!Number.isFinite(parsed) || parsed < 0) return fallback;
-		return parsed > 0 && parsed < 0.01 ? Number((parsed * 1_000_000).toFixed(6)) : parsed;
-	}
-	return fallback;
+	const rate = typeof value === "string" ? Number.parseFloat(value) : value;
+	if (rate === undefined || !Number.isFinite(rate) || rate < 0) return fallback;
+	// Values < 0.01 are per-token rates; convert to $/1M tokens.
+	return rate > 0 && rate < 0.01 ? Number((rate * 1_000_000).toFixed(6)) : rate;
 }
 
 export function meliousCost(pricing: MeliousModelPricing | undefined, fallback?: ModelCost): ModelCost {
@@ -91,7 +84,12 @@ export async function personalizeMeliousCatalog(
 	}
 	if (response.status === 401 || response.status === 403 || response.status === 404) return catalog;
 	if (!response.ok) return catalog;
-	const body: unknown = await response.json();
+	let body: unknown;
+	try {
+		body = await response.json();
+	} catch {
+		return catalog;
+	}
 	if (typeof body !== "object" || body === null || !("data" in body) || !Array.isArray(body.data)) {
 		return catalog;
 	}
