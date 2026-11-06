@@ -249,6 +249,24 @@ describe("fixed sleeps", () => {
 		}
 	});
 
+	it("refuses a command before its leading sleep, not after it", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-sleep-"));
+		try {
+			const jobs = new BackgroundJobs();
+			fakeJob(jobs, "make");
+			const bash = createBashTool(dir, { backgroundJobs: jobs });
+			const start = performance.now();
+			// A pattern this process's own command line matches: the self-kill guard refuses it.
+			await expect(bash.execute("s5", { command: `sleep 45 && pkill -f '${process.argv[1]}'` })).rejects.toThrow(
+				/^Not run: `-f /,
+			);
+			expect(performance.now() - start).toBeLessThan(500);
+			jobs.killAll();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("does not run a command that sleeps longer than a command runs before it goes to the background", async () => {
 		const dir = mkdtempSync(join(tmpdir(), "pi-sleep-"));
 		try {

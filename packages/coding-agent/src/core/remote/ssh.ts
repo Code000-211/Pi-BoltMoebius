@@ -202,9 +202,14 @@ export class SshConnection {
 		throw error;
 	}
 
+	/** Lets go of this connection, and leaves the master connection to the host to others that share it. */
+	release(): void {
+		this.askpass?.close();
+	}
+
 	/** Ends the master connection. */
 	close(): void {
-		this.askpass?.close();
+		this.release();
 		const child = spawn(this.ssh, ["-o", `ControlPath=${this.controlPath}`, "-O", "exit", this.host], {
 			stdio: "ignore",
 		});

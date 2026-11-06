@@ -1463,6 +1463,8 @@ export class AgentSession {
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempts = 0;
+			// A run that ended cut off must not leave the next prompt thinking less.
+			this._cutOffResponses = 0;
 			const messageText = contentText(event.message.content, "");
 			if (messageText) {
 				// Check steering queue first
@@ -2846,8 +2848,16 @@ export class AgentSession {
 		let next: typeof this._remote;
 		if (target) {
 			const ssh = new SshConnection(target.host, { askSecret: this._askSecret });
-			const dir = await resolveRemoteDir(ssh, target.dir);
-			const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
+			let dir: string;
+			try {
+				dir = await resolveRemoteDir(ssh, target.dir);
+			} catch (error) {
+				// The master connection stays for the folder the session is on there.
+				if (this._remote?.ssh.host === target.host) ssh.release();
+				else ssh.close();
+				throw error;
+			}
+			const harness = new ClaudeHarnessManager({ enableDiagnostics: false, local: false });
 			const bashOptions = {
 				operations: createRemoteBashOperations(ssh, () => dir),
 				backgroundJobs: this.backgroundJobs,
@@ -2889,6 +2899,7 @@ export class AgentSession {
 		const previous = this._remote;
 		this._remote = next;
 		if (previous && previous.ssh.host !== next?.ssh.host) previous.ssh.close();
+		else previous?.ssh.release();
 		previous?.harness.dispose();
 
 		const active = this.getActiveToolNames();
@@ -3435,14 +3446,15 @@ export class AgentSession {
 		callbacks: RetryCallbacks | undefined,
 	): Promise<CompactionResult | undefined> {
 		const sessionModel = this.agent.state.model;
-		const thinkingLevel = this.agent.state.thinkingLevel;
 		if (
 			request.model.provider !== sessionModel.provider ||
 			request.model.id !== sessionModel.id ||
-			request.thinkingLevel !== thinkingLevel
+			request.thinkingLevel !== this.agent.state.thinkingLevel
 		) {
 			return undefined;
 		}
+		// As the requests it continues think: less after responses cut off at the output limit (_requestThinkingLevel).
+		const thinkingLevel = this._requestThinkingLevel();
 		// The messages the session's next request would send (see _installAgentRequestProjection and agent-loop).
 		let messages: AgentMessage[] = this.sessionManager.buildSessionProjection().messages;
 		if (this.agent.transformContext) messages = await this.agent.transformContext(messages, signal);

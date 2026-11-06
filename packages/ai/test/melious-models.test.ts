@@ -102,4 +102,10 @@ describe("Melious provider and models", () => {
 			cost: { input: 0.5, output: 1.5, cacheRead: 0, cacheWrite: 0 },
 		});
 	});
+
+	it("keeps the catalog when the model list is not JSON", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("<html>bad gateway</html>", { status: 200 }));
+		const catalog = meliousProvider().getModels();
+		await expect(personalizeMeliousCatalog(catalog, refreshContext())).resolves.toBe(catalog);
+	});
 });

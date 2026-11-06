@@ -399,9 +399,9 @@ function tryParseDirectBinaryCommand(
 	const trimmed = command.trim();
 	if (!trimmed || SHELL_METACHAR_REGEX.test(trimmed)) return undefined;
 	const tokens = trimmed.split(/[ \t]+/);
-	if (tokens.length === 0) return undefined;
 	const cmdName = tokens[0];
-	if (!cmdName || cmdName.includes("=") || SHELL_KEYWORDS_AND_BUILTINS.has(cmdName)) return undefined;
+	// A name with a slash is a path from the working directory (`bin/tool`), not one to look up on PATH.
+	if (!cmdName || /[/\\]/.test(cmdName) || SHELL_KEYWORDS_AND_BUILTINS.has(cmdName)) return undefined;
 	if (process.platform === "win32") {
 		for (let i = 0; i < tokens.length; i++) {
 			if (tokens[i].startsWith("/")) return undefined;
@@ -410,7 +410,8 @@ function tryParseDirectBinaryCommand(
 	const pathValue = env.PATH ?? env.Path ?? "";
 	const cacheKey = `${pathValue}\0${cmdName}`;
 	let resolved = directBinaryCache.get(cacheKey);
-	if (resolved === undefined) {
+	// A program removed since it was found is looked up again: the shell then reports it missing with exit code 127.
+	if (resolved === undefined || (resolved !== null && !existsSync(resolved))) {
 		resolved = findExecutableOnPath(cmdName, env) ?? null;
 		directBinaryCache.set(cacheKey, resolved);
 	}
@@ -425,6 +426,8 @@ interface WarmBashProcess {
 	child: ChildProcess;
 	shellExe: string;
 	cwd: string;
+	/** The environment it started with: a command's own is applied as the difference to it. */
+	env: NodeJS.ProcessEnv;
 	msys?: { bash: string; group: string };
 }
 
@@ -506,7 +509,7 @@ function spawnWarmBashCandidate(
 			if (warmBashProcess?.child === child) warmBashProcess = undefined;
 		});
 		holdWarmShell(child, false);
-		return { child, shellExe, cwd, msys };
+		return { child, shellExe, cwd, env: baseEnv, msys };
 	} catch {
 		return undefined;
 	}
@@ -577,7 +580,7 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 					child = taken.child;
 					msys = taken.msys;
 					holdWarmShell(child, true);
-					const envPrefix = env ? buildEnvDiffScript(defaultShellEnv, shellEnv) : "";
+					const envPrefix = buildEnvDiffScript(taken.env, shellEnv);
 					const input = warmCommandInput(child);
 					input?.on("error", () => {});
 					input?.end(envPrefix ? `${envPrefix}${command}` : command);
@@ -690,6 +693,8 @@ function resolveSpawnContext(
 	delete env.PI_PROVIDER;
 	delete env.PI_MODEL;
 	delete env.PI_REASONING_LEVEL;
+	// The session's remote machine (--remote): a Pi a command starts works here unless told otherwise.
+	delete env.PI_REMOTE;
 	if (exposeSessionEnvironment && ctx) {
 		const model = ctx.model;
 		env.PI_SESSION_ID = ctx.sessionManager.getSessionId();
@@ -778,9 +783,28 @@ export function createShellToolDefinition(
 			onUpdate?,
 			ctx?: ExtensionContext,
 		) {
+			if (jobs && !background && process.env.PI_BASH_SLEEP_GUARD !== "off") {
+				const sleep = fixedSleepSeconds(command);
+				// From oh-my-pi's "NEVER poll": a sleep that would only go on in the background.
+				if (sleep > Math.max(MAX_FIXED_SLEEP_SECONDS, autoBackgroundSeconds)) {
+					throw new Error(fixedSleepRefusal(sleep, autoBackgroundSeconds));
+				}
+			}
+			// From oh-my-pi's bash interceptor. In Pi's sessions, 65 of 2615 commands changed files this way. On this
+			// machine the command runs and gets the edit tool's checks afterwards (see checkChangedFiles): refusing it
+			// cost a turn each time, 35 times in 142 Terminal-Bench runs, mostly followed by the same change as an
+			// edit. On a remote machine what changed is not known here: such a command is refused.
+			const writes =
+				options?.editToolActive?.() && process.env.PI_BASH_EDIT_GUARD !== "off" ? fileWritesInCommand(command) : [];
+			if (options?.operations !== undefined && writes.length > 0) throw new Error(fileWriteRefusal(writes));
+			// On this machine only: a remote pkill does not reach this process.
+			if (options?.operations === undefined) {
+				const pattern = selfKillPattern(command);
+				if (pattern !== undefined) throw new Error(selfKillRefusal(pattern));
+			}
 			// A command that sleeps a while before looking at a job's progress: Pi sleeps for it, and stops when a job ends.
 			// Refusing it, as before, cost a turn 22 times in 230 Terminal-Bench runs, after which the model looked at once
-			// and again later.
+			// and again later. Only after the refusals above: a command refused after its sleep lost the sleep.
 			let sleptNote = "";
 			if (jobs && !background && jobs.running().length > 0 && process.env.PI_BASH_SLEEP_GUARD !== "off") {
 				const sleep = leadingSleep(command);
@@ -908,40 +932,19 @@ export function createShellToolDefinition(
 			const startedAtEpoch = Date.now();
 
 			const backgroundAfter = backgroundAfterMs(jobs, background, timeout, autoBackgroundSeconds);
-			if (jobs && !background && process.env.PI_BASH_SLEEP_GUARD !== "off") {
-				const sleep = fixedSleepSeconds(command);
-				// From oh-my-pi's "NEVER poll": a sleep that would only go on in the background.
-				if (sleep > Math.max(MAX_FIXED_SLEEP_SECONDS, autoBackgroundSeconds)) {
-					throw new Error(fixedSleepRefusal(sleep, autoBackgroundSeconds));
-				}
-			}
 			/** Existing files the command changes as edit and write would, with their content before it ran. */
 			const watched: WatchedFile[] = [];
-			if (options?.editToolActive?.() && process.env.PI_BASH_EDIT_GUARD !== "off") {
-				// From oh-my-pi's bash interceptor. In Pi's sessions, 65 of 2615 commands changed files this way. On this
-				// machine the command runs and gets the edit tool's checks afterwards (see checkChangedFiles): refusing it
-				// cost a turn each time, 35 times in 142 Terminal-Bench runs, mostly followed by the same change as an
-				// edit. On a remote machine what changed is not known here: such a command is refused.
-				const writes = fileWritesInCommand(command);
-				if (options.operations !== undefined) {
-					if (writes.length > 0) throw new Error(fileWriteRefusal(writes));
-				} else {
-					for (const w of writes) {
-						// Only files that exist: a new file has no compiler errors to compare.
-						const path = resolvePath(spawnContext.cwd, expandHome(w.dir), expandHome(w.target));
-						if (!existsSync(path) || watched.some((f) => f.path === path)) continue;
-						watched.push({
-							target: w.target,
-							path,
-							before: await readFileAsync(path, "utf-8").catch(() => undefined),
-						});
-					}
-				}
-			}
-			// On this machine only: a remote pkill does not reach this process.
 			if (options?.operations === undefined) {
-				const pattern = selfKillPattern(command);
-				if (pattern !== undefined) throw new Error(selfKillRefusal(pattern));
+				for (const w of writes) {
+					// Only files that exist: a new file has no compiler errors to compare.
+					const path = resolvePath(spawnContext.cwd, expandHome(w.dir), expandHome(w.target));
+					if (!existsSync(path) || watched.some((f) => f.path === path)) continue;
+					watched.push({
+						target: w.target,
+						path,
+						before: await readFileAsync(path, "utf-8").catch(() => undefined),
+					});
+				}
 			}
 			// The command's own abort: the tool call's, until the command goes to the background.
 			const commandAbort = new AbortController();
@@ -1076,9 +1079,9 @@ export function createShellToolDefinition(
 				if (options?.harness && !snapshot.truncation.truncated) {
 					// The model saw these files whole: editing or rewriting them needs no extra read.
 					const shown = filesShownByCat(command);
-					const base = resolvePath(spawnContext.cwd, shown.dir);
+					const base = resolvePath(spawnContext.cwd, expandHome(shown.dir));
 					for (const file of shown.files) {
-						const path = resolvePath(base, file);
+						const path = resolvePath(base, expandHome(file));
 						try {
 							const [content, info] = await Promise.all([readFileAsync(path, "utf-8"), statAsync(path)]);
 							options.harness.onFileRead(path, content, info.mtimeMs, spawnContext.cwd);

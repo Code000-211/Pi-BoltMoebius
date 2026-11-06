@@ -30,6 +30,7 @@ import { completeSimple, isContextOverflow } from "@earendil-works/pi-ai/compat"
 import { compactionSummaryText, convertToLlm } from "../messages.ts";
 import {
 	buildSessionProjection,
+	COMPACTED_USER_MESSAGE_CUT,
 	COMPACTED_USER_MESSAGES_MAX_CHARS,
 	type CompactionEntry,
 	compactedUserMessagesEnabled,
@@ -1107,6 +1108,8 @@ export interface CompactionPreparation {
 	settings: CompactionSettings;
 	/** The user's messages before the kept part that Pi's own compaction carries verbatim beside its summary. */
 	keptUserMessages?: string[];
+	/** False when some of them did not fit beside the summary: left out, or cut. */
+	keptUserMessagesComplete?: boolean;
 }
 
 /**
@@ -1115,7 +1118,13 @@ export interface CompactionPreparation {
  */
 export function keptUserMessagesInstruction(preparation: CompactionPreparation): string | undefined {
 	if (!preparation.keptUserMessages?.length) return undefined;
-	return `The user's own messages from this history stay word for word next to your summary (up to ${COMPACTED_USER_MESSAGES_MAX_CHARS.toLocaleString("en-US")} characters; a longer one is cut there and its rest is yours to summarize). Do not quote, copy or restate them anywhere in the summary. Under Goal, write one line that names the task (such as an issue's number and title) and says it is in the user's messages; under Constraints & Preferences, list only what the conversation added to them (clarifications, decisions, constraints found during the work), or "(none beyond the user's messages)".`;
+	const instruction = `The user's own messages from this history stay word for word next to your summary (up to ${COMPACTED_USER_MESSAGES_MAX_CHARS.toLocaleString("en-US")} characters; a longer one is cut there and its rest is yours to summarize). Do not quote, copy or restate them anywhere in the summary. Under Goal, write one line that names the task (such as an issue's number and title) and says it is in the user's messages; under Constraints & Preferences, list only what the conversation added to them (clarifications, decisions, constraints found during the work), or "(none beyond the user's messages)".`;
+	if (preparation.keptUserMessagesComplete !== false) return instruction;
+	// Not all fit: the summarizer has to know which stay, to summarize the others.
+	const starts = preparation.keptUserMessages
+		.map((text) => `- ${JSON.stringify(text.split("\n", 1)[0]!.slice(0, 100))}`)
+		.join("\n");
+	return `${instruction}\n\nNot all of them fit: only those that start as listed below stay (one cut short ends with "${COMPACTED_USER_MESSAGE_CUT.trim()}"). Summarize the user's other messages, and the rest of a cut one, as usual:\n${starts}`;
 }
 
 function isProjectedTurnStart(entry: ProjectedSessionEntry): boolean {
@@ -1255,9 +1264,9 @@ export function prepareCompaction(
 	}
 
 	const keptIndex = pathEntries.findIndex((entry) => entry.id === firstKeptEntryId);
-	const keptUserMessages = compactedUserMessagesEnabled()
+	const userMessages = compactedUserMessagesEnabled()
 		? userMessagesBefore(pathEntries, keptIndex < 0 ? pathEntries.length : keptIndex)
-		: [];
+		: { kept: [], complete: true };
 
 	return {
 		firstKeptEntryId,
@@ -1268,7 +1277,8 @@ export function prepareCompaction(
 		previousSummary,
 		fileOps,
 		settings,
-		keptUserMessages,
+		keptUserMessages: userMessages.kept,
+		keptUserMessagesComplete: userMessages.complete,
 	};
 }
 

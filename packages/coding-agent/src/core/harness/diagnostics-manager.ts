@@ -157,11 +157,17 @@ export class ClaudeHarnessManager {
 	private inflightWarmups = new Map<string, Promise<void>>();
 	/** C, C++ and HIP files are checked in the background ({@link cppChecker}), not during the edit. */
 	private cppInBackground = false;
+	/**
+	 * Whether the files are on this machine. Those on a remote machine stay out of the search caches here, and get no
+	 * nested AGENTS.md files: both would come from this machine's files at the same paths.
+	 */
+	private readonly local: boolean;
 
-	constructor(options?: { customProvider?: CustomDiagnosticsProvider; enableDiagnostics?: boolean }) {
+	constructor(options?: { customProvider?: CustomDiagnosticsProvider; enableDiagnostics?: boolean; local?: boolean }) {
 		this.cppHipEngine = new CppHipDiagnosticsEngine(this.stateTracker);
 		this.customProvider = options?.customProvider;
 		this.defaultEnableDiagnostics = options?.enableDiagnostics ?? true;
+		this.local = options?.local ?? true;
 	}
 
 	setCustomProvider(provider: CustomDiagnosticsProvider | undefined): void {
@@ -213,7 +219,7 @@ export class ClaudeHarnessManager {
 	): string {
 		this.stateTracker.recordFileRead(absolutePath, content, mtimeMs, contentComplete);
 		if (contentComplete) {
-			notifySearchFileTouched(absolutePath, rawBuffer ?? content, mtimeMs);
+			if (this.local) notifySearchFileTouched(absolutePath, rawBuffer ?? content, mtimeMs);
 			this.checks?.onRead(absolutePath);
 		}
 
@@ -232,6 +238,7 @@ export class ClaudeHarnessManager {
 			this.inflightWarmups.set(key, p);
 		}
 
+		if (!this.local) return "";
 		const nestedFiles = this.stateTracker.discoverNestedInstructionsOnRead(
 			absolutePath,
 			workspaceCwd,
@@ -312,7 +319,7 @@ export class ClaudeHarnessManager {
 			result?.diagnostics,
 			result?.complete === false ? "merge" : "replace",
 		);
-		notifySearchFileTouched(absolutePath, newContent, newMtimeMs);
+		if (this.local) notifySearchFileTouched(absolutePath, newContent, newMtimeMs);
 		this.checks?.onEdited(absolutePath);
 
 		let suffix = "";

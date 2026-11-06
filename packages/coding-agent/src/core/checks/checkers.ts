@@ -78,16 +78,26 @@ interface Ran {
 	code: number | null;
 }
 
-/** Runs `argv` without a shell; the output also when it exits with an error, which is how checkers report. */
-function run(argv: string[], cwd: string, signal: AbortSignal, env?: NodeJS.ProcessEnv): Promise<Ran> {
+/**
+ * Runs `argv` without a shell; the output also when it exits with an error, which is how checkers report. Rejects when
+ * it was aborted, could not start, or ran out of time: its output is then partial, not its findings.
+ */
+export function run(
+	argv: string[],
+	cwd: string,
+	signal: AbortSignal,
+	env?: NodeJS.ProcessEnv,
+	timeoutMs = RUN_TIMEOUT_MS,
+): Promise<Ran> {
 	return new Promise((resolvePromise, reject) => {
 		execFile(
 			argv[0]!,
 			argv.slice(1),
-			{ cwd, signal, env: { ...process.env, ...env }, timeout: RUN_TIMEOUT_MS, maxBuffer: 64 * 1024 * 1024 },
+			{ cwd, signal, env: { ...process.env, ...env }, timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 },
 			(error, stdout, stderr) => {
 				if (error && (error as NodeJS.ErrnoException).code === "ABORT_ERR") return reject(error);
 				if (error && typeof (error as { code?: unknown }).code === "string") return reject(error);
+				if (error?.killed) return reject(new Error(`${argv[0]} ran out of time after ${timeoutMs} ms`));
 				resolvePromise({
 					stdout: String(stdout),
 					stderr: String(stderr),

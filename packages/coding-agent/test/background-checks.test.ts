@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { BackgroundChecks } from "../src/core/checks/background-checks.ts";
-import { CHECKERS, type Checker, enabledCheckers, onPath } from "../src/core/checks/checkers.ts";
+import { CHECKERS, type Checker, enabledCheckers, onPath, run } from "../src/core/checks/checkers.ts";
 import type { HarnessDiagnostic } from "../src/core/harness/file-state-tracker.ts";
 import { ClaudeHarnessManager } from "../src/core/harness/index.ts";
 
@@ -153,6 +153,25 @@ describe("background checks", () => {
 		expect(enabledCheckers(undefined)).toBe(CHECKERS);
 		expect(enabledCheckers("off")).toEqual([]);
 		expect(enabledCheckers("rust, python").map((c) => c.name)).toEqual(["rust", "python"]);
+	});
+});
+
+describe("a checker's run", () => {
+	it("fails when it runs out of time, rather than passing its partial output on as findings", async () => {
+		await expect(
+			run(
+				["sh", "-c", "echo 'a.py:1:1: error[x] partial'; sleep 5"],
+				tmpdir(),
+				new AbortController().signal,
+				undefined,
+				200,
+			),
+		).rejects.toThrow(/ran out of time/);
+		await expect(run(["sh", "-c", "echo found; exit 1"], tmpdir(), new AbortController().signal)).resolves.toEqual({
+			stdout: "found\n",
+			stderr: "",
+			code: 1,
+		});
 	});
 });
 
