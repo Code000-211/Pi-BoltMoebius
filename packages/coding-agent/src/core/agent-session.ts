@@ -136,16 +136,13 @@ import { NestedToolCallRunner } from "./nested-tool-calls.ts";
 import { takeProjectSnapshot } from "./project-snapshot.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import {
-	type AskSecret,
-	createRemoteBashOperations,
-	createRemoteEditOperations,
-	createRemoteReadOperations,
-	createRemoteWriteOperations,
-	parseRemoteTarget,
-	type RemoteTarget,
-	resolveRemoteDir,
-	SshConnection,
-} from "./remote/ssh.ts";
+	REMOTE_ENTRY,
+	REMOTE_PAUSED_TOOLS,
+	RemoteWorkspace,
+	routedToRemote,
+	savedRemoteTarget,
+} from "./remote/remote-workspace.ts";
+import { type AskSecret, parseRemoteTarget, type RemoteTarget } from "./remote/ssh.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
 import {
@@ -172,13 +169,10 @@ import {
 	normalizeBuildSystemPromptOptions,
 } from "./system-prompt.ts";
 import { tokensAfterPruning } from "./tool-result-pruning.ts";
-import { type BashOperations, createBashToolDefinition, createLocalBashOperations } from "./tools/bash.ts";
+import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { isReadOnlyCommand } from "./tools/bash-read-only.ts";
-import { createEditToolDefinition } from "./tools/edit.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
-import { createReadToolDefinition } from "./tools/read.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
-import { createWriteToolDefinition } from "./tools/write.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
 import {
 	findLatestResponse,
@@ -231,12 +225,6 @@ export function parseSkillBlock(text: string): ParsedSkillBlock | null {
  * search in-process; otherwise they may first download ripgrep or fd, which would stay if the early run is dropped.
  */
 const EARLY_TOOL_NAMES: ReadonlySet<string> = new Set(PIBOLT ? ["read", "ls", "grep", "find"] : ["read", "ls"]);
-/** Built-in tools that work on the remote machine while there is one (see setRemote). */
-const REMOTE_ROUTED_TOOLS = new Set(["read", "edit", "write", "bash"]);
-/** Built-in tools that search this machine: off while working on another. */
-const REMOTE_PAUSED_TOOLS = new Set(["grep", "find", "ls"]);
-/** Custom session entry with the remote machine (a RemoteTarget), or null for this one. */
-const REMOTE_ENTRY = "remote";
 
 /**
  * Extensions whose `tool_call` handlers let calls of the tools in EARLY_TOOL_NAMES through unchanged. The built-in MCP
@@ -592,19 +580,11 @@ export class AgentSession {
 		),
 	);
 	/** The machine read, edit, write and bash work on over ssh, when not this one (see setRemote). */
-	private _remote:
-		| {
-				target: RemoteTarget;
-				ssh: SshConnection;
-				/** `target.dir`, resolved on the host. */
-				dir: string;
-				/** Read-before-edit for the host's files, apart from this machine's; no diagnostics there. */
-				fileTracker: FileTracker;
-				tools: Map<string, ToolDefinition>;
-				/** Local search tools turned off while working there, turned on again after. */
-				pausedTools: string[];
-		  }
-		| undefined;
+	private _remote: RemoteWorkspace | undefined;
+	/** Local search tools turned off while working on the remote machine, turned on again after. */
+	private _remotePausedTools: string[] = [];
+	/** Why the remote machine the session was working on could not be reached again when it was bound, if it could not. */
+	remoteRestoreError: string | undefined;
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -2023,13 +2003,7 @@ export class AgentSession {
 		const project = remote ? undefined : this._getProjectSnapshot();
 		this._baseSystemPromptOptions = normalizeBuildSystemPromptOptions({
 			cwd: remote ? `${remote.dir} on ${remote.target.host} (over ssh)` : this._cwd,
-			sections: remote
-				? {
-						remote: `read, edit, write and bash work on the machine ${remote.target.host} over ssh, in ${remote.dir}: paths are that machine's. grep, find and ls are off (they search this machine): search there with rg or find in bash. Edits there get no compiler diagnostics. Project context files and skills above are this machine's.`,
-					}
-				: project
-					? { project }
-					: undefined,
+			sections: remote ? { remote: remote.promptSection() } : project ? { project } : undefined,
 			skills: loadedSkills,
 			contextFiles: loadedContextFiles,
 			customPrompt: loaderSystemPrompt,
@@ -2738,66 +2712,25 @@ export class AgentSession {
 	 * folder cannot be reached (ssh runs without asking for passwords).
 	 */
 	async setRemote(target: RemoteTarget | undefined, options?: { persist?: boolean }): Promise<void> {
-		let next: typeof this._remote;
-		if (target) {
-			const ssh = new SshConnection(target.host, { askSecret: this._askSecret });
-			let dir: string;
-			try {
-				dir = await resolveRemoteDir(ssh, target.dir);
-			} catch (error) {
-				// The master connection stays for the folder the session is on there.
-				if (this._remote?.ssh.host === target.host) ssh.release();
-				else ssh.close();
-				throw error;
-			}
-			const fileTracker = new FileTracker({ local: false });
-			const bashOptions = {
-				operations: createRemoteBashOperations(ssh, () => dir),
-				backgroundJobs: this.backgroundJobs,
-				editToolActive: () => this.agent.state.tools.some((tool) => tool.name === "edit"),
-				exposeSessionEnvironment: false,
-			};
-			const tools = new Map<string, ToolDefinition>([
-				[
-					"read",
-					createReadToolDefinition(dir, {
-						operations: createRemoteReadOperations(ssh),
-						fileTracker,
-						autoResizeImages: this.settingsManager.getImageAutoResize(),
-					}) as ToolDefinition,
-				],
-				[
-					"edit",
-					createEditToolDefinition(dir, {
-						operations: createRemoteEditOperations(ssh),
-						fileTracker,
-						enforceReadBeforeEdit: true,
-						includePostEditSnippet: true,
-					}) as ToolDefinition,
-				],
-				[
-					"write",
-					createWriteToolDefinition(dir, {
-						operations: createRemoteWriteOperations(ssh),
-						fileTracker,
-						enforceReadBeforeEdit: true,
-					}) as ToolDefinition,
-				],
-				["bash", createBashToolDefinition(dir, bashOptions) as ToolDefinition],
-			]);
-			next = { target, ssh, dir, fileTracker, tools, pausedTools: this._remote?.pausedTools ?? [] };
-		}
 		const previous = this._remote;
+		const next = target
+			? await RemoteWorkspace.connect(target, {
+					askSecret: this._askSecret,
+					current: previous,
+					backgroundJobs: this.backgroundJobs,
+					editToolActive: () => this.agent.state.tools.some((tool) => tool.name === "edit"),
+					autoResizeImages: this.settingsManager.getImageAutoResize(),
+				})
+			: undefined;
 		this._remote = next;
-		if (previous && previous.ssh.host !== next?.ssh.host) previous.ssh.close();
-		else previous?.ssh.release();
+		previous?.leave(next);
 
 		const active = this.getActiveToolNames();
 		if (next && !previous) {
-			next.pausedTools = active.filter((name) => REMOTE_PAUSED_TOOLS.has(name));
+			this._remotePausedTools = active.filter((name) => REMOTE_PAUSED_TOOLS.has(name));
 			this.setActiveToolsByName(active.filter((name) => !REMOTE_PAUSED_TOOLS.has(name)));
 		} else if (!next && previous) {
-			this.setActiveToolsByName([...active, ...previous.pausedTools.filter((name) => !active.includes(name))]);
+			this.setActiveToolsByName([...active, ...this._remotePausedTools.filter((name) => !active.includes(name))]);
 		} else {
 			this._rebuildSystemPrompt(this.getActiveToolNames());
 		}
@@ -2811,41 +2744,15 @@ export class AgentSession {
 	 * new runtime).
 	 */
 	private async _restoreRemoteFromSession(): Promise<void> {
-		const fromFlag = process.env.PI_REMOTE ? parseRemoteTarget(process.env.PI_REMOTE) : undefined;
-		if (process.env.PI_REMOTE && !fromFlag) throw new Error(`Not a remote folder: ${process.env.PI_REMOTE}`);
+		const flag = process.env.PI_REMOTE;
+		const fromFlag = flag ? parseRemoteTarget(flag) : undefined;
+		if (flag && !fromFlag) throw new Error(`Not a remote folder: ${flag}`);
+		const saved = savedRemoteTarget(this.sessionManager.getBranch());
 		if (fromFlag) {
-			const current = this.sessionManager
-				.getBranch()
-				.findLast((e) => e.type === "custom" && (e as { customType?: string }).customType === REMOTE_ENTRY);
-			const saved = (current as { data?: RemoteTarget | null } | undefined)?.data;
 			const same = saved?.host === fromFlag.host && saved?.dir === fromFlag.dir;
 			return this.setRemote(fromFlag, { persist: !same });
 		}
-		const entry = this.sessionManager
-			.getBranch()
-			.findLast((e) => e.type === "custom" && (e as { customType?: string }).customType === REMOTE_ENTRY);
-		const target = (entry as { data?: RemoteTarget | null } | undefined)?.data;
-		if (target?.host) await this.setRemote(target, { persist: false });
-	}
-
-	/**
-	 * A built-in file tool or bash that runs on the remote machine while there is one. Its declaration stays the local
-	 * tool's, and the context it gets says the remote folder is the working folder.
-	 */
-	private _routedToRemote(name: string, definition: ToolDefinition): ToolDefinition {
-		if (!REMOTE_ROUTED_TOOLS.has(name)) return definition;
-		return {
-			...definition,
-			execute: (toolCallId, params, signal, onUpdate, ctx) => {
-				const remote = this._remote;
-				const tool = remote?.tools.get(name);
-				if (!remote || !tool) return definition.execute(toolCallId, params, signal, onUpdate, ctx);
-				const remoteCtx = new Proxy(ctx, {
-					get: (t, key, receiver) => (key === "cwd" ? remote.dir : Reflect.get(t, key, receiver)),
-				});
-				return tool.execute(toolCallId, params, signal, onUpdate, remoteCtx);
-			},
-		};
+		if (saved?.host) await this.setRemote(saved, { persist: false });
 	}
 
 	/** Resolves once no background job runs and every report is in a finished run (print mode exits after it). */
@@ -3989,9 +3896,6 @@ export class AgentSession {
 		}
 	}
 
-	/** Why the remote machine the session was working on could not be reached again when it was bound, if it could not. */
-	remoteRestoreError: string | undefined;
-
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
 		if (!this._extensionRunner.hasHandlers("resources_discover")) {
 			return;
@@ -4361,7 +4265,9 @@ export class AgentSession {
 		this._baseToolDefinitions = new Map(
 			Object.entries(baseToolDefinitions).map(([name, tool]) => [
 				name,
-				this._baseToolsOverride ? (tool as ToolDefinition) : this._routedToRemote(name, tool as ToolDefinition),
+				this._baseToolsOverride
+					? (tool as ToolDefinition)
+					: routedToRemote(name, tool as ToolDefinition, () => this._remote),
 			]),
 		);
 
