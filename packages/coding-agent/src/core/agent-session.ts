@@ -67,7 +67,7 @@ import { BACKGROUND_JOB_MESSAGE_TYPE, BackgroundJobs, formatJobReport, JobReport
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
-import { BackgroundChecks } from "./checks/background-checks.ts";
+import { BackgroundChecks, CHECK_REPORT_MESSAGE_TYPE } from "./checks/background-checks.ts";
 import { CHECKERS, enabledCheckers } from "./checks/checkers.ts";
 import { cppChecker } from "./checks/cpp/checker.ts";
 import { compactionFeatures } from "./compaction/features.ts";
@@ -171,7 +171,7 @@ import {
 	type NormalizedBuildSystemPromptOptions,
 	normalizeBuildSystemPromptOptions,
 } from "./system-prompt.ts";
-import { prunedTokens } from "./tool-result-pruning.ts";
+import { tokensAfterPruning } from "./tool-result-pruning.ts";
 import { type BashOperations, createBashToolDefinition, createLocalBashOperations } from "./tools/bash.ts";
 import { isReadOnlyCommand } from "./tools/bash-read-only.ts";
 import { createEditToolDefinition } from "./tools/edit.ts";
@@ -478,14 +478,6 @@ interface CompactionAhead {
 	done: boolean;
 }
 
-/** `customType` of the message that reports new errors from the background checks. */
-export const CHECK_REPORT_MESSAGE_TYPE = "check-report";
-/**
- * How long a run that would end waits for the checks of its edits (`PI_CHECKS_WAIT`, seconds): long enough for a
- * warm `cargo check` or `tsc`, short enough that a cold one on a large project does not hold the run.
- */
-const CHECKS_WAIT_MS = (Number(process.env.PI_CHECKS_WAIT) || 30) * 1000;
-
 function getOverflowRecoveryStep(
 	settings: CompactionSettings,
 	step: number,
@@ -673,10 +665,7 @@ export class AgentSession {
 			cwd: this._cwd,
 			checkers: enabledCheckers(undefined, cpp ? [...CHECKERS, cpp] : CHECKERS),
 			report: (text) => {
-				this.sendCustomMessage(
-					{ customType: CHECK_REPORT_MESSAGE_TYPE, content: text, display: true },
-					{ deliverAs: "steer" },
-				).catch(() => {});
+				this._sendCheckReport(text).catch(() => {});
 			},
 		});
 		if (checks.enabled) {
@@ -1000,7 +989,7 @@ export class AgentSession {
 	 * runs before every request and the footer asks after every entry, and each estimate walks the whole context.
 	 * `knownAfterCompaction` is false when the latest compaction has no projected assistant response with usage after it
 	 * (the size is unknown until the next response). `nextRequestTokens` is what the next request sends, which the
-	 * compaction threshold is checked against (see {@link _afterPruning}).
+	 * compaction threshold is checked against (see tokensAfterPruning).
 	 */
 	private _contextTokenEstimate(): { tokens: number; nextRequestTokens: number; knownAfterCompaction: boolean } {
 		const sessionManager = this.sessionManager;
@@ -1030,7 +1019,12 @@ export class AgentSession {
 			knownAfterCompaction = branch.slice(compactionIndex + 1).some((entry) => projectedAssistants.has(entry.id));
 		}
 		const estimate = estimateProjectedContextTokens(projection, branch);
-		const nextRequestTokens = this._afterPruning(estimate.tokens, projection.messages, estimate.lastUsageIndex);
+		const nextRequestTokens = tokensAfterPruning(
+			estimate.tokens,
+			projection.messages,
+			estimate.lastUsageIndex,
+			this.settingsManager.getToolResultPruningSettings(),
+		);
 		this._contextEstimate = {
 			sessionManager,
 			revision,
@@ -1039,21 +1033,6 @@ export class AgentSession {
 			knownAfterCompaction,
 		};
 		return this._contextEstimate;
-	}
-
-	/**
-	 * `tokens` of `messages` as the next request sends them: less what tool-result pruning (tool-result-pruning.ts)
-	 * clears in it beyond what it cleared in the request whose usage `tokens` counts (the one before the response at
-	 * `usageIndex`; without one, `tokens` is the estimate of all of `messages`). Pruning clears in steps, so a step can
-	 * take a context back below the compaction threshold that the size of the last request was above.
-	 */
-	private _afterPruning(tokens: number, messages: AgentMessage[], usageIndex: number | null): number {
-		const settings = this.settingsManager.getToolResultPruningSettings();
-		if (!settings.enabled) return tokens;
-		const cleared =
-			prunedTokens(convertToLlm(messages), settings) -
-			(usageIndex === null ? 0 : prunedTokens(convertToLlm(messages.slice(0, usageIndex)), settings));
-		return Math.max(0, tokens - Math.max(0, cleared));
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
@@ -2360,26 +2339,17 @@ export class AgentSession {
 		return !this._agentRunAbortRequested && this.agent.hasQueuedMessages();
 	}
 
-	/**
-	 * Before a run ends: the background checks of its edits, up to CHECKS_WAIT_MS, so their errors still reach it; with
-	 * none, the lint findings its changes brought, which wait until the run would end so as not to interrupt it.
-	 */
+	/** Before a run ends: the errors of its edits' checks, or else the lint findings (BackgroundChecks.settle). */
 	private async _waitForChecks(): Promise<void> {
-		const checks = this._checks;
-		if (!checks) return;
-		if (checks.busy) {
-			await checks.waitForIdle(CHECKS_WAIT_MS);
-			// A report is sent on a promise: let it reach the queue before the queue is looked at.
-			await new Promise<void>((resolve) => setImmediate(resolve));
-		}
-		if (this.agent.hasQueuedMessages()) return;
-		const lint = checks.takeLintReport();
-		if (lint) {
-			await this.sendCustomMessage(
-				{ customType: CHECK_REPORT_MESSAGE_TYPE, content: lint, display: true },
-				{ deliverAs: "steer" },
-			);
-		}
+		const lint = await this._checks?.settle(() => this.agent.hasQueuedMessages());
+		if (lint) await this._sendCheckReport(lint);
+	}
+
+	private _sendCheckReport(text: string): Promise<void> {
+		return this.sendCustomMessage(
+			{ customType: CHECK_REPORT_MESSAGE_TYPE, content: text, display: true },
+			{ deliverAs: "steer" },
+		);
 	}
 
 	private async _runBeforeSettleBoundary(): Promise<boolean> {
@@ -3708,9 +3678,10 @@ export class AgentSession {
 		const hasContextEdits = projection.entries.some((entry) => entry.sourceEntry.type === "context_edit");
 		const directContextTokens = assistantMessage.usage ? calculateContextTokens(assistantMessage.usage) : 0;
 		// What the next request sends: tool-result pruning may clear more of it than of the last one.
+		const pruning = this.settingsManager.getToolResultPruningSettings();
 		if (hasContextEdits) {
 			const estimate = estimateProjectedContextTokens(projection, branch);
-			contextTokens = this._afterPruning(estimate.tokens, projection.messages, estimate.lastUsageIndex);
+			contextTokens = tokensAfterPruning(estimate.tokens, projection.messages, estimate.lastUsageIndex, pruning);
 		} else if (assistantMessage.stopReason === "error" || directContextTokens === 0) {
 			const messages = this.agent.state.messages;
 			const estimate = estimateContextTokens(messages);
@@ -3729,11 +3700,12 @@ export class AgentSession {
 					return false;
 				}
 			}
-			contextTokens = this._afterPruning(estimate.tokens, messages, estimate.lastUsageIndex);
+			contextTokens = tokensAfterPruning(estimate.tokens, messages, estimate.lastUsageIndex, pruning);
 		} else {
 			const messages = this.agent.state.messages;
 			const index = messages.lastIndexOf(assistantMessage);
-			contextTokens = index < 0 ? directContextTokens : this._afterPruning(directContextTokens, messages, index);
+			contextTokens =
+				index < 0 ? directContextTokens : tokensAfterPruning(directContextTokens, messages, index, pruning);
 		}
 		// Near the threshold when a run ends, the summary is made while the user reads and writes; above it, while the
 		// agent goes on.

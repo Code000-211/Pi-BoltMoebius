@@ -64,6 +64,15 @@ function counts(diagnostics: Diagnostic[]): Counts {
 	return map;
 }
 
+/** `customType` of the message that reports new errors (or lint findings) from the background checks. */
+export const CHECK_REPORT_MESSAGE_TYPE = "check-report";
+
+/**
+ * How long a run that would end waits for the checks of its edits (`PI_CHECKS_WAIT`, seconds): long enough for a
+ * warm `cargo check` or `tsc`, short enough that a cold one on a large project does not hold the run.
+ */
+const CHECKS_WAIT_MS = (Number(process.env.PI_CHECKS_WAIT) || 30) * 1000;
+
 /** The findings not in `before`; without `before`, those in `files` only (one elsewhere may well have been there). */
 function newAgainst(diagnostics: Diagnostic[], before: Counts | undefined, files: Set<string>): Diagnostic[] {
 	const remaining = new Map(before ?? []);
@@ -253,6 +262,20 @@ export class BackgroundChecks {
 			}
 			this.idleWaiters.push(done);
 		});
+	}
+
+	/**
+	 * Before a run ends: waits for the checks of its edits, up to CHECKS_WAIT_MS, so their errors (sent through
+	 * `report`) still reach it. Then, when `hasQueued()` says nothing is waiting for the agent, the lint findings its
+	 * changes brought, which wait until the run would end so as not to interrupt it.
+	 */
+	async settle(hasQueued: () => boolean): Promise<string | undefined> {
+		if (this.busy) {
+			await this.waitForIdle(CHECKS_WAIT_MS);
+			// A report is sent on a promise: let it reach the queue before the queue is looked at.
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+		return hasQueued() ? undefined : this.takeLintReport();
 	}
 
 	/** Stops the running checks; none start after. */
