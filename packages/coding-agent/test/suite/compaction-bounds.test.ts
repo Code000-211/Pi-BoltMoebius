@@ -105,11 +105,14 @@ function summaryRequestText(context: TranscriptContext): string {
 
 describe("compaction bounds", () => {
 	// The standalone summary request's bounds; the request on the cached prefix is in agent-session-compaction.test.ts.
+	// The note on the user's messages kept verbatim is in compaction-user-messages.test.ts.
 	beforeAll(() => {
 		process.env.PI_COMPACTION_CACHED_PREFIX = "off";
+		process.env.PI_COMPACTION_USER_MESSAGES = "off";
 	});
 	afterAll(() => {
 		delete process.env.PI_COMPACTION_CACHED_PREFIX;
+		delete process.env.PI_COMPACTION_USER_MESSAGES;
 	});
 
 	const harnesses: Harness[] = [];

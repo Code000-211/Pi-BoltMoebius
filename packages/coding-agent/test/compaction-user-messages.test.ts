@@ -1,8 +1,14 @@
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { type AssistantMessage, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import { estimateTokens } from "../src/core/compaction/index.ts";
+import {
+	DEFAULT_COMPACTION_SETTINGS,
+	estimateTokens,
+	keptUserMessagesInstruction,
+	prepareCompaction,
+} from "../src/core/compaction/index.ts";
 import { type CompactionSummaryMessage, convertToLlm } from "../src/core/messages.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
+import { createHarness } from "./suite/harness.ts";
 
 function assistant(text: string): AssistantMessage {
 	return {
@@ -99,5 +105,69 @@ describe("the user's messages beside a compaction summary", () => {
 	it("is off with PI_COMPACTION_USER_MESSAGES=off", () => {
 		process.env.PI_COMPACTION_USER_MESSAGES = "off";
 		expect(summary(compactedSession()).userRequests).toBeUndefined();
+	});
+});
+
+describe("the user's messages in Pi's own compaction", () => {
+	afterEach(() => {
+		delete process.env.PI_COMPACTION_USER_MESSAGES;
+	});
+
+	it("leaves out a message a later one contains whole, as a run continued with its task again", () => {
+		const session = SessionManager.inMemory();
+		session.appendMessage({ role: "user", content: TICKET, timestamp: Date.now() });
+		session.appendMessage(assistant("round 1"));
+		session.appendMessage({
+			role: "user",
+			content: `${TICKET}\n\nNotes from the last round: x`,
+			timestamp: Date.now(),
+		});
+		const keptId = session.appendMessage(assistant("round 2"));
+		session.appendCompaction("summary", keptId, 5000);
+		expect(summary(session).userRequests).toEqual([`${TICKET}\n\nNotes from the last round: x`]);
+	});
+
+	it("tells the summary request not to restate them", async () => {
+		const harness = await createHarness();
+		const seen: string[] = [];
+		const respond = (context: { messages: unknown[] }) => {
+			const text = JSON.stringify(context.messages);
+			if (text.includes("being compacted to free context") || text.includes("structured context checkpoint")) {
+				seen.push(text);
+				return fauxAssistantMessage("## Goal\n(as in the user's messages)");
+			}
+			return fauxAssistantMessage(`ok ${"y".repeat(60_000)}`);
+		};
+		harness.setResponses(Array(6).fill(respond));
+		try {
+			await harness.session.prompt(TICKET);
+			await harness.session.prompt("go on");
+			await harness.session.prompt("and on");
+			await harness.session.compact();
+			expect(seen).toHaveLength(1);
+			expect(seen[0]).toContain("stay word for word next to your summary");
+			const message = harness.session.messages.find(
+				(m) => m.role === "compactionSummary",
+			) as CompactionSummaryMessage;
+			expect(message.userRequests?.[0]).toBe(TICKET);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	it("says nothing of them when they are off", async () => {
+		process.env.PI_COMPACTION_USER_MESSAGES = "off";
+		const session = SessionManager.inMemory();
+		session.appendMessage({ role: "user", content: TICKET, timestamp: Date.now() });
+		session.appendMessage(assistant("x".repeat(100_000)));
+		session.appendMessage({ role: "user", content: "more", timestamp: Date.now() });
+		session.appendMessage(assistant("y".repeat(100_000)));
+		const preparation = prepareCompaction(session.getBranch(), DEFAULT_COMPACTION_SETTINGS)!;
+		expect(preparation.keptUserMessages).toEqual([]);
+		expect(keptUserMessagesInstruction(preparation)).toBeUndefined();
+		delete process.env.PI_COMPACTION_USER_MESSAGES;
+		const on = prepareCompaction(session.getBranch(), DEFAULT_COMPACTION_SETTINGS)!;
+		expect(on.keptUserMessages).toEqual([TICKET, "more"]);
+		expect(keptUserMessagesInstruction(on)).toContain("Do not quote, copy or restate them");
 	});
 });

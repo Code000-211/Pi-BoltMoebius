@@ -144,10 +144,12 @@ describe("compaction scaled with the context window", () => {
 		process.env.PI_COMPACTION_CACHED_PREFIX = "off";
 		// The thresholds themselves: a summary made ahead would let the agent go on above them.
 		process.env.PI_COMPACTION_AHEAD = "off";
+		process.env.PI_COMPACTION_USER_MESSAGES = "off";
 	});
 	afterAll(() => {
 		delete process.env.PI_COMPACTION_CACHED_PREFIX;
 		delete process.env.PI_COMPACTION_AHEAD;
+		delete process.env.PI_COMPACTION_USER_MESSAGES;
 	});
 
 	const harnesses: Harness[] = [];
