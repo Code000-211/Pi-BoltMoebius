@@ -778,9 +778,28 @@ export function createShellToolDefinition(
 			onUpdate?,
 			ctx?: ExtensionContext,
 		) {
+			if (jobs && !background && process.env.PI_BASH_SLEEP_GUARD !== "off") {
+				const sleep = fixedSleepSeconds(command);
+				// From oh-my-pi's "NEVER poll": a sleep that would only go on in the background.
+				if (sleep > Math.max(MAX_FIXED_SLEEP_SECONDS, autoBackgroundSeconds)) {
+					throw new Error(fixedSleepRefusal(sleep, autoBackgroundSeconds));
+				}
+			}
+			// From oh-my-pi's bash interceptor. In Pi's sessions, 65 of 2615 commands changed files this way. On this
+			// machine the command runs and gets the edit tool's checks afterwards (see checkChangedFiles): refusing it
+			// cost a turn each time, 35 times in 142 Terminal-Bench runs, mostly followed by the same change as an
+			// edit. On a remote machine what changed is not known here: such a command is refused.
+			const writes =
+				options?.editToolActive?.() && process.env.PI_BASH_EDIT_GUARD !== "off" ? fileWritesInCommand(command) : [];
+			if (options?.operations !== undefined && writes.length > 0) throw new Error(fileWriteRefusal(writes));
+			// On this machine only: a remote pkill does not reach this process.
+			if (options?.operations === undefined) {
+				const pattern = selfKillPattern(command);
+				if (pattern !== undefined) throw new Error(selfKillRefusal(pattern));
+			}
 			// A command that sleeps a while before looking at a job's progress: Pi sleeps for it, and stops when a job ends.
 			// Refusing it, as before, cost a turn 22 times in 230 Terminal-Bench runs, after which the model looked at once
-			// and again later.
+			// and again later. Only after the refusals above: a command refused after its sleep lost the sleep.
 			let sleptNote = "";
 			if (jobs && !background && jobs.running().length > 0 && process.env.PI_BASH_SLEEP_GUARD !== "off") {
 				const sleep = leadingSleep(command);
@@ -908,40 +927,19 @@ export function createShellToolDefinition(
 			const startedAtEpoch = Date.now();
 
 			const backgroundAfter = backgroundAfterMs(jobs, background, timeout, autoBackgroundSeconds);
-			if (jobs && !background && process.env.PI_BASH_SLEEP_GUARD !== "off") {
-				const sleep = fixedSleepSeconds(command);
-				// From oh-my-pi's "NEVER poll": a sleep that would only go on in the background.
-				if (sleep > Math.max(MAX_FIXED_SLEEP_SECONDS, autoBackgroundSeconds)) {
-					throw new Error(fixedSleepRefusal(sleep, autoBackgroundSeconds));
-				}
-			}
 			/** Existing files the command changes as edit and write would, with their content before it ran. */
 			const watched: WatchedFile[] = [];
-			if (options?.editToolActive?.() && process.env.PI_BASH_EDIT_GUARD !== "off") {
-				// From oh-my-pi's bash interceptor. In Pi's sessions, 65 of 2615 commands changed files this way. On this
-				// machine the command runs and gets the edit tool's checks afterwards (see checkChangedFiles): refusing it
-				// cost a turn each time, 35 times in 142 Terminal-Bench runs, mostly followed by the same change as an
-				// edit. On a remote machine what changed is not known here: such a command is refused.
-				const writes = fileWritesInCommand(command);
-				if (options.operations !== undefined) {
-					if (writes.length > 0) throw new Error(fileWriteRefusal(writes));
-				} else {
-					for (const w of writes) {
-						// Only files that exist: a new file has no compiler errors to compare.
-						const path = resolvePath(spawnContext.cwd, expandHome(w.dir), expandHome(w.target));
-						if (!existsSync(path) || watched.some((f) => f.path === path)) continue;
-						watched.push({
-							target: w.target,
-							path,
-							before: await readFileAsync(path, "utf-8").catch(() => undefined),
-						});
-					}
-				}
-			}
-			// On this machine only: a remote pkill does not reach this process.
 			if (options?.operations === undefined) {
-				const pattern = selfKillPattern(command);
-				if (pattern !== undefined) throw new Error(selfKillRefusal(pattern));
+				for (const w of writes) {
+					// Only files that exist: a new file has no compiler errors to compare.
+					const path = resolvePath(spawnContext.cwd, expandHome(w.dir), expandHome(w.target));
+					if (!existsSync(path) || watched.some((f) => f.path === path)) continue;
+					watched.push({
+						target: w.target,
+						path,
+						before: await readFileAsync(path, "utf-8").catch(() => undefined),
+					});
+				}
 			}
 			// The command's own abort: the tool call's, until the command goes to the background.
 			const commandAbort = new AbortController();
