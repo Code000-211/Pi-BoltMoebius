@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
@@ -29,6 +29,28 @@ describe("AgentSession on a remote machine", () => {
 		harness.session.messages
 			.filter((m) => m.role === "toolResult")
 			.map((m) => ({ text: getMessageText(m), error: m.isError }));
+
+	it("lets go of the connections it no longer uses, also when a folder there cannot be reached", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.session.setSecretPrompt(async () => undefined);
+		// The askpass bridges' folders go here, away from those of other tests.
+		const savedTmp = process.env.TMPDIR;
+		process.env.TMPDIR = mkdtempSync(join(tmpdir(), "pi-bridges-"));
+		const bridgesDir = process.env.TMPDIR;
+		try {
+			await harness.session.setRemote({ host: "fake", dir: remoteDir });
+			await harness.session.setRemote({ host: "fake", dir: sshDir });
+			await expect(harness.session.setRemote({ host: "fake", dir: join(remoteDir, "missing") })).rejects.toThrow();
+			await harness.session.setRemote(undefined);
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			expect(readdirSync(bridgesDir)).toEqual([]);
+		} finally {
+			process.env.TMPDIR = savedTmp;
+			if (savedTmp === undefined) delete process.env.TMPDIR;
+			rmSync(bridgesDir, { recursive: true, force: true });
+		}
+	});
 
 	it("runs read, edit, write and bash there, with their checks, and turns the local search tools off meanwhile", async () => {
 		const harness = await createHarness({

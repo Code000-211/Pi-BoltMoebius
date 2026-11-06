@@ -2848,7 +2848,15 @@ export class AgentSession {
 		let next: typeof this._remote;
 		if (target) {
 			const ssh = new SshConnection(target.host, { askSecret: this._askSecret });
-			const dir = await resolveRemoteDir(ssh, target.dir);
+			let dir: string;
+			try {
+				dir = await resolveRemoteDir(ssh, target.dir);
+			} catch (error) {
+				// The master connection stays for the folder the session is on there.
+				if (this._remote?.ssh.host === target.host) ssh.release();
+				else ssh.close();
+				throw error;
+			}
 			const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
 			const bashOptions = {
 				operations: createRemoteBashOperations(ssh, () => dir),
@@ -2891,6 +2899,7 @@ export class AgentSession {
 		const previous = this._remote;
 		this._remote = next;
 		if (previous && previous.ssh.host !== next?.ssh.host) previous.ssh.close();
+		else previous?.ssh.release();
 		previous?.harness.dispose();
 
 		const active = this.getActiveToolNames();
