@@ -4,7 +4,7 @@ import { access as fsAccess, readFile as readFileAsync, stat as statAsync } from
 import { homedir, constants as osConstants } from "node:os";
 import { resolve as resolvePath } from "node:path";
 import type { Writable } from "node:stream";
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { type ChildProcess, spawn } from "child_process";
 import { type Static, Type } from "typebox";
 import { findExecutableOnPath, waitForChildProcess } from "../../utils/child-process.ts";
@@ -26,7 +26,7 @@ import type { FileTracker } from "../file-tracking/file-tracker.ts";
 import { type FileWrite, filesShownByCat, fileWritesInCommand } from "./bash-file-writes.ts";
 import { selfKillPattern, selfKillRefusal } from "./bash-self-kill.ts";
 import { notifySearchExternalChange } from "./native-search.ts";
-import { OutputAccumulator } from "./output-accumulator.ts";
+import { OutputAccumulator, type OutputSnapshot } from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { formatSize, type TruncationResult, truncationDetails } from "./truncate.ts";
@@ -676,6 +676,264 @@ export interface ShellToolConfig {
 	tempFilePrefix: string;
 }
 
+const appendStatus = (text: string, status: string) => `${text ? `${text}\n\n` : ""}${status}`;
+
+/**
+ * The checks before a command runs: a fixed sleep that would only go on in the background, a command that changes files
+ * as edit and write would on a remote machine, and a pkill that would end this process. Throws the refusal; returns the
+ * files the command writes as edit and write would (watched when it runs here, see checkChangedFiles).
+ */
+function refuseOrWatch(
+	command: string,
+	options: {
+		jobs: BackgroundJobs | undefined;
+		background: boolean | undefined;
+		autoBackgroundSeconds: number;
+		local: boolean;
+		editToolActive: boolean;
+	},
+): FileWrite[] {
+	if (options.jobs && !options.background) {
+		const sleep = fixedSleepSeconds(command);
+		// From oh-my-pi's "NEVER poll": a sleep that would only go on in the background.
+		if (sleep > Math.max(MAX_FIXED_SLEEP_SECONDS, options.autoBackgroundSeconds)) {
+			throw new Error(fixedSleepRefusal(sleep, options.autoBackgroundSeconds));
+		}
+	}
+	// From oh-my-pi's bash interceptor. In Pi's sessions, 65 of 2615 commands changed files this way. On this machine
+	// the command runs and gets the edit tool's checks afterwards (see checkChangedFiles): refusing it cost a turn each
+	// time, 35 times in 142 Terminal-Bench runs, mostly followed by the same change as an edit. On a remote machine what
+	// changed is not known here: such a command is refused.
+	const writes = options.editToolActive ? fileWritesInCommand(command) : [];
+	if (!options.local && writes.length > 0) throw new Error(fileWriteRefusal(writes));
+	// On this machine only: a remote pkill does not reach this process.
+	if (options.local) {
+		const pattern = selfKillPattern(command);
+		if (pattern !== undefined) throw new Error(selfKillRefusal(pattern));
+	}
+	return writes;
+}
+
+/** The existing files of `writes`, with their content before the command ran. */
+async function watchFiles(writes: FileWrite[], cwd: string): Promise<WatchedFile[]> {
+	const watched: WatchedFile[] = [];
+	for (const w of writes) {
+		// Only files that exist: a new file has no compiler errors to compare.
+		const path = resolvePath(cwd, expandHome(w.dir), expandHome(w.target));
+		if (!existsSync(path) || watched.some((f) => f.path === path)) continue;
+		watched.push({ target: w.target, path, before: await readFileAsync(path, "utf-8").catch(() => undefined) });
+	}
+	return watched;
+}
+
+/** Files a command printed whole with `cat`: the model saw them, so editing or rewriting them needs no extra read. */
+async function markCatFilesRead(command: string, cwd: string, fileTracker: FileTracker): Promise<void> {
+	const shown = filesShownByCat(command);
+	const base = resolvePath(cwd, expandHome(shown.dir));
+	for (const file of shown.files) {
+		const path = resolvePath(base, expandHome(file));
+		try {
+			const [content, info] = await Promise.all([readFileAsync(path, "utf-8"), statAsync(path)]);
+			fileTracker.onFileRead(path, content, info.mtimeMs, cwd);
+		} catch {}
+	}
+}
+
+/**
+ * A call's output: collected (OutputAccumulator: cleaned, its first lines and its end), sent on as updates at most every
+ * BASH_UPDATE_THROTTLE_MS, and formatted for the result with a note on what was left out.
+ */
+class CallOutput {
+	readonly accumulator: OutputAccumulator;
+	private readonly onUpdate: ((update: AgentToolResult<BashToolDetails | undefined>) => void) | undefined;
+	private accepting = true;
+	/** The call returned (its command went on in the background): no more updates for it. */
+	private updatesStopped = false;
+	private updateTimer: NodeJS.Timeout | undefined;
+	private updateDirty = false;
+	private lastUpdateAt = 0;
+	private fullOutputError: string | undefined;
+
+	constructor(
+		tempFilePrefix: string,
+		onUpdate: ((update: AgentToolResult<BashToolDetails | undefined>) => void) | undefined,
+	) {
+		this.accumulator = new OutputAccumulator({
+			tempFilePrefix,
+			maxBytes: BASH_MAX_BYTES,
+			clean: true,
+			headLines: BASH_HEAD_LINES,
+			headBytes: BASH_HEAD_BYTES,
+		});
+		this.onUpdate = onUpdate;
+		onUpdate?.({ content: [], details: undefined });
+	}
+
+	append(data: Buffer): void {
+		if (!this.accepting) return;
+		this.accumulator.append(data);
+		this.scheduleUpdate();
+	}
+
+	stopUpdates(): void {
+		this.updatesStopped = true;
+		this.clearUpdateTimer();
+	}
+
+	/** The output complete: the last update sent, the full output file closed. */
+	async finish(): Promise<OutputSnapshot> {
+		this.accepting = false;
+		this.accumulator.finish();
+		this.clearUpdateTimer();
+		this.emitUpdate();
+		const snapshot = this.accumulator.snapshot({ persistIfTruncated: true });
+		try {
+			this.accumulator.closeTempFile();
+		} catch (error) {
+			// A full disk must not cost the model the output and exit code it already has.
+			this.fullOutputError = error instanceof Error ? error.message : String(error);
+		}
+		return snapshot;
+	}
+
+	/** `snapshot` as the result shows it: the output, and what was left out of it and where the rest is. */
+	format(snapshot: OutputSnapshot, emptyText = "(no output)"): { text: string; details: BashToolDetails | undefined } {
+		const truncation = snapshot.truncation;
+		let text = snapshot.content || emptyText;
+		if (!truncation.truncated) return { text, details: undefined };
+		const details = { truncation: truncationDetails(truncation), fullOutputPath: snapshot.fullOutputPath };
+		const startLine = truncation.totalLines - (truncation.outputLines - (snapshot.headLines ?? 0)) + 1;
+		const endLine = truncation.totalLines;
+		const head = snapshot.headLines ? `lines 1-${snapshot.headLines} and ` : "";
+		const fullOutput = snapshot.fullOutputPath
+			? `Full output: ${snapshot.fullOutputPath}`
+			: "The full output could not be saved";
+		if (truncation.lastLinePartial) {
+			const lastLineSize = formatSize(this.accumulator.getLastLineBytes());
+			text += `\n\n[Showing ${head}the last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). ${fullOutput}]`;
+		} else if (truncation.truncatedBy === "lines") {
+			text += `\n\n[Showing ${head || "lines "}${startLine}-${endLine} of ${truncation.totalLines}. ${fullOutput}]`;
+		} else {
+			text += `\n\n[Showing ${head || "lines "}${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(BASH_MAX_BYTES)} limit). ${fullOutput}]`;
+		}
+		if (this.fullOutputError) {
+			text += snapshot.fullOutputPath
+				? `\n[The full output file is incomplete: ${this.fullOutputError}]`
+				: `\n[${this.fullOutputError}]`;
+		}
+		return { text, details };
+	}
+
+	private emitUpdate(): void {
+		if (!this.onUpdate || !this.updateDirty || this.updatesStopped) return;
+		this.updateDirty = false;
+		this.lastUpdateAt = Date.now();
+		const snapshot = this.accumulator.snapshot({ persistIfTruncated: true });
+		this.onUpdate({
+			content: [{ type: "text", text: snapshot.content || "" }],
+			details: {
+				truncation: snapshot.truncation.truncated ? truncationDetails(snapshot.truncation) : undefined,
+				fullOutputPath: snapshot.fullOutputPath,
+			},
+		});
+	}
+
+	private clearUpdateTimer(): void {
+		if (this.updateTimer) {
+			clearTimeout(this.updateTimer);
+			this.updateTimer = undefined;
+		}
+	}
+
+	private scheduleUpdate(): void {
+		if (!this.onUpdate || this.updatesStopped) return;
+		this.updateDirty = true;
+		const delay = BASH_UPDATE_THROTTLE_MS - (Date.now() - this.lastUpdateAt);
+		if (delay <= 0) {
+			this.clearUpdateTimer();
+			this.emitUpdate();
+			return;
+		}
+		this.updateTimer ??= setTimeout(() => {
+			this.updateTimer = undefined;
+			this.emitUpdate();
+		}, delay);
+	}
+}
+
+/**
+ * A command still running at its time to go to the background: kept running as a job of `jobs`, whose end is recorded
+ * when `running` settles. The call's result: the output so far, and where the rest goes.
+ */
+function moveToBackground(params: {
+	jobs: BackgroundJobs;
+	command: string;
+	cwd: string;
+	child: ChildProcess | undefined;
+	running: Promise<{ exitCode: number | null }>;
+	output: CallOutput;
+	startedAt: number;
+	kill: () => void;
+	background: boolean | undefined;
+	timeout: number | undefined;
+	backgroundAfterMs: number;
+}): AgentToolResult<BashToolDetails | undefined> {
+	const { jobs, command, output, background, timeout, backgroundAfterMs } = params;
+	output.stopUpdates();
+	const pid = keepAsBackgroundJob(params.child);
+	const file = output.accumulator.ensureFullOutputFile();
+	const { text, details } = output.format(output.accumulator.snapshot({ persistIfTruncated: true }), "");
+	const handle = jobs.add({
+		command,
+		cwd: params.cwd,
+		pid,
+		startedAt: params.startedAt,
+		outputFile: file,
+		output: () => output.accumulator.snapshot().content,
+		kill: params.kill,
+	});
+	const id = handle.job.id;
+	void params.running
+		.then(
+			(done) => ({ code: done.exitCode, status: done.exitCode === 0 ? ("done" as const) : ("failed" as const) }),
+			(err: unknown) => ({
+				code: null,
+				status:
+					err instanceof Error && err.message.startsWith("timeout:")
+						? ("timed out" as const)
+						: ("failed" as const),
+			}),
+		)
+		.then(async ({ code, status }) => {
+			if (pid) backgroundJobPids.delete(pid);
+			notifySearchExternalChange();
+			const done = await output.finish();
+			handle.end(status, code, done.content.slice(-BACKGROUND_DONE_TAIL_CHARS));
+		});
+	const stop = pid
+		? ` (pid ${pid}; stop it with: ${process.platform === "win32" ? `taskkill /T /F /PID ${pid}` : `kill -- -${pid}`})`
+		: "";
+	const atTimeout = !background && timeout !== undefined && backgroundAfterMs === timeout * 1000;
+	const status = background
+		? `Started in the background as job ${id}${stop}.`
+		: atTimeout
+			? `Command still running at its timeout of ${timeout} seconds: moved to the background as job ${id}${stop}, not stopped.`
+			: `Command still running after ${backgroundAfterMs / 1000} seconds: moved to the background as job ${id}${stop}.`;
+	return {
+		content: [
+			{
+				type: "text",
+				text: appendStatus(
+					text,
+					`${status} Its output goes ${background ? "" : "on "}into ${file ?? "memory"}${background && timeout ? `; its timeout of ${timeout} seconds still ends it` : ""}. ` +
+						"A message reports when it ends, with its exit code and the end of its output: go on with other work, and call wait only when nothing else is left.",
+				),
+			},
+		],
+		details,
+	};
+}
+
 export function createShellToolDefinition(
 	cwd: string,
 	config: ShellToolConfig,
@@ -706,24 +964,14 @@ export function createShellToolDefinition(
 			onUpdate?,
 			ctx?: ExtensionContext,
 		) {
-			if (jobs && !background) {
-				const sleep = fixedSleepSeconds(command);
-				// From oh-my-pi's "NEVER poll": a sleep that would only go on in the background.
-				if (sleep > Math.max(MAX_FIXED_SLEEP_SECONDS, autoBackgroundSeconds)) {
-					throw new Error(fixedSleepRefusal(sleep, autoBackgroundSeconds));
-				}
-			}
-			// From oh-my-pi's bash interceptor. In Pi's sessions, 65 of 2615 commands changed files this way. On this
-			// machine the command runs and gets the edit tool's checks afterwards (see checkChangedFiles): refusing it
-			// cost a turn each time, 35 times in 142 Terminal-Bench runs, mostly followed by the same change as an
-			// edit. On a remote machine what changed is not known here: such a command is refused.
-			const writes = options?.editToolActive?.() ? fileWritesInCommand(command) : [];
-			if (options?.operations !== undefined && writes.length > 0) throw new Error(fileWriteRefusal(writes));
-			// On this machine only: a remote pkill does not reach this process.
-			if (options?.operations === undefined) {
-				const pattern = selfKillPattern(command);
-				if (pattern !== undefined) throw new Error(selfKillRefusal(pattern));
-			}
+			const local = options?.operations === undefined;
+			const writes = refuseOrWatch(command, {
+				jobs,
+				background,
+				autoBackgroundSeconds,
+				local,
+				editToolActive: options?.editToolActive?.() ?? false,
+			});
 			// A command that sleeps a while before looking at a job's progress: Pi sleeps for it, and stops when a job ends.
 			// Refusing it, as before, cost a turn 22 times in 230 Terminal-Bench runs, after which the model looked at once
 			// and again later. Only after the refusals above: a command refused after its sleep lost the sleep.
@@ -735,139 +983,20 @@ export function createShellToolDefinition(
 					command = sleep.rest || "true";
 				}
 			}
-			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
 			const spawnContext = resolveSpawnContext(
-				resolvedCommand,
+				commandPrefix ? `${commandPrefix}\n${command}` : command,
 				ctx?.cwd || cwd,
 				spawnHook,
 				exposeSessionEnvironment,
 				ctx,
 			);
-			const output = new OutputAccumulator({
-				tempFilePrefix: config.tempFilePrefix,
-				maxBytes: BASH_MAX_BYTES,
-				clean: true,
-				headLines: BASH_HEAD_LINES,
-				headBytes: BASH_HEAD_BYTES,
-			});
-			let acceptingOutput = true;
-			let updateTimer: NodeJS.Timeout | undefined;
-			let updateDirty = false;
-			// The call returned (its command went on in the background): no more updates for it.
-			let updatesStopped = false;
-			let lastUpdateAt = 0;
-
-			const emitOutputUpdate = () => {
-				if (!onUpdate || !updateDirty || updatesStopped) return;
-				updateDirty = false;
-				lastUpdateAt = Date.now();
-				const snapshot = output.snapshot({ persistIfTruncated: true });
-				onUpdate({
-					content: [{ type: "text", text: snapshot.content || "" }],
-					details: {
-						truncation: snapshot.truncation.truncated ? truncationDetails(snapshot.truncation) : undefined,
-						fullOutputPath: snapshot.fullOutputPath,
-					},
-				});
-			};
-
-			const clearUpdateTimer = () => {
-				if (updateTimer) {
-					clearTimeout(updateTimer);
-					updateTimer = undefined;
-				}
-			};
-
-			const scheduleOutputUpdate = () => {
-				if (!onUpdate || updatesStopped) return;
-				updateDirty = true;
-				const delay = BASH_UPDATE_THROTTLE_MS - (Date.now() - lastUpdateAt);
-				if (delay <= 0) {
-					clearUpdateTimer();
-					emitOutputUpdate();
-					return;
-				}
-				updateTimer ??= setTimeout(() => {
-					updateTimer = undefined;
-					emitOutputUpdate();
-				}, delay);
-			};
-
-			if (onUpdate) {
-				onUpdate({ content: [], details: undefined });
-			}
+			const output = new CallOutput(config.tempFilePrefix, onUpdate);
 			if (sleptNote) output.append(Buffer.from(sleptNote));
-
-			const handleData = (data: Buffer) => {
-				if (!acceptingOutput) return;
-				output.append(data);
-				scheduleOutputUpdate();
-			};
-
-			const finishOutput = async () => {
-				acceptingOutput = false;
-				output.finish();
-				clearUpdateTimer();
-				emitOutputUpdate();
-				const snapshot = output.snapshot({ persistIfTruncated: true });
-				try {
-					output.closeTempFile();
-				} catch (error) {
-					// A full disk must not cost the model the output and exit code it already has.
-					fullOutputError = error instanceof Error ? error.message : String(error);
-				}
-				return snapshot;
-			};
-
-			let fullOutputError: string | undefined;
-			const formatOutput = (snapshot: Awaited<ReturnType<typeof finishOutput>>, emptyText = "(no output)") => {
-				const truncation = snapshot.truncation;
-				let text = snapshot.content || emptyText;
-				let details: BashToolDetails | undefined;
-				if (truncation.truncated) {
-					details = { truncation: truncationDetails(truncation), fullOutputPath: snapshot.fullOutputPath };
-					const startLine = truncation.totalLines - (truncation.outputLines - (snapshot.headLines ?? 0)) + 1;
-					const endLine = truncation.totalLines;
-					const head = snapshot.headLines ? `lines 1-${snapshot.headLines} and ` : "";
-					const fullOutput = snapshot.fullOutputPath
-						? `Full output: ${snapshot.fullOutputPath}`
-						: "The full output could not be saved";
-					if (truncation.lastLinePartial) {
-						const lastLineSize = formatSize(output.getLastLineBytes());
-						text += `\n\n[Showing ${head}the last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). ${fullOutput}]`;
-					} else if (truncation.truncatedBy === "lines") {
-						text += `\n\n[Showing ${head || "lines "}${startLine}-${endLine} of ${truncation.totalLines}. ${fullOutput}]`;
-					} else {
-						text += `\n\n[Showing ${head || "lines "}${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(BASH_MAX_BYTES)} limit). ${fullOutput}]`;
-					}
-					if (fullOutputError) {
-						text += snapshot.fullOutputPath
-							? `\n[The full output file is incomplete: ${fullOutputError}]`
-							: `\n[${fullOutputError}]`;
-					}
-				}
-				return { text, details };
-			};
-
-			const appendStatus = (text: string, status: string) => `${text ? `${text}\n\n` : ""}${status}`;
 			const startedAt = performance.now();
 			const startedAtEpoch = Date.now();
-
 			const backgroundAfter = backgroundAfterMs(jobs, background, timeout, autoBackgroundSeconds);
 			/** Existing files the command changes as edit and write would, with their content before it ran. */
-			const watched: WatchedFile[] = [];
-			if (options?.operations === undefined) {
-				for (const w of writes) {
-					// Only files that exist: a new file has no compiler errors to compare.
-					const path = resolvePath(spawnContext.cwd, expandHome(w.dir), expandHome(w.target));
-					if (!existsSync(path) || watched.some((f) => f.path === path)) continue;
-					watched.push({
-						target: w.target,
-						path,
-						before: await readFileAsync(path, "utf-8").catch(() => undefined),
-					});
-				}
-			}
+			const watched = local ? await watchFiles(writes, spawnContext.cwd) : [];
 			// The command's own abort: the tool call's, until the command goes to the background.
 			const commandAbort = new AbortController();
 			const forwardAbort = () => commandAbort.abort();
@@ -875,92 +1004,48 @@ export function createShellToolDefinition(
 			else signal?.addEventListener("abort", forwardAbort, { once: true });
 			let spawned: ChildProcess | undefined;
 			// The command goes to the background only once its process exists: it has to be known to end it.
-			let markSpawned = () => {};
-			const spawnedOnce = new Promise<void>((resolve) => {
-				markSpawned = resolve;
-			});
+			const spawnedOnce = Promise.withResolvers<void>();
 
 			try {
 				let exitCode: number | null;
 				try {
 					const running = ops.exec(spawnContext.command, spawnContext.cwd, {
-						onData: handleData,
+						onData: (data) => output.append(data),
 						signal: backgroundAfter !== undefined ? commandAbort.signal : signal,
 						// A command the call starts in the background keeps its timeout; another one goes there at it.
 						timeout: backgroundAfter === undefined || background ? timeout : undefined,
 						env: spawnContext.env,
 						onSpawn: (child) => {
 							spawned = child;
-							markSpawned();
+							spawnedOnce.resolve();
 						},
 					});
 					const result =
 						backgroundAfter !== undefined
-							? await Promise.race([running, spawnedOnce.then(() => untilBackground(running, backgroundAfter))])
+							? await Promise.race([
+									running,
+									spawnedOnce.promise.then(() => untilBackground(running, backgroundAfter)),
+								])
 							: await running;
 					if (result === MOVED_TO_BACKGROUND) {
 						signal?.removeEventListener("abort", forwardAbort);
-						updatesStopped = true;
-						const pid = keepAsBackgroundJob(spawned);
-						const file = output.ensureFullOutputFile();
-						const { text, details } = formatOutput(output.snapshot({ persistIfTruncated: true }), "");
-						const handle = jobs!.add({
+						return moveToBackground({
+							jobs: jobs!,
 							command,
 							cwd: spawnContext.cwd,
-							pid,
+							child: spawned,
+							running,
+							output,
 							startedAt: startedAtEpoch,
-							outputFile: file,
-							output: () => output.snapshot().content,
 							kill: () => commandAbort.abort(),
+							background,
+							timeout,
+							backgroundAfterMs: backgroundAfter!,
 						});
-						const id = handle.job.id;
-						void running
-							.then(
-								(done) => ({
-									code: done.exitCode,
-									status: done.exitCode === 0 ? ("done" as const) : ("failed" as const),
-								}),
-								(err: unknown) => ({
-									code: null,
-									status:
-										err instanceof Error && err.message.startsWith("timeout:")
-											? ("timed out" as const)
-											: ("failed" as const),
-								}),
-							)
-							.then(async ({ code, status }) => {
-								if (pid) backgroundJobPids.delete(pid);
-								notifySearchExternalChange();
-								const done = await finishOutput();
-								handle.end(status, code, done.content.slice(-BACKGROUND_DONE_TAIL_CHARS));
-							});
-						const stop = pid
-							? ` (pid ${pid}; stop it with: ${process.platform === "win32" ? `taskkill /T /F /PID ${pid}` : `kill -- -${pid}`})`
-							: "";
-						const atTimeout = !background && timeout !== undefined && backgroundAfter === timeout * 1000;
-						const status = background
-							? `Started in the background as job ${id}${stop}.`
-							: atTimeout
-								? `Command still running at its timeout of ${timeout} seconds: moved to the background as job ${id}${stop}, not stopped.`
-								: `Command still running after ${backgroundAfter! / 1000} seconds: moved to the background as job ${id}${stop}.`;
-						return {
-							content: [
-								{
-									type: "text",
-									text: appendStatus(
-										text,
-										`${status} Its output goes ${background ? "" : "on "}into ${file ?? "memory"}${background && timeout ? `; its timeout of ${timeout} seconds still ends it` : ""}. ` +
-											"A message reports when it ends, with its exit code and the end of its output: go on with other work, and call wait only when nothing else is left.",
-									),
-								},
-							],
-							details,
-						};
 					}
 					exitCode = result.exitCode;
 				} catch (err) {
-					const snapshot = await finishOutput();
-					const { text } = formatOutput(snapshot, "");
+					const { text } = output.format(await output.finish(), "");
 					if (err instanceof Error && err.message === "aborted") {
 						throw new Error(appendStatus(text, "Command aborted"));
 					}
@@ -971,13 +1056,13 @@ export function createShellToolDefinition(
 					throw err;
 				}
 
-				const snapshot = await finishOutput();
-				const { text: outputText, details } = formatOutput(snapshot);
+				const snapshot = await output.finish();
+				const { text: outputText, details } = output.format(snapshot);
 				if (exitCode === null) {
 					throw new Error(appendStatus(outputText, "Command terminated without an exit code"));
 				}
 				const wallTimeSeconds = Math.round((performance.now() - startedAt) / 100) / 10;
-				const fullOutput = await output.readFullOutput(STRUCTURED_OUTPUT_MAX_BYTES);
+				const fullOutput = await output.accumulator.readFullOutput(STRUCTURED_OUTPUT_MAX_BYTES);
 				const structuredContent: BashToolOutput = {
 					output: fullOutput.content,
 					truncated: fullOutput.truncated,
@@ -999,20 +1084,11 @@ export function createShellToolDefinition(
 					};
 				}
 				if (options?.fileTracker && !snapshot.truncation.truncated) {
-					// The model saw these files whole: editing or rewriting them needs no extra read.
-					const shown = filesShownByCat(command);
-					const base = resolvePath(spawnContext.cwd, expandHome(shown.dir));
-					for (const file of shown.files) {
-						const path = resolvePath(base, expandHome(file));
-						try {
-							const [content, info] = await Promise.all([readFileAsync(path, "utf-8"), statAsync(path)]);
-							options.fileTracker.onFileRead(path, content, info.mtimeMs, spawnContext.cwd);
-						} catch {}
-					}
+					await markCatFilesRead(command, spawnContext.cwd, options.fileTracker);
 				}
 				return { content: [{ type: "text", text: outputText + changes }], details, structuredContent };
 			} finally {
-				clearUpdateTimer();
+				output.stopUpdates();
 				signal?.removeEventListener("abort", forwardAbort);
 				// The command may have created, changed or removed files that grep and find hold in their caches.
 				notifySearchExternalChange();
