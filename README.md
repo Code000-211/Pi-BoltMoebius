@@ -208,8 +208,11 @@ above the file), the unit is compiled for gfx1201 and its machine code checked a
 a register used before the `s_wait_*` its load needs (above all after a memory instruction in inline asm, which the
 compiler does not wait for), WMMA and VOPD hazards, use after VGPR deallocation. These come as errors at the source
 line, with the wait to insert; spills, scratch arrays and memory instructions in inline asm come as lint findings.
-AMDGPU `.s` files are checked the same way. A check compiles the whole unit: 1-60 s on libr4d's units, so a large one
-can report after the run ended (`PI_CHECKS_WAIT`). `PI_CHECKS` names it `rdna4-isa`.
+AMDGPU `.s` files are checked the same way. The unit is optimised as a whole each time, but only kernels whose optimised
+code changed are compiled and checked again; the others come from radisa's cache. On libr4d with clang 20: 12 s for the
+first check of `r4d_attn_paged_h256_gqa12` (38 kernels), 4.6 s after an edit that changes few kernels (the whole compile
+took 18 s); for `r4d_gemm_iqr` (704 kernels) 86 s instead of more than 10 minutes. A large unit can still report after the
+run ended (`PI_CHECKS_WAIT`) or exceed the checks' 300 s limit on its first check. `PI_CHECKS` names it `rdna4-isa`.
 
 On Moebius (443 Rust files), a type error the model wrote was reported 3 s after the edit, before the run ended, and
 fixed; rust-analyzer, which Pi used before, reported nothing within 84 s and took 3.2 GB. `PI_CHECKS=off` turns the
