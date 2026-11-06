@@ -7,12 +7,13 @@
  * native `tsc` (about 3-10x the JavaScript one), `cargo check` for Rust (1.4 s warm on Moebius's 440-file workspace,
  * where rust-analyzer gave no answer within 84 s and took 3.2 GB), shuck for shell (2-4 ms), luau-analyze (5 ms), and
  * Bun's own parsers for JSON, TOML and YAML (all three in about 1 ms, in the process). C, C++ and HIP are not here: libclang
- * checks them in the process (cpp/checker.ts, cpp/libclang.ts), with the files the agent read.
+ * checks them in the process (cpp/checker.ts, cpp/libclang.ts), with the files the agent read. HIP built for AMD RDNA4 is
+ * also checked as machine code, by radisa (`rdna4-isa` below).
  */
 
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -477,6 +478,161 @@ const json = dataChecker("json", ["json"], () => JSON.parse);
 const toml = dataChecker("toml", ["toml"], () => bunParser("TOML"));
 const yaml = dataChecker("yaml", ["yaml", "yml"], () => bunParser("YAML"));
 
+// ------------------------------------------------------- AMD RDNA4 (gfx12) machine code: radisa from rdna4-isa-suite
+
+/**
+ * radisa (github.com/Code000-211/radiance-rdna4-isa-suite) compiles a HIP unit for gfx1201 and checks the machine code
+ * against AMD's machine-readable RDNA4 ISA: memory-counter waits the code misses (`s_wait_*`, typically after inline-asm
+ * memory instructions, which the compiler does not track), WMMA and VOPD hazards, VGPR deallocation, spills. Syntax and
+ * type errors are libclang's (cpp/checker.ts); this only adds what the compiler accepts but the hardware does not.
+ */
+
+/** The suite folder (the one holding radisa/): `PI_RADISA`, else `tools/rdna4-isa-suite` or `rdna4-isa-suite` above. */
+function radisaSuite(dir: string): string | undefined {
+	const env = process.env.PI_RADISA;
+	if (env) return existsSync(join(env, "radisa", "__main__.py")) ? resolve(env) : undefined;
+	for (const sub of [join("tools", "rdna4-isa-suite"), "rdna4-isa-suite"]) {
+		const found = findUp(dir, [join(sub, "radisa", "__main__.py")]);
+		if (found) return join(found, sub);
+	}
+	return undefined;
+}
+
+/** The compile_commands.json for a file, as the C/C++ linter finds it. */
+function compileDb(dir: string): string | undefined {
+	const found = findUp(dir, ["compile_commands.json", join("build", "compile_commands.json")]);
+	if (!found) return undefined;
+	return existsSync(join(found, "compile_commands.json"))
+		? join(found, "compile_commands.json")
+		: join(found, "build", "compile_commands.json");
+}
+
+const archCache = new Map<string, { mtimeMs: number; archs: Map<string, string[]> }>();
+
+/** The `--offload-arch` targets compile_commands.json gives each file, by absolute path. */
+function offloadArchs(db: string): Map<string, string[]> {
+	const mtimeMs = statSync(db).mtimeMs;
+	const cached = archCache.get(db);
+	if (cached?.mtimeMs === mtimeMs) return cached.archs;
+	const archs = new Map<string, string[]>();
+	const entries = JSON.parse(readFileSync(db, "utf-8")) as Array<{
+		directory?: string;
+		file: string;
+		command?: string;
+		arguments?: string[];
+	}>;
+	for (const e of entries) {
+		const text = e.arguments?.join(" ") ?? e.command ?? "";
+		const found = [...text.matchAll(/(?:--offload-arch|--cuda-gpu-arch)[= ](gfx\w+)/g)].map((m) => m[1]!);
+		archs.set(resolve(e.directory ?? dirname(db), e.file), found);
+	}
+	archCache.set(db, { mtimeMs, archs });
+	return archs;
+}
+
+/** Whether the file is built for RDNA4: its compile command, else HIP_OFFLOAD_ARCH / HCC_AMDGPU_TARGET, names gfx12. */
+function buildsForGfx12(path: string, db: string | undefined): boolean {
+	const gfx12 = (archs: string[]) => archs.some((a) => a.startsWith("gfx12"));
+	if (db) {
+		const archs = offloadArchs(db).get(resolve(path));
+		if (archs && archs.length > 0) return gfx12(archs);
+	}
+	const env = process.env.HIP_OFFLOAD_ARCH ?? process.env.HCC_AMDGPU_TARGET;
+	return env ? gfx12(env.split(/[,;\s]+/)) : true;
+}
+
+/** Whether a .s file is AMDGPU assembly rather than a host's. */
+function amdgpuAssembly(path: string): boolean {
+	try {
+		return /\.amdgcn_target|\.amdhsa_kernel|\bs_endpgm\b|\bs_wait_\w+|\bv_\w+_[bfiu]\d+/.test(
+			readFileSync(path, "utf-8").slice(0, 65536),
+		);
+	} catch {
+		return false;
+	}
+}
+
+interface RadisaFinding {
+	rule: string;
+	severity: string;
+	message: string;
+	pc?: number | null;
+	loc?: { file: string; line: number; column?: number };
+	instruction?: string;
+}
+
+interface RadisaReport {
+	findings: RadisaFinding[];
+	kernels: Array<{ name: string; findings: RadisaFinding[] }>;
+}
+
+/**
+ * Rules that are not the agent's to fix: LLVM emits VOPD pairs with an X/Y anti-dependency on purpose, and compile errors
+ * come from the C/C++/HIP check already.
+ */
+const RADISA_IGNORED = new Set(["VOPD_ANTIDEP", "COMPILE", "COMPILER_DIAGNOSTICS"]);
+
+/** radisa's errors as errors and its warnings as lint findings; notes and info are left out. */
+export function radisaDiagnostics(report: RadisaReport, file: string): Diagnostic[] {
+	const out: Diagnostic[] = [];
+	const add = (f: RadisaFinding, kernel?: string) => {
+		const severity = f.severity === "error" ? "error" : f.severity === "review" ? "warning" : undefined;
+		if (!severity || RADISA_IGNORED.has(f.rule)) return;
+		// A pc moves with every change of the code; only the source position says where.
+		let message = f.message.replace(/\s*\(pc 0x[0-9a-f]+\)/g, "");
+		if (f.instruction) message += ` [${f.instruction}]`;
+		if (!f.loc && kernel) message = `in kernel ${kernel}: ${message}`;
+		out.push(diag(f.loc?.file ?? file, f.loc?.line ?? 1, f.loc?.column ?? 1, message, f.rule, severity));
+	};
+	for (const f of report.findings) add(f);
+	for (const k of report.kernels) for (const f of k.findings) add(f, k.name);
+	return out;
+}
+
+const rdna4: Checker = {
+	name: "rdna4-isa",
+	matches: (path) => ["hip", "cu"].includes(extension(path)) || (extension(path) === "s" && amdgpuAssembly(path)),
+	unit(path) {
+		const python3 = onPath("python3");
+		const suite = radisaSuite(dirname(path));
+		if (!python3 || !suite) return undefined;
+		if (extension(path) !== "s" && !buildsForGfx12(path, compileDb(dirname(path)))) return undefined;
+		return { key: `rdna4-isa:${path}`, checker: rdna4, cwd: dirname(path), file: path };
+	},
+	async run(unit, signal) {
+		const suite = radisaSuite(unit.cwd);
+		if (!suite) return [];
+		const out = join(
+			tmpdir(),
+			"pi-checks",
+			`${createHash("sha1").update(unit.file!).digest("hex").slice(0, 16)}.radisa.json`,
+		);
+		mkdirSync(dirname(out), { recursive: true });
+		const db = extension(unit.file!) === "s" ? undefined : compileDb(unit.cwd);
+		// -I keeps the edited project's modules and PYTHON* settings out; radisa is imported from the suite alone.
+		const argv = [
+			"python3",
+			"-I",
+			"-c",
+			"import sys; sys.path.insert(0, sys.argv.pop(1)); from radisa.cli import main; sys.exit(main(sys.argv[1:]))",
+			suite,
+			"check",
+			unit.file!,
+			"--json",
+			out,
+		];
+		if (db) argv.push("--compile-commands", db);
+		const ran = await run(argv, unit.cwd, signal);
+		// 0 clean, 1 findings, 3 could not analyse: only a report says which findings there are.
+		if (ran.code !== 0 && ran.code !== 1) return [];
+		try {
+			return radisaDiagnostics(JSON.parse(readFileSync(out, "utf-8")) as RadisaReport, unit.file!);
+		} catch {
+			return [];
+		}
+	},
+};
+
 // ------------------------------------------------------------------- Linters, each where the project configures it
 
 /** The file's linter in a unit of its own, run from the folder its configuration is in; lint findings only. */
@@ -668,6 +824,7 @@ export const CHECKERS: Checker[] = [
 	yamlLint,
 	luauLint,
 	cppLint,
+	rdna4,
 ];
 
 /** The checkers of `all` that `PI_CHECKS` allows: all by default, none for `off`, else the comma-separated names. */

@@ -201,6 +201,16 @@ progress (errors come at once).
 | Luau | selene | `selene.toml` | 3 ms |
 | C/C++/HIP | clangd-tidy (about 10x clang-tidy) | `.clang-tidy` and `compile_commands.json` | 0.2 s a file |
 
+**HIP for AMD RDNA4 (gfx12)**: what the compiler accepts but the GPU does not. When a HIP unit is built for a `gfx12`
+target (its `--offload-arch` in `compile_commands.json`, else `HIP_OFFLOAD_ARCH`) and
+[radisa](https://github.com/Code000-211/radiance-rdna4-isa-suite) is found (`PI_RADISA`, or `tools/rdna4-isa-suite`
+above the file), the unit is compiled for gfx1201 and its machine code checked against AMD's machine-readable RDNA4 ISA:
+a register used before the `s_wait_*` its load needs (above all after a memory instruction in inline asm, which the
+compiler does not wait for), WMMA and VOPD hazards, use after VGPR deallocation. These come as errors at the source
+line, with the wait to insert; spills, scratch arrays and memory instructions in inline asm come as lint findings.
+AMDGPU `.s` files are checked the same way. A check compiles the whole unit: 1-60 s on libr4d's units, so a large one
+can report after the run ended (`PI_CHECKS_WAIT`). `PI_CHECKS` names it `rdna4-isa`.
+
 On Moebius (443 Rust files), a type error the model wrote was reported 3 s after the edit, before the run ended, and
 fixed; rust-analyzer, which Pi used before, reported nothing within 84 s and took 3.2 GB. `PI_CHECKS=off` turns the
 checks off (for a harness that runs its own, as Moebius's lens), `PI_CHECKS=rust,python` keeps those named, and
