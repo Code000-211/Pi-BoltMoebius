@@ -118,7 +118,7 @@ describe("job hub", () => {
 				.render(100)
 				.map((line) => stripVTControlCharacters(line))
 				.join("\n"),
-		).toContain("No background jobs in this session.");
+		).toContain("No background jobs in this session. A bash command still running after 2 minutes,");
 		hub.dispose();
 	});
 

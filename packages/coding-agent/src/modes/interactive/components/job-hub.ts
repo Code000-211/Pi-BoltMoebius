@@ -7,6 +7,7 @@
 
 import { type Component, type Focusable, getKeybindings, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { BackgroundJob, BackgroundJobStatus, BackgroundJobs } from "../../../core/background-jobs.ts";
+import { DEFAULT_AUTO_BACKGROUND_SECONDS } from "../../../core/tools/bash.ts";
 import { theme } from "../theme/theme.ts";
 import { keyHint, rawKeyHint } from "./keybinding-hints.ts";
 
@@ -131,7 +132,10 @@ export class JobHubComponent implements Component, Focusable {
 		const list = this.list();
 		if (list.length === 0) {
 			lines.push(
-				theme.fg("muted", "No background jobs in this session. A bash command still running after a minute,"),
+				theme.fg(
+					"muted",
+					`No background jobs in this session. A bash command still running after ${DEFAULT_AUTO_BACKGROUND_SECONDS / 60} minutes,`,
+				),
 			);
 			lines.push(theme.fg("muted", "or one the agent starts with background: true, shows up here."));
 		}
