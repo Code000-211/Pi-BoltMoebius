@@ -14,7 +14,7 @@ import { createHarness, type Harness } from "./harness.ts";
 
 type Internals = {
 	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
-	_compactionAhead: { result: Promise<unknown> } | undefined;
+	_compactionAhead: { pending: { result: Promise<unknown> } | undefined };
 };
 
 function usage(totalTokens: number) {
@@ -140,11 +140,11 @@ describe("AgentSession compaction ahead", () => {
 		const long = "x".repeat(40_000);
 
 		await internals._checkCompaction(turn(harness, `one ${long}`, 50_000));
-		expect(internals._compactionAhead).toBeUndefined();
+		expect(internals._compactionAhead.pending).toBeUndefined();
 
 		await internals._checkCompaction(turn(harness, `two ${long}`, 90_000));
-		expect(internals._compactionAhead).toBeDefined();
-		await internals._compactionAhead?.result;
+		expect(internals._compactionAhead.pending).toBeDefined();
+		await internals._compactionAhead.pending?.result;
 		expect(summaries).toEqual(["summary 1"]);
 		const keptFrom = harness.sessionManager.getBranch().at(-1)?.id;
 
@@ -157,7 +157,7 @@ describe("AgentSession compaction ahead", () => {
 		const kept = branch.findIndex((e) => e.id === entry?.firstKeptEntryId);
 		expect(kept).toBeGreaterThan(0);
 		expect(kept).toBeLessThanOrEqual(branch.findIndex((e) => e.id === keptFrom));
-		expect(internals._compactionAhead).toBeUndefined();
+		expect(internals._compactionAhead.pending).toBeUndefined();
 	});
 
 	it("waits for a summary still being made instead of starting another", async () => {
@@ -184,12 +184,12 @@ describe("AgentSession compaction ahead", () => {
 		await internals._checkCompaction(turn(harness, `one ${long}`, 30_000));
 		hold();
 		await internals._checkCompaction(turn(harness, `two ${long}`, 45_000));
-		expect(internals._compactionAhead).toBeDefined();
+		expect(internals._compactionAhead.pending).toBeDefined();
 
 		await expect(internals._checkCompaction(turn(harness, "three", 55_000))).resolves.toBe(false);
 		expect(compactions(harness)).toHaveLength(0);
 		release();
-		await internals._compactionAhead?.result;
+		await internals._compactionAhead.pending?.result;
 		await internals._checkCompaction(turn(harness, "four", 60_000));
 		expect(summaries).toEqual(["summary 1"]);
 		expect(compactions(harness)[0]?.summary).toContain("summary 1");
@@ -216,8 +216,8 @@ describe("AgentSession compaction ahead", () => {
 		harnesses.push(harness);
 		harness.sessionManager.appendMessage({ role: "user", content: "read them all", timestamp: Date.now() });
 		for (let n = 1; n <= 8; n++) await internals._checkCompaction(step(harness, n, n * 5_500));
-		expect(internals._compactionAhead).toBeDefined();
-		await internals._compactionAhead?.result;
+		expect(internals._compactionAhead.pending).toBeDefined();
+		await internals._compactionAhead.pending?.result;
 		await internals._checkCompaction(step(harness, 9, 60_000));
 		expect(summaries).toEqual(["summary 1"]);
 		expect(compactions(harness)[0]?.summary).toContain("summary 1");
@@ -274,7 +274,7 @@ describe("AgentSession compaction ahead", () => {
 		const long = "x".repeat(40_000);
 		await internals._checkCompaction(turn(harness, `one ${long}`, 50_000));
 		await internals._checkCompaction(turn(harness, `two ${long}`, 90_000));
-		await internals._compactionAhead?.result;
+		await internals._compactionAhead.pending?.result;
 		await harness.session.compact();
 		expect(summaries).toEqual(["summary 1", "summary 2"]);
 
@@ -290,7 +290,7 @@ describe("AgentSession compaction ahead", () => {
 		const long = "x".repeat(40_000);
 		await internals._checkCompaction(turn(harness, `one ${long}`, 50_000));
 		await internals._checkCompaction(turn(harness, `two ${long}`, 90_000));
-		expect(internals._compactionAhead).toBeUndefined();
+		expect(internals._compactionAhead.pending).toBeUndefined();
 		expect(summaries).toEqual([]);
 	});
 });

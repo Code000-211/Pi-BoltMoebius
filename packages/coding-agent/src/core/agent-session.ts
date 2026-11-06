@@ -70,6 +70,7 @@ import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
 import { BackgroundChecks, CHECK_REPORT_MESSAGE_TYPE } from "./checks/background-checks.ts";
 import { CHECKERS, enabledCheckers } from "./checks/checkers.ts";
 import { cppChecker } from "./checks/cpp/checker.ts";
+import { CompactionAhead } from "./compaction/compaction-ahead.ts";
 import { compactionFeatures } from "./compaction/features.ts";
 import {
 	type CompactionPreparation,
@@ -84,7 +85,6 @@ import {
 	estimateProjectedContextTokens,
 	estimateTokens,
 	generateBranchSummary,
-	getCompactionThreshold,
 	keptUserMessagesInstruction,
 	prepareCompaction,
 	shouldCompact,
@@ -451,33 +451,6 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
  */
 const OVERFLOW_RECOVERY_STEPS = 3;
 
-/**
- * How far below the compaction threshold the summary starts in the background (see `_compactAhead`): a share of the
- * threshold, up to a number of tokens. Started closer, the agent works on above the threshold for longer (a summary
- * takes 15 to 90 seconds); started earlier, more of the context stays after the compaction, and a session that ends
- * below the threshold paid for a summary it never used.
- */
-const COMPACTION_AHEAD_SHARE = 0.15;
-const COMPACTION_AHEAD_MAX_TOKENS = 40_000;
-/**
- * How far above the threshold the agent goes on while the summary made ahead is not ready yet, as a share of the
- * threshold: at most halfway to the context's limit (the window less `reserveTokens`).
- */
-const COMPACTION_AHEAD_OVERRUN = 0.5;
-
-/** A compaction summary made in the background before the threshold was reached, see `_compactAhead`. */
-interface CompactionAhead {
-	sessionManager: SessionManager;
-	/** The branch's last entry when it started: the summary covers the entries before the cut point up to it. */
-	leafId: string;
-	firstKeptEntryId: string;
-	keepRecentTokens: number;
-	controller: AbortController;
-	/** Undefined when it failed or was cancelled. */
-	result: Promise<CompactionResult | undefined>;
-	done: boolean;
-}
-
 function getOverflowRecoveryStep(
 	settings: CompactionSettings,
 	step: number,
@@ -522,7 +495,7 @@ export class AgentSession {
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
-	private _compactionAhead: CompactionAhead | undefined = undefined;
+	private readonly _compactionAhead = new CompactionAhead();
 	/** Overflow recovery steps taken since the last user message or successful response */
 	private _overflowRecoveryAttempts = 0;
 	/** Responses cut off at the output limit with nothing done, answered with a notice (cut-off-response.ts). */
@@ -1724,7 +1697,7 @@ export class AgentSession {
 		try {
 			this.abortRetry();
 			this.abortCompaction();
-			this._compactionAhead?.controller.abort();
+			this._compactionAhead.cancel();
 			this.abortBranchSummary();
 			this.abortBash();
 			this.agent.abort();
@@ -3717,105 +3690,22 @@ export class AgentSession {
 	}
 
 	/**
-	 * Near the compaction threshold, the summary of what the compaction would cut is made in the background, and the
-	 * threshold compaction takes it ({@link _takeCompactionAhead}) instead of stopping the agent for the summary request.
-	 * The threshold is not the context's limit: while the summary is still being made, the agent goes on above it, and
-	 * stops to wait for it only some way above (see {@link COMPACTION_AHEAD_OVERRUN}). The entries the summary covers
-	 * stay as they are: later ones are appended, and kept by the compaction. Not when an extension makes or vets
-	 * compactions (`session_before_compact`), nor for a context so small that the kept part alone would be near the
-	 * threshold again.
-	 *
+	 * Near the compaction threshold, the summary of what the compaction would cut is made in the background (see
+	 * compaction/compaction-ahead.ts). Not when an extension makes or vets compactions (`session_before_compact`).
 	 * Returns whether the compaction is to wait: a summary is being made, and the context is below where it stops.
 	 */
 	private _compactAhead(contextTokens: number, contextWindow: number): boolean {
 		if (!compactionFeatures.ahead || !this.settingsManager.getCompactionEnabled()) return false;
 		const model = this.model;
 		if (!model || this._extensionRunner.hasHandlers("session_before_compact")) return false;
-		const settings = this.settingsManager.getCompactionSettings(model, contextWindow);
-		const threshold = getCompactionThreshold(contextWindow, settings);
-		const start = threshold - Math.min(threshold * COMPACTION_AHEAD_SHARE, COMPACTION_AHEAD_MAX_TOKENS);
-		if (contextTokens <= start || start < 2 * settings.keepRecentTokens) return false;
-		const limit = contextWindow - settings.reserveTokens;
-		const goesOn =
-			contextTokens <= threshold + Math.min((limit - threshold) / 2, threshold * COMPACTION_AHEAD_OVERRUN);
-		const branch = this.sessionManager.getBranch();
-		const current = this._compactionAhead;
-		if (current) {
-			if (this._compactionAheadValid(current, branch, settings)) return goesOn && !current.done;
-			current.controller.abort();
-			this._compactionAhead = undefined;
-		}
-		const leafId = branch.at(-1)?.id;
-		const preparation = prepareCompaction(branch, settings);
-		if (
-			!leafId ||
-			!preparation ||
-			(preparation.messagesToSummarize.length === 0 && preparation.turnPrefixMessages.length === 0)
-		) {
-			return false;
-		}
-		const controller = new AbortController();
-		const ahead: CompactionAhead = {
+		return this._compactionAhead.update({
+			contextTokens,
+			contextWindow,
 			sessionManager: this.sessionManager,
-			leafId,
-			firstKeptEntryId: preparation.firstKeptEntryId,
-			keepRecentTokens: settings.keepRecentTokens,
-			controller,
-			done: false,
-			result: this._runDefaultCompaction(preparation, model, undefined, controller.signal, "threshold", true)
-				.catch(() => undefined)
-				.finally(() => {
-					ahead.done = true;
-				}),
-		};
-		this._compactionAhead = ahead;
-		return goesOn;
-	}
-
-	/** Whether a summary made ahead still fits `branch`: nothing it covers was compacted, edited or left since. */
-	private _compactionAheadValid(
-		ahead: CompactionAhead,
-		branch: SessionEntry[],
-		settings: CompactionSettings,
-	): boolean {
-		if (ahead.sessionManager !== this.sessionManager || ahead.keepRecentTokens !== settings.keepRecentTokens) {
-			return false;
-		}
-		if (ahead.controller.signal.aborted) return false;
-		const leafIndex = branch.findIndex((entry) => entry.id === ahead.leafId);
-		const keptIndex = branch.findIndex((entry) => entry.id === ahead.firstKeptEntryId);
-		if (leafIndex < 0 || keptIndex < 0) return false;
-		return branch.slice(leafIndex + 1).every((entry) => {
-			if (entry.type === "compaction") return false;
-			if (entry.type !== "context_edit") return true;
-			const target = branch.findIndex((other) => other.id === entry.targetId);
-			return target >= keptIndex;
+			settings: this.settingsManager.getCompactionSettings(model, contextWindow),
+			summarize: (preparation, signal) =>
+				this._runDefaultCompaction(preparation, model, undefined, signal, "threshold", true),
 		});
-	}
-
-	/**
-	 * The summary made ahead for a threshold compaction of `branch`, waited for when it is still being made (the wait
-	 * ends with `signal`); undefined when there is none, it does not fit, or it failed. Taken once.
-	 */
-	private async _takeCompactionAhead(
-		branch: SessionEntry[],
-		settings: CompactionSettings,
-		signal: AbortSignal,
-	): Promise<CompactionResult | undefined> {
-		const ahead = this._compactionAhead;
-		if (!ahead) return undefined;
-		this._compactionAhead = undefined;
-		if (!this._compactionAheadValid(ahead, branch, settings)) {
-			ahead.controller.abort();
-			return undefined;
-		}
-		const cancel = () => ahead.controller.abort();
-		signal.addEventListener("abort", cancel, { once: true });
-		try {
-			return await ahead.result;
-		} finally {
-			signal.removeEventListener("abort", cancel);
-		}
 	}
 
 	private async _emitOverflowRecoveryFailure(errorMessage: string): Promise<void> {
@@ -3969,7 +3859,7 @@ export class AgentSession {
 				// shared with manual compaction.
 				const ahead =
 					reason === "threshold" && recovery === undefined
-						? await this._takeCompactionAhead(pathEntries, settings, abortController.signal)
+						? await this._compactionAhead.take(this.sessionManager, pathEntries, settings, abortController.signal)
 						: undefined;
 				abortController.signal.throwIfAborted();
 				const compactResult =
