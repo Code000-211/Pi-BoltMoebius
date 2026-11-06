@@ -247,9 +247,9 @@ export class FileStateTracker {
 			this.headerToHostSource.set(this.normalizeKey(resolvedHeader), sourceAbsolutePath);
 			const text = relInclude.replace(/\\/g, "/").replace(/^(\.\/)+/, "");
 			const textKey = process.platform === "win32" ? text.toLowerCase() : text;
-			let sources = this.includeTextToSources.get(textKey);
-			if (!sources) this.includeTextToSources.set(textKey, (sources = new Set()));
+			const sources = this.includeTextToSources.get(textKey) ?? new Set<string>();
 			sources.add(sourceAbsolutePath);
+			this.includeTextToSources.set(textKey, sources);
 		}
 	}
 }

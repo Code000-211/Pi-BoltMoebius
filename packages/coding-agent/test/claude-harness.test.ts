@@ -8,16 +8,14 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
 	ClaudeHarnessManager,
 	CompileCommandsResolver,
-	FileStateTracker,
 	fuzzyFilterPaths,
-	type HarnessDiagnostic,
 	sanitizeCompileFlags,
 } from "../src/core/harness/index.ts";
 import { buildEnvDiffScript, createBashTool } from "../src/core/tools/bash.ts";
 import { createEditTool, createEditToolDefinition } from "../src/core/tools/edit.ts";
 import { createFindTool } from "../src/core/tools/find.ts";
 import { createLsTool } from "../src/core/tools/ls.ts";
-import { getFileFrecencyScore, nativeFind, nativeFindDetailed, nativeGrep } from "../src/core/tools/native-search.ts";
+import { nativeFind, nativeFindDetailed, nativeGrep } from "../src/core/tools/native-search.ts";
 import { createReadTool } from "../src/core/tools/read.ts";
 import { createWriteTool } from "../src/core/tools/write.ts";
 import { createHarness, type Harness } from "./suite/harness.ts";
@@ -379,7 +377,7 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 		expect(getText(toolResults[2])).toContain("2→    int i = threadIdx.x;");
 	});
 
-	it("supports fff-style boundary-aware fuzzy path ranking, in-memory tree/content caching, and frecency tracking", async () => {
+	it("supports fff-style boundary-aware fuzzy path ranking and in-memory tree/content caching", async () => {
 		const paths = [
 			"third_party/legacy_attention_kernel_test_helper.cpp",
 			"src/kernels/attention_kernel.hip",
@@ -404,19 +402,17 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 		});
 		expect(foundFuzzy).toEqual(["src/kernels/flash_attn_v2.hip"]);
 
-		// Reading & editing through ClaudeHarnessManager boosts frecency and updates in-memory grep buffer cache
+		// Reading & editing through ClaudeHarnessManager updates the in-memory grep buffer cache
 		const harness = new ClaudeHarnessManager();
 		const readTool = createReadTool(testDir, { harness });
 		const editTool = createEditTool(testDir, { harness, enforceReadBeforeEdit: true });
 
 		await readTool.execute("r-frec", { path: "src/kernels/flash_attn_v2.hip" });
-		expect(getFileFrecencyScore(hipKernel)).toBeGreaterThanOrEqual(10);
 
 		await editTool.execute("e-frec", {
 			path: "src/kernels/flash_attn_v2.hip",
 			edits: [{ oldText: "flash_attn_v2()", newText: "flash_attn_v2_optimized()" }],
 		});
-		expect(getFileFrecencyScore(hipKernel)).toBeGreaterThanOrEqual(20);
 
 		const grepRes = await nativeGrep({
 			root: testDir,

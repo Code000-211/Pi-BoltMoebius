@@ -13,7 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import {
 	type AfterToolCallContext,

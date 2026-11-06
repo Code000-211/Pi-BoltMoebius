@@ -296,10 +296,6 @@ function getLeadingWhitespace(line: string): string {
 	return line.slice(0, i);
 }
 
-/**
- * Adjust the leading indentation of `newText` lines when `oldText` matched via
- * Codex-style trimmed line matching (e.g., model sent 2-space indent instead of tab indent).
- */
 function gcd(a: number, b: number): number {
 	return b === 0 ? a : gcd(b, a % b);
 }

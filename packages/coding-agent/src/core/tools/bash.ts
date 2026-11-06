@@ -29,7 +29,7 @@ import { notifySearchExternalChange } from "./native-search.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
-import { DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncationDetails } from "./truncate.ts";
+import { formatSize, type TruncationResult, truncationDetails } from "./truncate.ts";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
 /** Output limit of `structuredContent.output`, which programmatic callers such as codemode scripts receive. */
