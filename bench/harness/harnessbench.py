@@ -661,7 +661,8 @@ class GatewayClient:
 
 def search_verify(root: Path) -> tuple[bool, str]:
     code, diff = sh("git status --porcelain", root)
-    changed = sorted(line[3:] for line in diff.splitlines() if line.strip())
+    # Bytecode caches Python wrote when the agent ran the code are not changes.
+    changed = sorted(line[3:] for line in diff.splitlines() if line.strip() and "__pycache__" not in line)
     want = ["services/payments/client.py", "services/payments/config.py"]
     if changed != want:
         return False, f"changed files: {changed}, want {want}"
