@@ -387,8 +387,8 @@ run's time was the model's. So:
 
 - **The project is in the prompt.** A `<project>` section, taken once per session, lists the working folder's files (git's,
   up to 150; a larger project by folders with file counts). Nearly every run used to begin by listing the folder.
-  `PI_PROJECT_SNAPSHOT=full` adds small files' contents (faster with deepseek-v4.1-flash, slower with glm-5.3-flash,
-  which then planned everything at once), `=off` leaves it out.
+  Small files' contents in it were measured too and dropped (faster with deepseek-v4.1-flash, slower with
+  glm-5.3-flash, which then planned everything at once). `PI_PROJECT_SNAPSHOT=off` leaves it out.
 - **An edit and its test in one response.** The calls of a response run in order when one of them is `edit`, `write` or
   `bash`, and the prompt says that all edits for a fix and the command that tests them can go together.
 - **A smaller prompt than Pi's.** 2.2k characters of rules, tool list and docs pointer against Pi's 2.9k: "Be concise in
@@ -437,7 +437,7 @@ Everything above is on by default.
 |---|---|
 | `compaction.maxContextTokens` | Cap for the compaction threshold (default 128000) |
 | `toolResultPruning` | Shortening old tool results: `enabled`, `triggerTokens` (40000), `keepRecent` (8), `minChars` (2000) |
-| `PI_PROJECT_SNAPSHOT=full` / `off` | The project listing with small files' contents / none |
+| `PI_PROJECT_SNAPSHOT=off` | No project listing in the system prompt |
 | `--remote <host>[:<folder>]`, `PI_REMOTE` | Start working on that machine (as `/remote`) |
 | `PI_SSH_COMMAND` | The ssh program (default `ssh`) |
 | `PI_CHECKS` | `off`, or the background checks to keep (`cpp,rust,python,typescript,javascript,shell,luau,json,toml,yaml`, and the linters `js-lint,markdown,yaml-lint,luau-lint,cpp-lint`) |

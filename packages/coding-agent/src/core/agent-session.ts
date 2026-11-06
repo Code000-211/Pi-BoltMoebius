@@ -136,7 +136,7 @@ import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./m
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { NestedToolCallRunner } from "./nested-tool-calls.ts";
-import { type ProjectSnapshot, takeProjectSnapshot } from "./project-snapshot.ts";
+import { takeProjectSnapshot } from "./project-snapshot.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import {
 	type AskSecret,
@@ -2115,7 +2115,7 @@ export class AgentSession {
 						remote: `read, edit, write and bash work on the machine ${remote.target.host} over ssh, in ${remote.dir}: paths are that machine's. grep, find and ls are off (they search this machine): search there with rg or find in bash. Edits there get no compiler diagnostics. Project context files and skills above are this machine's.`,
 					}
 				: project
-					? { project: project.text }
+					? { project }
 					: undefined,
 			skills: loadedSkills,
 			contextFiles: loadedContextFiles,
@@ -2803,22 +2803,13 @@ export class AgentSession {
 	}
 
 	private _askSecret: AskSecret | undefined;
-	/** The working folder's files (and small ones' contents) for the system prompt: taken once, so the prompt stays put. */
-	private _projectSnapshot: ProjectSnapshot | null | undefined;
+	/** The working folder's files for the system prompt: taken once, so the prompt stays put. */
+	private _projectSnapshot: string | null | undefined;
 
-	private _getProjectSnapshot(): ProjectSnapshot | undefined {
+	private _getProjectSnapshot(): string | undefined {
 		if (this._projectSnapshot === undefined) {
-			const mode = process.env.PI_PROJECT_SNAPSHOT;
 			this._projectSnapshot =
-				mode === "off" ? null : (takeProjectSnapshot(this._cwd, { contents: mode === "full" }) ?? null);
-			// The model has these files' contents: they count as read, so edits get the same checks as after a read.
-			for (const [path, content] of this._projectSnapshot?.inlined ?? []) {
-				let mtimeMs = Date.now();
-				try {
-					mtimeMs = statSync(path).mtimeMs;
-				} catch {}
-				this._claudeHarness.onFileRead(path, content, mtimeMs, this._cwd);
-			}
+				process.env.PI_PROJECT_SNAPSHOT === "off" ? null : (takeProjectSnapshot(this._cwd) ?? null);
 		}
 		return this._projectSnapshot ?? undefined;
 	}
