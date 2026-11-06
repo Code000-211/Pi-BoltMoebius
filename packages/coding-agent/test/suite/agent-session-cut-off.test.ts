@@ -58,6 +58,24 @@ describe("AgentSession responses cut off at the output limit", () => {
 		expect(levels).toEqual(["medium", "low", "minimal", "medium"]);
 	});
 
+	it("starts the next prompt at the session's thinking level after a run that ended cut off", async () => {
+		const harness = await createHarness({ models: [{ id: "faux-1", reasoning: true, maxTokens: MAX_TOKENS }] });
+		harnesses.push(harness);
+		harness.session.setThinkingLevel("high");
+		const levels: Array<string | undefined> = [];
+		const recorded =
+			(message: ReturnType<typeof cutOff>) => (_context: unknown, options: { reasoning?: string } | undefined) => {
+				levels.push(options?.reasoning);
+				return message;
+			};
+		harness.setResponses([cutOff(), cutOff(), cutOff(), cutOff()].map(recorded) as never);
+		await harness.session.prompt("solve it");
+		harness.appendResponses([recorded(cutOff()), recorded(fauxAssistantMessage("Done."))] as never);
+		await harness.session.prompt("once more");
+		expect(levels).toEqual(["high", "medium", "low", "minimal", "high", "medium"]);
+		expect(notices(harness)).toBe(4);
+	});
+
 	it("puts the notice ahead of a message already queued, such as a job report", async () => {
 		const harness = await createHarness({ models: [{ id: "faux-1", reasoning: true, maxTokens: MAX_TOKENS }] });
 		harnesses.push(harness);
