@@ -27,14 +27,17 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import { completeSimple, isContextOverflow } from "@earendil-works/pi-ai/compat";
-import { convertToLlm } from "../messages.ts";
+import { compactionSummaryText, convertToLlm } from "../messages.ts";
 import {
 	buildSessionProjection,
+	COMPACTED_USER_MESSAGES_MAX_CHARS,
 	type CompactionEntry,
+	compactedUserMessagesEnabled,
 	type ProjectedSessionEntry,
 	type SessionEntry,
 	type SessionProjection,
 	sessionEntryToContextMessages,
+	userMessagesBefore,
 } from "../session-manager.ts";
 import { combineUsage } from "../usage-totals.ts";
 import {
@@ -378,9 +381,12 @@ export function estimateTokens(message: AgentMessage): number {
 			chars = message.command.length + message.output.length;
 			return Math.ceil(chars / 4);
 		}
-		case "branchSummary":
-		case "compactionSummary": {
+		case "branchSummary": {
 			chars = message.summary.length;
+			return Math.ceil(chars / 4);
+		}
+		case "compactionSummary": {
+			chars = compactionSummaryText(message).length;
 			return Math.ceil(chars / 4);
 		}
 	}
@@ -1099,6 +1105,17 @@ export interface CompactionPreparation {
 	fileOps: FileOperations;
 	/** Compaction settions from settings.jsonl	*/
 	settings: CompactionSettings;
+	/** The user's messages before the kept part that Pi's own compaction carries verbatim beside its summary. */
+	keptUserMessages?: string[];
+}
+
+/**
+ * What Pi's own summary request is told when the user's messages stay verbatim beside the summary
+ * ({@link CompactionPreparation.keptUserMessages}): not to restate them, so its room goes to the progress.
+ */
+export function keptUserMessagesInstruction(preparation: CompactionPreparation): string | undefined {
+	if (!preparation.keptUserMessages?.length) return undefined;
+	return `The user's own messages from this history stay word for word next to your summary (up to ${COMPACTED_USER_MESSAGES_MAX_CHARS.toLocaleString("en-US")} characters; a longer one is cut there and its rest is yours to summarize). Do not quote, copy or restate them anywhere in the summary. Under Goal, write one line that names the task (such as an issue's number and title) and says it is in the user's messages; under Constraints & Preferences, list only what the conversation added to them (clarifications, decisions, constraints found during the work), or "(none beyond the user's messages)".`;
 }
 
 function isProjectedTurnStart(entry: ProjectedSessionEntry): boolean {
@@ -1237,6 +1254,11 @@ export function prepareCompaction(
 		}
 	}
 
+	const keptIndex = pathEntries.findIndex((entry) => entry.id === firstKeptEntryId);
+	const keptUserMessages = compactedUserMessagesEnabled()
+		? userMessagesBefore(pathEntries, keptIndex < 0 ? pathEntries.length : keptIndex)
+		: [];
+
 	return {
 		firstKeptEntryId,
 		messagesToSummarize,
@@ -1246,6 +1268,7 @@ export function prepareCompaction(
 		previousSummary,
 		fileOps,
 		settings,
+		keptUserMessages,
 	};
 }
 

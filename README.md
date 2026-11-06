@@ -358,6 +358,12 @@ Not measured on a real host yet: checked with an ssh stand-in that runs the remo
   to wait. Before, the agent stood still for each summary: 14, 56, 60 and 95 s in four real sessions. A session that
   ends between the start and the threshold has paid for a summary it did not use. Not when an extension makes or vets
   compactions; `PI_COMPACTION_AHEAD=off` turns it off.
+- **The task stays word for word.** A summary drops requirements and constraints of the task (arXiv 2608.11242: about
+  17% survive; 2606.22528: violations 0% before, 30% after compaction). After Pi's own compactions the user's messages
+  from the compacted part (a task sent via RPC included) stay next to the summary verbatim, oldest first, up to 16,000
+  characters; one that a later message contains whole (a continued run sent its task again with notes) is left out. The
+  summary request is told so and does not restate them. Not for compactions an extension makes itself;
+  `PI_COMPACTION_USER_MESSAGES=off` turns it off.
 - **Summaries from the prompt cache.** The compaction summary is asked for as a continuation of the session's own
   request, so the provider reads the conversation from its cache (as deepseek-harness does). Before, all 4 compactions in
   real sessions read nothing from the cache (26k to 508k input tokens, 14 to 95 s each).
@@ -435,6 +441,7 @@ Everything above is on by default.
 | `toolResultPruning` | Shortening old tool results: `enabled`, `triggerTokens` (40000), `keepRecent` (8), `minChars` (2000) |
 | `PI_COMPACTION_CACHED_PREFIX=off` | Ask for compaction summaries as a standalone request |
 | `PI_COMPACTION_AHEAD=off` | Make the compaction summary at the threshold, with the agent waiting, instead of ahead |
+| `PI_COMPACTION_USER_MESSAGES=off` | Do not keep the user's compacted messages verbatim beside the summary |
 | `PI_BASH_AUTO_BACKGROUND=off` | Keep commands in the foreground unless the call asks for `background: true` |
 | `PI_BASH_SLEEP_GUARD=off` | Run fixed sleeps over 120 s, and leave sleeps that start a command to the shell |
 | `PI_EARLY_BASH=off` | Start read-only commands only after the model's message |

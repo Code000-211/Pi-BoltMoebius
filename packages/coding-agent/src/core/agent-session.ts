@@ -88,6 +88,7 @@ import {
 	estimateTokens,
 	generateBranchSummary,
 	getCompactionThreshold,
+	keptUserMessagesInstruction,
 	prepareCompaction,
 	shouldCompact,
 	truncateContentForContext,
@@ -3395,6 +3396,9 @@ export class AgentSession {
 	): Promise<CompactionResult> {
 		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
 		const request = await this._getSummarizationRequestAuth(model, signal);
+		// Pi's own summary sits beside the user's messages (see session-manager.ts): it need not restate them.
+		const kept = keptUserMessagesInstruction(preparation);
+		if (kept) customInstructions = customInstructions ? `${customInstructions}\n\n${kept}` : kept;
 		const callbacks = ahead ? undefined : this._summarizationRetryCallbacks({ source: "compaction", reason });
 		if (reason !== "overflow" && process.env.PI_COMPACTION_CACHED_PREFIX !== "off") {
 			const cached = await this._compactOnCachedPrefix(preparation, request, customInstructions, signal, callbacks);

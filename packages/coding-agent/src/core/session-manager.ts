@@ -547,6 +547,59 @@ export function buildSessionProjection(
 	return projectSessionPath(buildSessionPath(entries, leafId, byId));
 }
 
+/** Most characters of the user's compacted messages that a compaction summary carries verbatim. */
+export const COMPACTED_USER_MESSAGES_MAX_CHARS = 16_000;
+/** A path's entries before a compaction do not change, so neither do its compacted user messages. */
+const compactedUserMessagesCache = new WeakMap<CompactionEntry, string[]>();
+
+/** Whether Pi's own compactions carry the user's compacted messages verbatim (PI_COMPACTION_USER_MESSAGES=off: no). */
+export function compactedUserMessagesEnabled(): boolean {
+	return process.env.PI_COMPACTION_USER_MESSAGES !== "off";
+}
+
+function userText(entry: SessionEntry): string | undefined {
+	if (entry.type !== "message" || entry.message.role !== "user") return undefined;
+	const content = entry.message.content;
+	const text = (
+		typeof content === "string"
+			? content
+			: (content ?? []).map((part) => (part.type === "text" ? part.text : "")).join("\n")
+	).trim();
+	return text || undefined;
+}
+
+/**
+ * The text of the user's own messages in `path` before `keptIndex`, oldest first, within
+ * COMPACTED_USER_MESSAGES_MAX_CHARS (a message cut there says so). A message that a later one of `path` contains whole is
+ * left out: a run that continues a session is often sent its task again with notes added. Harness and extension
+ * messages are not the user's.
+ */
+export function userMessagesBefore(path: SessionEntry[], keptIndex: number): string[] {
+	const all = path.map(userText);
+	const texts: string[] = [];
+	let room = COMPACTED_USER_MESSAGES_MAX_CHARS;
+	for (let i = 0; i < keptIndex && room > 0; i++) {
+		const text = all[i];
+		if (!text || all.some((later, j) => j > i && later?.includes(text))) continue;
+		texts.push(text.length <= room ? text : `${text.slice(0, room)}\n[cut here: the rest is in the summary]`);
+		room -= text.length;
+	}
+	return texts;
+}
+
+/** The user's messages that `compaction` carries (see {@link userMessagesBefore}), up to the compaction in `path`. */
+function compactedUserMessages(path: SessionEntry[], compaction: CompactionEntry): string[] {
+	const cached = compactedUserMessagesCache.get(compaction);
+	if (cached) return cached;
+	const at = path.indexOf(compaction);
+	const before = at < 0 ? path : path.slice(0, at);
+	let kept = before.findIndex((entry) => entry.id === compaction.firstKeptEntryId);
+	if (kept < 0) kept = before.length;
+	const texts = userMessagesBefore(before, kept);
+	compactedUserMessagesCache.set(compaction, texts);
+	return texts;
+}
+
 /** The projection of a root-to-leaf path. Does not keep or return `path`. */
 function projectSessionPath(path: SessionEntry[]): SessionProjection {
 	const { thinkingLevel, model } = getSessionContextSettings(path);
@@ -567,6 +620,16 @@ function projectSessionPath(path: SessionEntry[]): SessionProjection {
 					: projectContextEntry(sourceEntry, edits.get(sourceEntry.id)),
 		}),
 	);
+	const first = projectedEntries[0];
+	// An extension's own compaction decides itself what it keeps.
+	if (first?.sourceEntry.type === "compaction" && !first.sourceEntry.fromHook && compactedUserMessagesEnabled()) {
+		const userRequests = compactedUserMessages(path, first.sourceEntry);
+		if (userRequests.length > 0) {
+			first.messages = first.messages.map((message) =>
+				message.role === "compactionSummary" ? { ...message, userRequests } : message,
+			);
+		}
+	}
 	return {
 		entries: projectedEntries,
 		messages: projectedEntries.flatMap((entry) => entry.messages),
