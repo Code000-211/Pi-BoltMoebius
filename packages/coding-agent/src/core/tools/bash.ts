@@ -399,9 +399,9 @@ function tryParseDirectBinaryCommand(
 	const trimmed = command.trim();
 	if (!trimmed || SHELL_METACHAR_REGEX.test(trimmed)) return undefined;
 	const tokens = trimmed.split(/[ \t]+/);
-	if (tokens.length === 0) return undefined;
 	const cmdName = tokens[0];
-	if (!cmdName || cmdName.includes("=") || SHELL_KEYWORDS_AND_BUILTINS.has(cmdName)) return undefined;
+	// A name with a slash is a path from the working directory (`bin/tool`), not one to look up on PATH.
+	if (!cmdName || /[/\\]/.test(cmdName) || SHELL_KEYWORDS_AND_BUILTINS.has(cmdName)) return undefined;
 	if (process.platform === "win32") {
 		for (let i = 0; i < tokens.length; i++) {
 			if (tokens[i].startsWith("/")) return undefined;
@@ -410,7 +410,8 @@ function tryParseDirectBinaryCommand(
 	const pathValue = env.PATH ?? env.Path ?? "";
 	const cacheKey = `${pathValue}\0${cmdName}`;
 	let resolved = directBinaryCache.get(cacheKey);
-	if (resolved === undefined) {
+	// A program removed since it was found is looked up again: the shell then reports it missing with exit code 127.
+	if (resolved === undefined || (resolved !== null && !existsSync(resolved))) {
 		resolved = findExecutableOnPath(cmdName, env) ?? null;
 		directBinaryCache.set(cacheKey, resolved);
 	}
