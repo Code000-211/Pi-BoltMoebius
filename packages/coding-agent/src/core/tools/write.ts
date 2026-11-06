@@ -119,11 +119,9 @@ export function createWriteToolDefinition(
 					}
 					if (existingStat) {
 						// A newer modification time with the same content (`touch`) is no change: compare the content then.
-						const state = fileTracker.stateTracker.getTrackedState(absolutePath);
-						const current =
-							state?.contentComplete && existingStat.mtimeMs > state.lastReadMtimeMs + 10
-								? await fsReadFile(absolutePath, "utf-8").catch(() => undefined)
-								: undefined;
+						const current = fileTracker.stateTracker.needsContentCompare(absolutePath, existingStat.mtimeMs)
+							? await fsReadFile(absolutePath, "utf-8").catch(() => undefined)
+							: undefined;
 						throwIfAborted();
 						fileTracker.assertCanModifyExistingFile(absolutePath, existingStat.mtimeMs, current);
 					}
