@@ -63,12 +63,7 @@ import { processImage } from "../utils/image-process.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
-import {
-	BACKGROUND_JOB_MESSAGE_TYPE,
-	BackgroundJobs,
-	formatJobReport,
-	JOB_SETTLE_WINDOW_MS,
-} from "./background-jobs.ts";
+import { BACKGROUND_JOB_MESSAGE_TYPE, BackgroundJobs, formatJobReport, JobReporter } from "./background-jobs.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
@@ -624,9 +619,19 @@ export class AgentSession {
 	 * next request, and a run waits for those still running before it ends (see _waitForChecks).
 	 */
 	private _checks: BackgroundChecks | undefined;
-	/** Commands the bash tool let run on in the background. Their ends are reported to the agent (see _reportJobs). */
+	/** Commands the bash tool let run on in the background. Their ends are reported to the agent (_jobReporter). */
 	readonly backgroundJobs = new BackgroundJobs();
-	private _jobReportTimer: ReturnType<typeof setTimeout> | undefined;
+	private readonly _jobReporter = new JobReporter(this.backgroundJobs, (ended) =>
+		this.sendCustomMessage(
+			{
+				customType: BACKGROUND_JOB_MESSAGE_TYPE,
+				content: formatJobReport(ended),
+				display: true,
+				details: { jobs: ended.map((job) => job.id) },
+			},
+			{ triggerTurn: true, deliverAs: "steer" },
+		),
+	);
 	/** The machine read, edit, write and bash work on over ssh, when not this one (see setRemote). */
 	private _remote:
 		| {
@@ -641,11 +646,6 @@ export class AgentSession {
 				pausedTools: string[];
 		  }
 		| undefined;
-	/** The last report being handed over (with an idle agent: the run it starts). */
-	private _jobReportSending: Promise<void> = Promise.resolve();
-	private _unsubscribeJobs = this.backgroundJobs.subscribe((event) => {
-		if (event.type === "end") this._scheduleJobReport();
-	});
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -1778,9 +1778,8 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
-		clearTimeout(this._jobReportTimer);
+		this._jobReporter.dispose();
 		this._remote?.ssh.close();
-		this._unsubscribeJobs();
 		this.backgroundJobs.killAll();
 		try {
 			this.abortRetry();
@@ -2945,44 +2944,13 @@ export class AgentSession {
 		};
 	}
 
-	/** Reports jobs that ended in a moment: jobs ending together come in one report. */
-	private _scheduleJobReport(): void {
-		this._jobReportTimer ??= setTimeout(() => {
-			this._jobReportTimer = undefined;
-			this._reportJobs();
-		}, JOB_SETTLE_WINDOW_MS);
-	}
-
-	/**
-	 * Tells the agent which jobs ended: in the running turn before its next request, or as a new turn when it is idle.
-	 * A blocked `wait` call reports them itself.
-	 */
-	private _reportJobs(): void {
-		if (this.backgroundJobs.hasWaiters()) {
-			// Should the wait end without them (aborted), they still come as a message.
-			this._scheduleJobReport();
-			return;
-		}
-		const ended = this.backgroundJobs.takeUnreported();
-		if (ended.length === 0) return;
-		this._jobReportSending = this.sendCustomMessage(
-			{
-				customType: BACKGROUND_JOB_MESSAGE_TYPE,
-				content: formatJobReport(ended),
-				display: true,
-				details: { jobs: ended.map((job) => job.id) },
-			},
-			{ triggerTurn: true, deliverAs: "steer" },
-		).catch(() => {});
-	}
-
 	/** Resolves once no background job runs and every report is in a finished run (print mode exits after it). */
 	async waitForBackgroundJobs(): Promise<void> {
 		for (;;) {
 			await this.waitForIdle();
-			await this._jobReportSending;
+			const reportComing = await this._jobReporter.settle();
 			const jobs = this.backgroundJobs;
-			if (jobs.running().length === 0 && !jobs.hasUnreported() && !this._jobReportTimer && this.isIdle) return;
+			if (jobs.running().length === 0 && !jobs.hasUnreported() && !reportComing && this.isIdle) return;
 			await new Promise<void>((resolve) => {
 				const done = () => {
 					clearTimeout(timer);

@@ -241,6 +241,56 @@ function describeEnd(job: BackgroundJob): string {
 }
 
 /** The report of ended jobs the agent gets: what ended how, and the end of each one's output. */
+/**
+ * Tells the agent which jobs ended, through `send`: jobs that end together in one report, a moment after the first;
+ * not while a `wait` call is blocked on them, which reports them itself. `send` delivers it in the running turn before
+ * its next request, or as a new turn when the agent is idle.
+ */
+export class JobReporter {
+	private readonly jobs: BackgroundJobs;
+	private readonly send: (ended: BackgroundJob[]) => Promise<void>;
+	private timer: ReturnType<typeof setTimeout> | undefined;
+	/** The last report being handed over (with an idle agent: the run it starts). */
+	private sending: Promise<void> = Promise.resolve();
+	private readonly unsubscribe: () => void;
+
+	constructor(jobs: BackgroundJobs, send: (ended: BackgroundJob[]) => Promise<void>) {
+		this.jobs = jobs;
+		this.send = send;
+		this.unsubscribe = jobs.subscribe((event) => {
+			if (event.type === "end") this.schedule();
+		});
+	}
+
+	/** Resolves once the report being handed over is in: whether another one is still to come. */
+	async settle(): Promise<boolean> {
+		await this.sending;
+		return this.timer !== undefined;
+	}
+
+	dispose(): void {
+		clearTimeout(this.timer);
+		this.unsubscribe();
+	}
+
+	private schedule(): void {
+		this.timer ??= setTimeout(() => {
+			this.timer = undefined;
+			this.report();
+		}, JOB_SETTLE_WINDOW_MS);
+	}
+
+	private report(): void {
+		if (this.jobs.hasWaiters()) {
+			// Should the wait end without them (aborted), they still come as a message.
+			this.schedule();
+			return;
+		}
+		const ended = this.jobs.takeUnreported();
+		if (ended.length > 0) this.sending = this.send(ended).catch(() => {});
+	}
+}
+
 export function formatJobReport(jobs: readonly BackgroundJob[]): string {
 	const one = (job: BackgroundJob) =>
 		`Background job ${job.id} (\`${job.command}\`) ${describeEnd(job)}.` +
