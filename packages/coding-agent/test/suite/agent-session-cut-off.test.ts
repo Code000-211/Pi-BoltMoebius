@@ -76,6 +76,25 @@ describe("AgentSession responses cut off at the output limit", () => {
 		expect(notices(harness)).toBe(4);
 	});
 
+	it("asks the summary on the cached prefix at the thinking level the requests before it used", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1", reasoning: true, maxTokens: MAX_TOKENS }],
+			settings: { compaction: { keepRecentTokens: 1 } },
+		});
+		harnesses.push(harness);
+		harness.session.setThinkingLevel("medium");
+		const levels: Array<string | undefined> = [];
+		const stream = harness.session.agent.streamFunction;
+		harness.session.agent.streamFunction = (model, context, options) => {
+			levels.push(options?.reasoning);
+			return stream(model, context, options);
+		};
+		harness.setResponses([cutOff(), cutOff(), cutOff(), cutOff(), fauxAssistantMessage("## Goal\nSummary.")]);
+		await harness.session.prompt("solve it");
+		await harness.session.compact();
+		expect(levels).toEqual(["medium", "low", "minimal", "minimal", "minimal"]);
+	});
+
 	it("puts the notice ahead of a message already queued, such as a job report", async () => {
 		const harness = await createHarness({ models: [{ id: "faux-1", reasoning: true, maxTokens: MAX_TOKENS }] });
 		harnesses.push(harness);

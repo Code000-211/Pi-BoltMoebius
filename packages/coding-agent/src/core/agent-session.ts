@@ -3437,14 +3437,15 @@ export class AgentSession {
 		callbacks: RetryCallbacks | undefined,
 	): Promise<CompactionResult | undefined> {
 		const sessionModel = this.agent.state.model;
-		const thinkingLevel = this.agent.state.thinkingLevel;
 		if (
 			request.model.provider !== sessionModel.provider ||
 			request.model.id !== sessionModel.id ||
-			request.thinkingLevel !== thinkingLevel
+			request.thinkingLevel !== this.agent.state.thinkingLevel
 		) {
 			return undefined;
 		}
+		// As the requests it continues think: less after responses cut off at the output limit (_requestThinkingLevel).
+		const thinkingLevel = this._requestThinkingLevel();
 		// The messages the session's next request would send (see _installAgentRequestProjection and agent-loop).
 		let messages: AgentMessage[] = this.sessionManager.buildSessionProjection().messages;
 		if (this.agent.transformContext) messages = await this.agent.transformContext(messages, signal);
