@@ -94,6 +94,27 @@ describe("the user's messages beside a compaction summary", () => {
 		expect(requests[0]).toMatch(/^x{16000}\n\[cut here: the rest is in the summary\]$/);
 	});
 
+	it("keeps the task and the newest messages that fit when not all of them do", () => {
+		const session = SessionManager.inMemory();
+		const task = `task ${"t".repeat(6000)}`;
+		session.appendMessage({ role: "user", content: task, timestamp: Date.now() });
+		for (let i = 1; i <= 5; i++) {
+			session.appendMessage({ role: "user", content: `m${i} ${"m".repeat(4000)}`, timestamp: Date.now() });
+		}
+		const keptId = session.appendMessage(assistant("ok"));
+		session.appendCompaction("summary", keptId, 5000);
+		expect(summary(session).userRequests?.map((text) => text.slice(0, 4))).toEqual(["task", "m4 m", "m5 m"]);
+		// The summary request names the ones that stay, so it summarizes the others.
+		const preparation = prepareCompaction(session.getBranch().slice(0, -1), {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 1,
+		});
+		expect(preparation?.keptUserMessagesComplete).toBe(false);
+		expect(keptUserMessagesInstruction(preparation!)).toMatch(
+			/Not all of them fit: only those that start as listed below stay[^\n]*:\n- "task t+"\n- "m4 m+"\n- "m5 m+"$/,
+		);
+	});
+
 	it("leaves an extension's own compaction as the extension wrote it", () => {
 		const session = SessionManager.inMemory();
 		session.appendMessage({ role: "user", content: TICKET, timestamp: Date.now() });
@@ -169,5 +190,7 @@ describe("the user's messages in Pi's own compaction", () => {
 		const on = prepareCompaction(session.getBranch(), DEFAULT_COMPACTION_SETTINGS)!;
 		expect(on.keptUserMessages).toEqual([TICKET, "more"]);
 		expect(keptUserMessagesInstruction(on)).toContain("Do not quote, copy or restate them");
+		// All fit: nothing is listed.
+		expect(keptUserMessagesInstruction(on)).not.toContain("Not all of them fit");
 	});
 });

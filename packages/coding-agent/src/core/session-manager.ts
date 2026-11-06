@@ -568,23 +568,34 @@ function userText(entry: SessionEntry): string | undefined {
 	return text || undefined;
 }
 
+/** How a message cut at COMPACTED_USER_MESSAGES_MAX_CHARS ends. */
+export const COMPACTED_USER_MESSAGE_CUT = "\n[cut here: the rest is in the summary]";
+
 /**
  * The text of the user's own messages in `path` before `keptIndex`, oldest first, within
- * COMPACTED_USER_MESSAGES_MAX_CHARS (a message cut there says so). A message that a later one of `path` contains whole is
- * left out: a run that continues a session is often sent its task again with notes added. Harness and extension
- * messages are not the user's.
+ * COMPACTED_USER_MESSAGES_MAX_CHARS: the first (the task, mostly; cut there when it is longer, which it then says), then
+ * the newest that fit whole. Those in between that do not fit are left to the summary; `complete` says whether all
+ * stayed, uncut. A message that a later one of `path` contains whole is left out: a run that continues a session is
+ * often sent its task again with notes added. Harness and extension messages are not the user's.
  */
-export function userMessagesBefore(path: SessionEntry[], keptIndex: number): string[] {
+export function userMessagesBefore(path: SessionEntry[], keptIndex: number): { kept: string[]; complete: boolean } {
 	const all = path.map(userText);
 	const texts: string[] = [];
-	let room = COMPACTED_USER_MESSAGES_MAX_CHARS;
-	for (let i = 0; i < keptIndex && room > 0; i++) {
+	for (let i = 0; i < keptIndex; i++) {
 		const text = all[i];
-		if (!text || all.some((later, j) => j > i && later?.includes(text))) continue;
-		texts.push(text.length <= room ? text : `${text.slice(0, room)}\n[cut here: the rest is in the summary]`);
-		room -= text.length;
+		if (text && !all.some((later, j) => j > i && later?.includes(text))) texts.push(text);
 	}
-	return texts;
+	if (texts.length === 0) return { kept: [], complete: true };
+	const [first, ...rest] = texts as [string, ...string[]];
+	let room = COMPACTED_USER_MESSAGES_MAX_CHARS - first.length;
+	const newest: string[] = [];
+	for (let i = rest.length - 1; i >= 0 && rest[i]!.length <= room; i--) {
+		newest.unshift(rest[i]!);
+		room -= rest[i]!.length;
+	}
+	const cut = first.length > COMPACTED_USER_MESSAGES_MAX_CHARS;
+	const head = cut ? `${first.slice(0, COMPACTED_USER_MESSAGES_MAX_CHARS)}${COMPACTED_USER_MESSAGE_CUT}` : first;
+	return { kept: [head, ...newest], complete: !cut && newest.length === rest.length };
 }
 
 /** The user's messages that `compaction` carries (see {@link userMessagesBefore}), up to the compaction in `path`. */
@@ -595,7 +606,7 @@ function compactedUserMessages(path: SessionEntry[], compaction: CompactionEntry
 	const before = at < 0 ? path : path.slice(0, at);
 	let kept = before.findIndex((entry) => entry.id === compaction.firstKeptEntryId);
 	if (kept < 0) kept = before.length;
-	const texts = userMessagesBefore(before, kept);
+	const texts = userMessagesBefore(before, kept).kept;
 	compactedUserMessagesCache.set(compaction, texts);
 	return texts;
 }
