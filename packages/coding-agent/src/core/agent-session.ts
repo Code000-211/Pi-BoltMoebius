@@ -90,6 +90,7 @@ import {
 	shouldCompact,
 	truncateContentForContext,
 } from "./compaction/index.ts";
+import { CutOffResponses } from "./cut-off-response.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
@@ -485,13 +486,6 @@ export const CHECK_REPORT_MESSAGE_TYPE = "check-report";
  */
 const CHECKS_WAIT_MS = (Number(process.env.PI_CHECKS_WAIT) || 30) * 1000;
 
-/** `customType` of the notice after a response cut off at the output limit with nothing done. */
-export const CUT_OFF_MESSAGE_TYPE = "cut-off-response";
-/** Such notices in a row before the run ends as before. */
-const MAX_CUT_OFF_NOTICES = 3;
-/** The thinking levels a cut-off response steps down through ("off" is never chosen for the model). */
-const CUT_OFF_THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
-
 function getOverflowRecoveryStep(
 	settings: CompactionSettings,
 	step: number,
@@ -539,8 +533,8 @@ export class AgentSession {
 	private _compactionAhead: CompactionAhead | undefined = undefined;
 	/** Overflow recovery steps taken since the last user message or successful response */
 	private _overflowRecoveryAttempts = 0;
-	/** Responses in a row cut off at the output limit with nothing done, see {@link _answerCutOffResponse}. */
-	private _cutOffResponses = 0;
+	/** Responses cut off at the output limit with nothing done, answered with a notice (cut-off-response.ts). */
+	private readonly _cutOffResponses = new CutOffResponses();
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -1189,50 +1183,18 @@ export class AgentSession {
 			if (previousDecision?.action === "end") return previousDecision;
 			// Before the other reasons to go on: a run that goes on anyway (a queued job report, an extension) still
 			// needs the notice and the lower thinking level, or the next response thinks to the limit again.
-			const cutOff = await this._answerCutOffResponse(turn.message);
-			if (cutOff || extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
+			const notice = this._cutOffResponses.answer(turn.message, this.agent.state.model?.maxTokens);
+			// Ahead of other queued messages (a job report): steering goes one message a turn, and a notice one turn late
+			// lets the next response think to the limit again.
+			if (notice) this.agent.steerFirst(notice);
+			if (notice || extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
 			return undefined;
 		};
 	}
 
-	/** The session's thinking level, one level less for each response in a row cut off at the output limit (not below minimal). */
+	/** The session's thinking level, one level less for each response in a row cut off at the output limit. */
 	private _requestThinkingLevel(): ThinkingLevel {
-		const level = this.agent.state.thinkingLevel;
-		const at = (CUT_OFF_THINKING_LEVELS as readonly string[]).indexOf(level);
-		if (this._cutOffResponses === 0 || at <= 0) return level;
-		return CUT_OFF_THINKING_LEVELS[Math.max(0, at - this._cutOffResponses)];
-	}
-
-	/**
-	 * A response cut off at the output limit with no tool call did nothing, and would end the run: the model is told and
-	 * goes on, up to {@link MAX_CUT_OFF_NOTICES} times in a row. In Terminal-Bench 2.1, glm-5.3-flash ended 2 of its first
-	 * 14 runs this way, after 65,536 tokens of thinking, with most of the time left.
-	 */
-	private async _answerCutOffResponse(message: AgentMessage): Promise<boolean> {
-		if (message.role !== "assistant") return false;
-		if (message.stopReason !== "length") {
-			this._cutOffResponses = 0;
-			return false;
-		}
-		// Only a response that did nothing but think: one cut off in its answer text ends as before (Pi's behaviour).
-		if (message.content.some((c) => c.type === "toolCall" || (c.type === "text" && c.text.trim()))) return false;
-		// Cut off below the output limit: the context ran out, which compact-and-retry handles (_checkCompaction).
-		const model = this.agent.state.model;
-		if (model && isRecoverableLength(message, model.maxTokens)) return false;
-		if (this._cutOffResponses >= MAX_CUT_OFF_NOTICES) return false;
-		// The next requests think one level less per such response, until one ends normally (_requestThinkingLevel).
-		this._cutOffResponses++;
-		// Ahead of other queued messages (a job report): steering goes one message a turn, and a notice one turn late
-		// lets the next response think to the limit again.
-		this.agent.steerFirst({
-			role: "custom",
-			customType: CUT_OFF_MESSAGE_TYPE,
-			content:
-				"Your last response reached the output limit while you were still working it out, so nothing was done. Think in shorter steps: take the next concrete step now (a tool call, or write the result), and decide the rest from what it shows.",
-			display: true,
-			timestamp: Date.now(),
-		});
-		return true;
+		return this._cutOffResponses.thinkingLevel(this.agent.state.thinkingLevel);
 	}
 
 	private _installAgentNextTurnRefresh(): void {
@@ -1464,8 +1426,7 @@ export class AgentSession {
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempts = 0;
-			// A run that ended cut off must not leave the next prompt thinking less.
-			this._cutOffResponses = 0;
+			this._cutOffResponses.reset();
 			const messageText = contentText(event.message.content, "");
 			if (messageText) {
 				// Check steering queue first
