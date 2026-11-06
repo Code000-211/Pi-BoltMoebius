@@ -1,5 +1,6 @@
 import { type AssistantMessage, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { compactionFeatures } from "../../src/core/compaction/features.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 type Internals = {
@@ -74,10 +75,10 @@ async function eightReads(pruning: boolean): Promise<{ harness: Harness; compact
 describe("compaction threshold after tool-result pruning", () => {
 	const harnesses: Harness[] = [];
 	beforeAll(() => {
-		process.env.PI_COMPACTION_AHEAD = "off";
+		compactionFeatures.ahead = false;
 	});
 	afterAll(() => {
-		delete process.env.PI_COMPACTION_AHEAD;
+		compactionFeatures.ahead = true;
 	});
 	afterEach(() => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();

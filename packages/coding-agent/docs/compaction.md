@@ -38,7 +38,7 @@ A compaction summary may produce at most the largest of 80% of `reserveTokens`, 
 
 ### The summary request
 
-A threshold or manual compaction first asks for the summary as a continuation of the session's own request: the messages the next request would send (system prompt, tools, conversation, with old tool results cleared as there), then one user message that asks for the summary and quotes the first message kept. The provider reads all but that message from its prompt cache. This needs the summary to come from the session's model at its thinking level; when the compaction uses another model, the summary calls a tool, fails or is cut off, and on an overflow (whose request did not fit), the standalone request below is sent instead: its own summarization system prompt and the conversation as text, which nothing has cached. `PI_COMPACTION_CACHED_PREFIX=off` always sends the standalone request.
+A threshold or manual compaction first asks for the summary as a continuation of the session's own request: the messages the next request would send (system prompt, tools, conversation, with old tool results cleared as there), then one user message that asks for the summary and quotes the first message kept. The provider reads all but that message from its prompt cache. This needs the summary to come from the session's model at its thinking level; when the compaction uses another model, the summary calls a tool, fails or is cut off, and on an overflow (whose request did not fit), the standalone request below is sent instead: its own summarization system prompt and the conversation as text, which nothing has cached.
 
 The defaults scale with the context window only while the matching setting is unset:
 

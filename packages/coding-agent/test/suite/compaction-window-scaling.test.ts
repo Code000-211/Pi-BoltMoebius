@@ -11,6 +11,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { compactionFeatures } from "../../src/core/compaction/features.ts";
 import { SUMMARIZATION_SYSTEM_PROMPT } from "../../src/core/compaction/index.ts";
 import { createHarness, type Harness, type HarnessOptions } from "./harness.ts";
 
@@ -141,15 +142,15 @@ function recordCompactions(harness: Harness, captured: Captured): void {
 describe("compaction scaled with the context window", () => {
 	// The standalone summary request's caps; the request on the cached prefix is in agent-session-compaction.test.ts.
 	beforeAll(() => {
-		process.env.PI_COMPACTION_CACHED_PREFIX = "off";
+		compactionFeatures.cachedPrefix = false;
 		// The thresholds themselves: a summary made ahead would let the agent go on above them.
-		process.env.PI_COMPACTION_AHEAD = "off";
-		process.env.PI_COMPACTION_USER_MESSAGES = "off";
+		compactionFeatures.ahead = false;
+		compactionFeatures.userMessages = false;
 	});
 	afterAll(() => {
-		delete process.env.PI_COMPACTION_CACHED_PREFIX;
-		delete process.env.PI_COMPACTION_AHEAD;
-		delete process.env.PI_COMPACTION_USER_MESSAGES;
+		compactionFeatures.cachedPrefix = true;
+		compactionFeatures.ahead = true;
+		compactionFeatures.userMessages = true;
 	});
 
 	const harnesses: Harness[] = [];

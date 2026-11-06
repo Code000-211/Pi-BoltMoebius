@@ -125,9 +125,7 @@ function buildRules(
 			"Put calls that need no answer in between into one response: they run in order, so all edits for a fix and the command that tests them go together",
 		);
 	}
-	addRule(
-		"Be concise in your responses",
-	);
+	addRule("Be concise in your responses");
 	addRule("Show file paths clearly when working with files");
 	return rules.map((rule) => `- ${rule}`).join("\n");
 }

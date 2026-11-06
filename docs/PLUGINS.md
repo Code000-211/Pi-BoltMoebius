@@ -39,7 +39,7 @@ A compiled-in plugin:
 - **Costs nothing measurable at startup.** Loading the same plugin with jiti costs 39 ms on Pi-Bolt and 95 ms on Bun.
 - **Runs 24× faster than the interpreter** that run-time plugins get on the JIT-off build. The interpreter is why that row says
   1,315 ms: the JIT is off and run-time code was never compiled
-  ([details](BENCHMARKS.md#why-is-a-run-time-plugins-loop-slow-on-the-default-build)).
+  ([details](https://github.com/opensec-git/Pi-Bolt/blob/pi-bolt/docs/BENCHMARKS.md#why-is-a-run-time-plugins-loop-slow-on-the-default-build)).
 - **Stays within 1.25× of fully warmed-up JIT code**, without the JIT's warm-up, compiler threads or memory.
 
 ## Three ways to run a plugin
@@ -496,7 +496,7 @@ Time Pi's startup phases, including each plugin's factory:
 PI_TIMING=1 out/pi-bolt-plugins/pi -p "hello"
 ```
 
-Compare builds end to end with the benchmark tools (see [BENCHMARKS.md](BENCHMARKS.md)):
+Compare builds end to end with the benchmark tools (see [BENCHMARKS.md](https://github.com/opensec-git/Pi-Bolt/blob/pi-bolt/docs/BENCHMARKS.md)):
 
 ```bash
 python3 bench/benchmark.py --runs 10 --build plugins=out/pi-bolt-plugins/pi --build plain=out/pi-bolt/pi

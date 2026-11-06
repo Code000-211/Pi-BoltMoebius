@@ -1,30 +1,17 @@
 /**
- * A snapshot of the working folder for the system prompt, taken once when the session starts: its files, and for a small
- * project their contents. Nearly every coding run otherwise spends its first turn listing the folder (`find`, `ls`)
- * and its second reading the files it found; in 156 benchmark runs, 70 began with a listing and 31 continued with 4-5
- * reads. The snapshot answers both up front, bounded so that a large repository costs a short summary.
+ * A listing of the working folder for the system prompt, taken once when the session starts. Nearly every coding run
+ * otherwise spends its first turn listing the folder (`find`, `ls`): in 156 benchmark runs, 70 began with a listing.
+ * Bounded, so that a large repository costs a short summary. Small files' contents were included too, once: that
+ * made glm-5.3-flash think longer over them than the reads would have taken.
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { type Dirent, existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 
-export interface ProjectSnapshot {
-	/** The section text. */
-	text: string;
-	/** Files whose whole content the text holds, by absolute path: they count as read. */
-	inlined: Map<string, string>;
-}
-
 /** Listed one per line up to this many; above, folders with their file counts. */
 const MAX_LISTED_FILES = 150;
-/** Contents are included when the project has at most this many files... */
-const MAX_INLINED_FILES = 40;
-/** ...of at most this many characters together... */
-const MAX_INLINED_TOTAL = 16_000;
-/** ...and each file at most this many. */
-const MAX_INLINED_FILE = 6_000;
 const MAX_WALKED = 5_000;
 const SKIPPED_DIRS = new Set([
 	"node_modules",
@@ -51,7 +38,7 @@ function listFiles(cwd: string): string[] | undefined {
 	const files: string[] = [];
 	const walk = (dir: string, depth: number): void => {
 		if (files.length >= MAX_WALKED || depth > 6) return;
-		let entries: import("node:fs").Dirent[];
+		let entries: Dirent[];
 		try {
 			entries = readdirSync(dir, { withFileTypes: true });
 		} catch {
@@ -85,59 +72,15 @@ function summarize(files: string[]): string {
 	return [...top.slice(0, 40), ...dirs.map(([dir, n]) => `${dir} (${n} files)`)].join("\n");
 }
 
-/** The snapshot of `cwd`, or undefined for a folder that is no project (the home folder, /) or cannot be listed. */
-export function takeProjectSnapshot(cwd: string, options?: { contents?: boolean }): ProjectSnapshot | undefined {
+/** The listing of `cwd`, or undefined for a folder that is no project (the home folder, /) or cannot be listed. */
+export function takeProjectSnapshot(cwd: string): string | undefined {
 	const root = resolve(cwd);
 	if (root === resolve(homedir()) || root === resolve("/")) return undefined;
 	const files = listFiles(root);
 	if (!files || files.length === 0) return undefined;
-	const inlined = new Map<string, string>();
-	let listing: string;
-	if (files.length > MAX_LISTED_FILES) {
-		listing = `${files.length} files; the folders, with how many files each holds:\n${summarize(files)}`;
-	} else {
-		listing = files.join("\n");
-		if ((options?.contents ?? true) && files.length <= MAX_INLINED_FILES) {
-			// Small files in full while they fit; a larger one is named as left out, to be read.
-			const contents: Array<[string, string]> = [];
-			const left: string[] = [];
-			let total = 0;
-			for (const file of files) {
-				const path = join(root, file);
-				let text: string;
-				try {
-					if (statSync(path).size > MAX_INLINED_FILE) {
-						left.push(file);
-						continue;
-					}
-					text = readFileSync(path, "utf-8");
-				} catch {
-					continue;
-				}
-				if (text.includes("\0")) continue;
-				if (total + text.length > MAX_INLINED_TOTAL) {
-					left.push(file);
-					continue;
-				}
-				total += text.length;
-				contents.push([file, text]);
-			}
-			if (contents.length > 0) {
-				for (const [file, text] of contents) inlined.set(join(root, file), text);
-				const body = contents
-					.map(([file, text]) => `--- ${file}\n${text.endsWith("\n") ? text : `${text}\n`}`)
-					.join("");
-				const note = left.length > 0 ? `\nNot included (read them when needed): ${left.join(", ")}\n` : "";
-				return {
-					text: `The files of the working folder and their contents when the session started (they may have changed since; read a file again after a command changed it):\n${listing}\n${note}\n${body}`,
-					inlined,
-				};
-			}
-		}
-	}
-	return withListing();
-
-	function withListing(): ProjectSnapshot {
-		return { text: `The files of the working folder when the session started:\n${listing}`, inlined: new Map() };
-	}
+	const listing =
+		files.length > MAX_LISTED_FILES
+			? `${files.length} files; the folders, with how many files each holds:\n${summarize(files)}`
+			: files.join("\n");
+	return `The files of the working folder when the session started:\n${listing}`;
 }

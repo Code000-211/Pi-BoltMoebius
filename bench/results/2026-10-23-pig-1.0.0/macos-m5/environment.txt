@@ -1,8 +1,0 @@
-Apple M5
-ProductName:		macOS
-ProductVersion:		27.0.1
-BuildVersion:		26A434
-16:23  up 3 days, 21:18, 3 users, load averages: 4.42 7.95 11.30
-runtime: CI run 39894603087 (runtime-darwin-arm64); 1.0.0 = perf/v1.0.0 d35149cb0 built with scripts/build-pi.sh
-rel: bolt-v0.9.9 pi-bolt-darwin-arm64.tar.xz, checked against its SHA256SUMS
-pig: pig-0.5.1-darwin-arm64.tar.gz, checked against its SHA256SUMS

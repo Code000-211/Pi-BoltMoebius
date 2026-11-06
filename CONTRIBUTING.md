@@ -20,7 +20,6 @@ Security problems: never in a public issue. See [SECURITY.md](SECURITY.md). Ever
    - the smallest steps that reproduce it.
 
 Questions and ideas that aren't bugs go to [Discussions](https://github.com/opensec-git/Pi-Bolt/discussions).
-[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) covers common problems and what to collect.
 
 ## Opening a pull request
 
@@ -35,8 +34,8 @@ Questions and ideas that aren't bugs go to [Discussions](https://github.com/open
    ```
 
 4. Add a test that fails without your change. For an engine or build change, also run `tests/aot/run.sh` and
-   `tests/pi/run.sh` on a build with it ([docs/BUILDING.md](docs/BUILDING.md)).
-5. If it can affect speed or memory, include before/after numbers from `bench/` (same machine, runs interleaved).
+   `tests/pi/run.sh` on a build with it.
+5. If it can affect speed or quality, include before/after numbers from `bench/harness` (same model, runs interleaved).
 6. Commit with a short message: `fix(coding-agent): what changed`. Types: `feat`, `fix`, `perf`, `docs`, `build`, `test`,
    `chore`. Don't edit `CHANGELOG.md` files; release notes are written at release time.
 7. Open the pull request against `pi-bolt`, link the issue (`Fixes #123`), and fill in the template.
@@ -49,8 +48,8 @@ need to rebase unless asked.
 | Area | Where | Check with |
 |---|---|---|
 | Pi's code as Pi-Bolt changes it | `packages/` | `npm run check`, `./test.sh` |
-| Build scripts, tools, docs | `scripts/`, `bench/`, `docs/` | `shellcheck -x scripts/*.sh`, and a build |
-| The engine (JavaScriptCore AOT compiler, runtime) | `.work/webkit`, then regenerate `patches/webkit.patch` | `tests/aot/run.sh`, `bench/e2e_tools.py`, `bench/ui_check.py` |
+| Build scripts, tools | `scripts/`, `bench/` | `shellcheck -x scripts/*.sh`, and a build |
+| The engine (JavaScriptCore AOT compiler, runtime) | `.work/webkit`, then regenerate `patches/webkit.patch` | `tests/aot/run.sh` |
 | The executable format | `.work/bun`, then regenerate `patches/bun.patch` | the same |
 | Installers and updater | `install.sh`, `install.ps1`, `npm/` | `tests/installer/run.sh` (and `run.ps1` on Windows) |
 

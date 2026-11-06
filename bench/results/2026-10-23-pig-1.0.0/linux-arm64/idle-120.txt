@@ -1,8 +1,0 @@
-{'build': 'rel', 'cpu_ms_per_s': 0.065, 'own_mb': [29.3, 17.1], 'threads': {'pi': (0.065, 0.3), 'mi-scavenger': (0.029, 0.4), 'HTTP Client': (0.001, 0.0)}}
-{'build': 'cand', 'cpu_ms_per_s': 0.046, 'own_mb': [27.1, 15.4], 'threads': {'pi': (0.047, 0.1), 'mi-scavenger': (0.023, 0.3), 'HTTP Client': (0.001, 0.0)}}
-{'build': 'pig', 'cpu_ms_per_s': 0.004, 'own_mb': [10.6, 10.6], 'threads': {'pig': (0.004, 0.1)}}
-
-build                 idle CPU ms/s (median)   own MB at end (median)
-rel                        0.065         17.1
-cand                       0.046         15.4
-pig                        0.004         10.6

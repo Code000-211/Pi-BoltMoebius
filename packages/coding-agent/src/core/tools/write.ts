@@ -3,7 +3,7 @@ import { mkdir as fsMkdir, readFile as fsReadFile, stat as fsStat, writeFile as 
 import { dirname } from "path";
 import { type Static, Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
-import { type ClaudeHarnessManager, defaultClaudeHarnessManager } from "../harness/index.ts";
+import { defaultFileTracker, type FileTracker } from "../file-tracking/file-tracker.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { writeRenderers } from "./renderers/write.ts";
@@ -58,12 +58,10 @@ const defaultWriteOperations: WriteOperations = {
 export interface WriteToolOptions {
 	/** Custom operations for file writing. Default: local filesystem */
 	operations?: WriteOperations;
-	/** Shared Claude harness manager for read-before-edit tracking & LSP/libclang diagnostics. */
-	harness?: ClaudeHarnessManager;
+	/** The session's file tracker: read-before-edit tracking, and the background checks after a write. */
+	fileTracker?: FileTracker;
 	/** Enforce that an existing file was read first and not modified externally before overwriting. */
 	enforceReadBeforeEdit?: boolean;
-	/** Run C++/HIP (libclang) diagnostics and append <new-diagnostics> (other languages are checked in the background). Default: true */
-	enableDiagnostics?: boolean;
 }
 
 export function createWriteToolDefinition(
@@ -71,9 +69,8 @@ export function createWriteToolDefinition(
 	options?: WriteToolOptions,
 ): ToolDefinition<typeof writeSchema, undefined> {
 	const ops = options?.operations ?? defaultWriteOperations;
-	const harness = options?.harness ?? defaultClaudeHarnessManager;
+	const fileTracker = options?.fileTracker ?? defaultFileTracker;
 	const enforceReadBeforeEdit = options?.enforceReadBeforeEdit ?? false;
-	const enableDiagnostics = options?.enableDiagnostics ?? true;
 	return {
 		name: "write",
 		label: "write",
@@ -109,31 +106,31 @@ export function createWriteToolDefinition(
 				if (enforceReadBeforeEdit && ops === defaultWriteOperations) {
 					const existingStat = await fsStat(absolutePath).catch(() => undefined);
 					throwIfAborted();
-					if (existingStat && !harness.stateTracker.hasBeenRead(absolutePath)) {
+					if (existingStat && !fileTracker.stateTracker.hasBeenRead(absolutePath)) {
 						// Not read: refused, with the file as it is, which then counts as read, so a write that still means
 						// to replace it goes through next time instead of after a read call (10 times in 142 Terminal-Bench
 						// runs a read came between).
 						const existing = await fsReadFile(absolutePath, "utf-8").catch(() => undefined);
 						throwIfAborted();
 						if (existing !== undefined) {
-							harness.onFileRead(absolutePath, existing, existingStat.mtimeMs, workspaceCwd);
+							fileTracker.onFileRead(absolutePath, existing, existingStat.mtimeMs, workspaceCwd);
 							throw new Error(unreadWriteRefusal(path, existing));
 						}
 					}
 					if (existingStat) {
 						// A newer modification time with the same content (`touch`) is no change: compare the content then.
-						const state = harness.stateTracker.getTrackedState(absolutePath);
+						const state = fileTracker.stateTracker.getTrackedState(absolutePath);
 						const current =
 							state?.contentComplete && existingStat.mtimeMs > state.lastReadMtimeMs + 10
 								? await fsReadFile(absolutePath, "utf-8").catch(() => undefined)
 								: undefined;
 						throwIfAborted();
-						harness.assertCanModifyExistingFile(absolutePath, existingStat.mtimeMs, current);
+						fileTracker.assertCanModifyExistingFile(absolutePath, existingStat.mtimeMs, current);
 					}
 				} else if (enforceReadBeforeEdit && ops.readExisting) {
 					const existing = await ops.readExisting(absolutePath);
 					throwIfAborted();
-					if (existing !== undefined) harness.assertCanModifyExistingFile(absolutePath, undefined, existing);
+					if (existing !== undefined) fileTracker.assertCanModifyExistingFile(absolutePath, undefined, existing);
 				}
 
 				// Create parent directories if needed.
@@ -148,18 +145,14 @@ export function createWriteToolDefinition(
 					enforceReadBeforeEdit && ops === defaultWriteOperations
 						? await fsStat(absolutePath).catch(() => undefined)
 						: undefined;
-				const { suffix } = await harness.onFileModified({
+				fileTracker.onFileModified({
 					absolutePath,
-					displayPath: path,
 					newContent: content,
 					newMtimeMs: afterStat?.mtimeMs ?? Date.now(),
-					workspaceCwd,
-					includePostEditSnippet: false,
-					enableDiagnostics,
 				});
 
 				return {
-					content: [{ type: "text", text: `Successfully wrote to ${path}${suffix}` }],
+					content: [{ type: "text", text: `Successfully wrote to ${path}` }],
 					details: undefined,
 				};
 			});

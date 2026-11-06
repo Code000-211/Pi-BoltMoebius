@@ -1,6 +1,0 @@
-{"build": "rel", "entries": 2292, "mode": "fullscreen", "size": 6000, "wall_s": 5.2, "cpu_s": 2.286, "frames": 318, "fps": 61.2, "kb_written": 188, "echo_ms_median": 6.9, "echo_ms_p95": 12.9, "echo_ms_max": 12.9}
-{"build": "cand", "entries": 2292, "mode": "fullscreen", "size": 6000, "wall_s": 5.16, "cpu_s": 0.259, "frames": 316, "fps": 61.2, "kb_written": 188, "echo_ms_median": 0.5, "echo_ms_p95": 0.8, "echo_ms_max": 0.8}
-{"build": "pig", "entries": 2292, "mode": "fullscreen", "size": 6000, "wall_s": 5.2, "cpu_s": 0.202, "frames": 322, "fps": 61.9, "kb_written": 1413, "echo_ms_median": 0.5, "echo_ms_p95": 1.0, "echo_ms_max": 1.0}
-{"build": "rel", "entries": 2292, "mode": "regular", "size": 6000, "wall_s": 5.17, "cpu_s": 4.307, "frames": 296, "fps": 57.3, "kb_written": 427, "echo_ms_median": 20.1, "echo_ms_p95": 32.5, "echo_ms_max": 32.5}
-{"build": "cand", "entries": 2292, "mode": "regular", "size": 6000, "wall_s": 5.22, "cpu_s": 0.761, "frames": 313, "fps": 59.9, "kb_written": 431, "echo_ms_median": 2.7, "echo_ms_p95": 3.0, "echo_ms_max": 3.0}
-{"build": "pig", "entries": 2292, "mode": "regular", "size": 6000, "wall_s": 5.19, "cpu_s": 0.204, "frames": 322, "fps": 62.1, "kb_written": 434, "echo_ms_median": 1.4, "echo_ms_p95": 1.7, "echo_ms_max": 1.7}

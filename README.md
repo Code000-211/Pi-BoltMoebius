@@ -158,10 +158,12 @@ request (see [background checks](#background-checks)). Errors that were there be
 in the background when the file is read. The model sees its mistake in its next step instead of at the next build.
 
 - **C, C++, HIP**: checked in the background like the other languages (before, the edit waited for the reparse: 0.1 s
-  on a warm translation unit, 1 s right after the read, seconds on a large one). libclang in process when a libclang library is found (`LIBCLANG_PATH`, ROCm's, or the system's), else
-  clangd (`CLANGD_PATH`, `/opt/rocm/llvm/bin/clangd`, or on `PATH`). libclang gets the builtin headers (`stddef.h`)
+  on a warm translation unit, 1 s right after the read, seconds on a large one), through libclang in the process when a
+  libclang library is found (`LIBCLANG_PATH`, ROCm's, or the system's). libclang gets the builtin headers (`stddef.h`)
   from the folder next to the library it loaded. Flags come from `compile_commands.json` in the
-  project or up to 5 parent folders (also `build/`, `out/`, `cmake-build-*`). A header is checked inside a source that
+  project or up to 5 parent folders (also `build/`, `out/`, `cmake-build-*`); without one, the `-I` folders of the
+  project's Makefile, else its `include/` or `inc/`. When a header is still not found, only that is reported, not each
+  use of what it declares. A header is checked inside a source that
   includes it, also through `-I` folders, with the other headers the agent changed.
 - Without these tools the edit goes through as before, with no diagnostics.
 
@@ -209,8 +211,6 @@ checks off (for a harness that runs its own, as Moebius's lens), `PI_CHECKS=rust
 
 | Limit | |
 |---|---:|
-| Diagnostics listed per edit | 15, then "and N more" |
-| C/C++/HIP, clangd: wait for an edit / for the baseline on read | 350 ms / 1.5 s |
 | Background checks: errors listed in one report | 15, then "and N more" |
 | Background checks: wait before a run ends, at most | 30 s (`PI_CHECKS_WAIT`) |
 | Error limit passed to the compiler | 20 |
@@ -357,13 +357,13 @@ Not measured on a real host yet: checked with an ssh stand-in that runs the remo
   above the threshold, by at most half the threshold and half the way to the window's limit; only there does it stop
   to wait. Before, the agent stood still for each summary: 14, 56, 60 and 95 s in four real sessions. A session that
   ends between the start and the threshold has paid for a summary it did not use. Not when an extension makes or vets
-  compactions; `PI_COMPACTION_AHEAD=off` turns it off.
+  compactions.
 - **The task stays word for word.** A summary drops requirements and constraints of the task (arXiv 2608.11242: about
   17% survive; 2606.22528: violations 0% before, 30% after compaction). After Pi's own compactions the user's messages
   from the compacted part (a task sent via RPC included) stay next to the summary verbatim, oldest first, up to 16,000
-  characters; one that a later message contains whole (a continued run sent its task again with notes) is left out. The
-  summary request is told so and does not restate them. Not for compactions an extension makes itself;
-  `PI_COMPACTION_USER_MESSAGES=off` turns it off.
+  characters: the first (the task), then the newest that fit; one that a later message contains whole (a continued run
+  sent its task again with notes) is left out. The summary request is told so and does not restate them (when not all
+  fit, it is told which stay, and summarizes the others). Not for compactions an extension makes itself.
 - **Summaries from the prompt cache.** The compaction summary is asked for as a continuation of the session's own
   request, so the provider reads the conversation from its cache (as deepseek-harness does). Before, all 4 compactions in
   real sessions read nothing from the cache (26k to 508k input tokens, 14 to 95 s each).
@@ -389,8 +389,8 @@ run's time was the model's. So:
 
 - **The project is in the prompt.** A `<project>` section, taken once per session, lists the working folder's files (git's,
   up to 150; a larger project by folders with file counts). Nearly every run used to begin by listing the folder.
-  `PI_PROJECT_SNAPSHOT=full` adds small files' contents (faster with deepseek-v4.1-flash, slower with glm-5.3-flash,
-  which then planned everything at once), `=off` leaves it out.
+  Small files' contents in it were measured too and dropped (faster with deepseek-v4.1-flash, slower with
+  glm-5.3-flash, which then planned everything at once). `PI_PROJECT_SNAPSHOT=off` leaves it out.
 - **An edit and its test in one response.** The calls of a response run in order when one of them is `edit`, `write` or
   `bash`, and the prompt says that all edits for a fix and the command that tests them can go together.
 - **A smaller prompt than Pi's.** 2.2k characters of rules, tool list and docs pointer against Pi's 2.9k: "Be concise in
@@ -439,20 +439,13 @@ Everything above is on by default.
 |---|---|
 | `compaction.maxContextTokens` | Cap for the compaction threshold (default 128000) |
 | `toolResultPruning` | Shortening old tool results: `enabled`, `triggerTokens` (40000), `keepRecent` (8), `minChars` (2000) |
-| `PI_COMPACTION_CACHED_PREFIX=off` | Ask for compaction summaries as a standalone request |
-| `PI_COMPACTION_AHEAD=off` | Make the compaction summary at the threshold, with the agent waiting, instead of ahead |
-| `PI_COMPACTION_USER_MESSAGES=off` | Do not keep the user's compacted messages verbatim beside the summary |
-| `PI_BASH_AUTO_BACKGROUND=off` | Keep commands in the foreground unless the call asks for `background: true` |
-| `PI_BASH_SLEEP_GUARD=off` | Run fixed sleeps over 120 s, and leave sleeps that start a command to the shell |
-| `PI_EARLY_BASH=off` | Start read-only commands only after the model's message |
-| `PI_BASH_EDIT_GUARD=off` | Run `sed -i` and text redirected into files |
-| `PI_PROJECT_SNAPSHOT=full` / `off` | The project listing with small files' contents / none |
+| `PI_PROJECT_SNAPSHOT=off` | No project listing in the system prompt |
 | `--remote <host>[:<folder>]`, `PI_REMOTE` | Start working on that machine (as `/remote`) |
 | `PI_SSH_COMMAND` | The ssh program (default `ssh`) |
-| `PI_CHECKS` | `off`, or the background checks to keep (`cpp,rust,python,typescript,javascript,shell,luau,json,toml,yaml`, and the linters `js-lint,markdown,yaml-lint,luau-lint,cpp-lint`); without `cpp`, C/C++/HIP is checked in the edit as before |
+| `PI_CHECKS` | `off`, or the background checks to keep (`cpp,rust,python,typescript,javascript,shell,luau,json,toml,yaml`, and the linters `js-lint,markdown,yaml-lint,luau-lint,cpp-lint`) |
 | `PI_CHECKS_WAIT` | Seconds a run that would end waits for the checks of its edits (default 30) |
 | `PI_CHECKS_CARGO_TARGET` | `shared` to let the background `cargo check` use the project's `target/` |
-| `LIBCLANG_PATH`, `CLANGD_PATH` | Where the C/C++ diagnostics tools are |
+| `LIBCLANG_PATH` | Where the libclang library for the C/C++ checks is |
 | `HCC_AMDGPU_TARGET`, `HIP_OFFLOAD_ARCH` | GPU target for HIP diagnostics (default `gfx1100`) |
 | `app.jobs.hub` keybinding | Opens the job hub (default `alt+j`) |
 
@@ -460,9 +453,9 @@ Everything above is on by default.
 
 Pi-Lightspeed's own tests, in `packages/coding-agent` unless noted:
 
-- `test/claude-harness.test.ts`: diagnostics with mock clangd, read before edit, nested instruction
-  files, the search caches, the bash fast paths and the edit fallback.
-- `test/cpp-hip-engine.test.ts`: against real libclang (skipped when the bridge is not built).
+- `test/claude-harness.test.ts`: read before edit, nested instruction files, compile flags, the search caches, the
+  bash fast paths and the edit fallback.
+- `test/libclang.test.ts`: against real libclang (skipped when the bridge is not built).
 - `test/background-jobs.test.ts`, `test/suite/agent-session-bash-background.test.ts`, `test/job-hub.test.ts`: jobs,
   their reports and wake-ups, `wait`, the sleep guard and the hub.
 - `test/bash-file-writes.test.ts`: which commands count as changing files, and the bash tool refusing them.

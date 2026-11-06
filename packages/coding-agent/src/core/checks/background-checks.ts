@@ -16,8 +16,7 @@
  * findings in the files edited count as new.
  */
 
-import type { HarnessDiagnostic } from "../harness/file-state-tracker.ts";
-import { type Checker, type CheckUnit, enabledCheckers, shown } from "./checkers.ts";
+import { type Checker, type CheckUnit, type Diagnostic, enabledCheckers, shown } from "./checkers.ts";
 
 /** How long edits settle before their check starts. */
 const SETTLE_MS = 150;
@@ -33,7 +32,7 @@ interface UnitState {
 	/** The lint findings before the agent first changed the unit (or at the last lint report). */
 	lintBaseline?: Counts;
 	/** Lint findings new against `lintBaseline` at the last check, to report when the run would end. */
-	lint: HarnessDiagnostic[];
+	lint: Diagnostic[];
 	/** Files edited since the last check ended. */
 	edited: Set<string>;
 	/** Every file of the unit the agent edited. */
@@ -54,25 +53,21 @@ export interface BackgroundChecksOptions {
 	checkers?: Checker[];
 }
 
-function fingerprint(d: HarnessDiagnostic): string {
+function fingerprint(d: Diagnostic): string {
 	// Not the line: an edit above an old finding moves it, and it is still the same finding.
 	return `${d.file}\0${d.severity}\0${d.code ?? ""}\0${d.message}`;
 }
 
-function counts(diagnostics: HarnessDiagnostic[]): Counts {
+function counts(diagnostics: Diagnostic[]): Counts {
 	const map: Counts = new Map();
 	for (const d of diagnostics) map.set(fingerprint(d), (map.get(fingerprint(d)) ?? 0) + 1);
 	return map;
 }
 
 /** The findings not in `before`; without `before`, those in `files` only (one elsewhere may well have been there). */
-function newAgainst(
-	diagnostics: HarnessDiagnostic[],
-	before: Counts | undefined,
-	files: Set<string>,
-): HarnessDiagnostic[] {
+function newAgainst(diagnostics: Diagnostic[], before: Counts | undefined, files: Set<string>): Diagnostic[] {
 	const remaining = new Map(before ?? []);
-	const fresh: HarnessDiagnostic[] = [];
+	const fresh: Diagnostic[] = [];
 	for (const d of diagnostics) {
 		const key = fingerprint(d);
 		const seen = remaining.get(key) ?? 0;
@@ -171,7 +166,7 @@ export class BackgroundChecks {
 	}
 
 	private async check(state: UnitState, edited: Set<string>): Promise<void> {
-		let diagnostics: HarnessDiagnostic[];
+		let diagnostics: Diagnostic[];
 		try {
 			diagnostics = await state.unit.checker.run(state.unit, this.abort.signal);
 		} catch {
@@ -199,7 +194,7 @@ export class BackgroundChecks {
 		}
 	}
 
-	private format(title: string, diagnostics: HarnessDiagnostic[]): string {
+	private format(title: string, diagnostics: Diagnostic[]): string {
 		const lines = diagnostics
 			.slice(0, MAX_REPORTED)
 			.map(
@@ -215,7 +210,7 @@ export class BackgroundChecks {
 	 * are none. What it reports becomes the baseline: the same finding is not reported again.
 	 */
 	takeLintReport(): string | undefined {
-		const findings: HarnessDiagnostic[] = [];
+		const findings: Diagnostic[] = [];
 		const linters = new Set<string>();
 		for (const state of this.units.values()) {
 			if (state.lint.length === 0) continue;

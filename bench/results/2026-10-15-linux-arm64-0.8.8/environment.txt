@@ -1,6 +1,0 @@
-date: 2026-10-15T12:50Z
-cpu: Apple M5 (Docker Desktop's Linux VM, 10 vCPUs, 12 GB), pinned to 2-5
-kernel: 6.12.76-linuxkit (4096-byte pages)
-pi-bolt: linux-arm64 build of this branch, Pi 1.2.0 (Pi-Bolt 0.8.6, linux-arm64, JIT off)
-bun: 1.4.2
-node: v24.22.0

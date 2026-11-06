@@ -1,7 +1,0 @@
-build        characters   wall s    cpu s  of a core  own MB
-pi-bolt            5000      5.1     0.37         7%      22
-pi-bolt           20000     20.0     1.66         8%      22
-pi-bolt           60000     59.8     6.46        11%      33
-opencode           5000      5.4     1.95        36%     155
-opencode          20000     20.2     4.21        21%     213
-opencode          60000     60.4    13.31        22%     288

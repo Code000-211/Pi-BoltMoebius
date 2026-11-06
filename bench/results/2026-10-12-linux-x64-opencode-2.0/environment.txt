@@ -1,6 +1,0 @@
-date: 2026-10-12T19:26Z
-Linux 7.0.0-1013-gcp x86_64
-model name	: AMD EPYC 7B13
-cpus: 40-43
-pi-bolt: 1.1.0 (Pi-Bolt 0.8.5, linux-x64, JIT off)
-opencode: opencode v2.0.27 (@opencode/cli, --standalone)

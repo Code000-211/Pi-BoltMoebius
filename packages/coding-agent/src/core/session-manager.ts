@@ -32,6 +32,7 @@ import { basename, join, resolve } from "path";
 import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
+import { compactionFeatures } from "./compaction/features.ts";
 import {
 	type BashExecutionMessage,
 	type CustomMessage,
@@ -552,11 +553,6 @@ export const COMPACTED_USER_MESSAGES_MAX_CHARS = 16_000;
 /** A path's entries before a compaction do not change, so neither do its compacted user messages. */
 const compactedUserMessagesCache = new WeakMap<CompactionEntry, string[]>();
 
-/** Whether Pi's own compactions carry the user's compacted messages verbatim (PI_COMPACTION_USER_MESSAGES=off: no). */
-export function compactedUserMessagesEnabled(): boolean {
-	return process.env.PI_COMPACTION_USER_MESSAGES !== "off";
-}
-
 function userText(entry: SessionEntry): string | undefined {
 	if (entry.type !== "message" || entry.message.role !== "user") return undefined;
 	const content = entry.message.content;
@@ -633,7 +629,7 @@ function projectSessionPath(path: SessionEntry[]): SessionProjection {
 	);
 	const first = projectedEntries[0];
 	// An extension's own compaction decides itself what it keeps.
-	if (first?.sourceEntry.type === "compaction" && !first.sourceEntry.fromHook && compactedUserMessagesEnabled()) {
+	if (first?.sourceEntry.type === "compaction" && !first.sourceEntry.fromHook && compactionFeatures.userMessages) {
 		const userRequests = compactedUserMessages(path, first.sourceEntry);
 		if (userRequests.length > 0) {
 			first.messages = first.messages.map((message) =>

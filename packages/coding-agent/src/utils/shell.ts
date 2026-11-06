@@ -11,7 +11,7 @@ export interface ShellConfig {
 	commandTransport?: "argv" | "stdin";
 }
 
-// Keep in sync with packages/durable/src/env/node.ts.
+// As upstream Pi's durable package (packages/durable/src/env/node.ts) has it.
 function isLegacyWslBashPath(path: string): boolean {
 	const normalized = win32.normalize(path).toLowerCase();
 	// The WSL Store app's alias in %LOCALAPPDATA%\Microsoft\WindowsApps (on the user's PATH whenever WSL is installed from
@@ -52,7 +52,7 @@ function getBashShellConfig(shell: string): ShellConfig {
 	return isLegacyWslBashPath(shell) ? { shell, args: ["-s"], commandTransport: "stdin" } : { shell, args: ["-c"] };
 }
 
-// Matches harness-v2's pathExists (packages/durable/src/env/node.ts).
+// Matches harness-v2's pathExists (upstream Pi's packages/durable/src/env/node.ts).
 // On Unix this is identical to existsSync() (both are access(F_OK)), just
 // spelled with try/catch. On Windows we explicitly avoid existsSync(): its
 // extra stat check rejects runnable Store aliases (nodejs/node#36790).

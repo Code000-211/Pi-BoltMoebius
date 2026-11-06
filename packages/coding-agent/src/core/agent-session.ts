@@ -13,7 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import {
 	type AfterToolCallContext,
@@ -74,6 +74,8 @@ import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
 import { BackgroundChecks } from "./checks/background-checks.ts";
 import { CHECKERS, enabledCheckers } from "./checks/checkers.ts";
+import { cppChecker } from "./checks/cpp/checker.ts";
+import { compactionFeatures } from "./compaction/features.ts";
 import {
 	type CompactionPreparation,
 	type CompactionResult,
@@ -129,13 +131,13 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
-import { ClaudeHarnessManager } from "./harness/index.ts";
+import { FileTracker } from "./file-tracking/file-tracker.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import { NestedToolCallRunner } from "./nested-tool-calls.ts";
-import { type ProjectSnapshot, takeProjectSnapshot } from "./project-snapshot.ts";
+import { takeProjectSnapshot } from "./project-snapshot.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import {
 	type AskSecret,
@@ -457,7 +459,7 @@ const OVERFLOW_RECOVERY_STEPS = 3;
  * How far below the compaction threshold the summary starts in the background (see `_compactAhead`): a share of the
  * threshold, up to a number of tokens. Started closer, the agent works on above the threshold for longer (a summary
  * takes 15 to 90 seconds); started earlier, more of the context stays after the compaction, and a session that ends
- * below the threshold paid for a summary it never used. `PI_COMPACTION_AHEAD=off` turns it off.
+ * below the threshold paid for a summary it never used.
  */
 const COMPACTION_AHEAD_SHARE = 0.15;
 const COMPACTION_AHEAD_MAX_TOKENS = 40_000;
@@ -616,7 +618,7 @@ export class AgentSession {
 
 	private _modelRuntime: ModelRuntime;
 	private _cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed">;
-	private _claudeHarness = new ClaudeHarnessManager();
+	private _fileTracker = new FileTracker();
 	/**
 	 * Checks after an edit in the background (checks/background-checks.ts): new errors come as a message before the
 	 * next request, and a run waits for those still running before it ends (see _waitForChecks).
@@ -633,7 +635,7 @@ export class AgentSession {
 				/** `target.dir`, resolved on the host. */
 				dir: string;
 				/** Read-before-edit for the host's files, apart from this machine's; no diagnostics there. */
-				harness: ClaudeHarnessManager;
+				fileTracker: FileTracker;
 				tools: Map<string, ToolDefinition>;
 				/** Local search tools turned off while working there, turned on again after. */
 				pausedTools: string[];
@@ -671,10 +673,11 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		// C, C++ and HIP through the file tracker's libclang engine, where its bridge is (see checks/cpp/checker.ts).
+		const cpp = cppChecker(this._fileTracker.cppEngine, this._cwd);
 		const checks = new BackgroundChecks({
 			cwd: this._cwd,
-			// C, C++ and HIP through the harness's libclang engine (see ClaudeHarnessManager.cppChecker).
-			checkers: enabledCheckers(undefined, [...CHECKERS, this._claudeHarness.cppChecker(this._cwd)]),
+			checkers: enabledCheckers(undefined, cpp ? [...CHECKERS, cpp] : CHECKERS),
 			report: (text) => {
 				this.sendCustomMessage(
 					{ customType: CHECK_REPORT_MESSAGE_TYPE, content: text, display: true },
@@ -684,7 +687,7 @@ export class AgentSession {
 		});
 		if (checks.enabled) {
 			this._checks = checks;
-			this._claudeHarness.setBackgroundChecks(checks);
+			this._fileTracker.setBackgroundChecks(checks);
 		}
 		this._modelRuntime = config.modelRuntime;
 		this._cacheWarmer = config.cacheWarmer;
@@ -858,7 +861,7 @@ export class AgentSession {
 	 * extension runner (cwd), so it is used only if both are still the same when the call is reached.
 	 *
 	 * So may calls of the built-in bash tool whose command only reads (`isReadOnlyCommand`: `git diff`, `rg`, `cat`,
-	 * ...), without a shell command prefix (it could do anything). `PI_EARLY_BASH=off` turns that off.
+	 * ...), without a shell command prefix (it could do anything).
 	 */
 	private _earlyToolExecution(toolCall: AgentToolCall, tool: AgentTool): (() => boolean) | undefined {
 		const runner = this._extensionRunner;
@@ -870,9 +873,7 @@ export class AgentSession {
 			if (command !== undefined && (typeof command !== "string" || !isReadOnlyCommand(command))) return undefined;
 		}
 		const allowed = () =>
-			(bash
-				? process.env.PI_EARLY_BASH !== "off" && !this.settingsManager.getShellCommandPrefix()
-				: this._earlyToolExecutes.has(tool.execute)) &&
+			(bash ? !this.settingsManager.getShellCommandPrefix() : this._earlyToolExecutes.has(tool.execute)) &&
 			!runner.hasHandlersOutside(
 				"tool_call",
 				bash ? EARLY_BASH_TOOL_CALL_PASSTHROUGH_EXTENSIONS : EARLY_TOOL_CALL_PASSTHROUGH_EXTENSIONS,
@@ -1779,7 +1780,6 @@ export class AgentSession {
 	dispose(): void {
 		clearTimeout(this._jobReportTimer);
 		this._remote?.ssh.close();
-		this._remote?.harness.dispose();
 		this._unsubscribeJobs();
 		this.backgroundJobs.killAll();
 		try {
@@ -1802,9 +1802,8 @@ export class AgentSession {
 			this._cacheWarmer.onWarmed = undefined;
 			this._cacheWarmer.cancel();
 		}
-		// Stop clangd and the background checks so replaced sessions do not leak processes.
+		// Stop the background checks so replaced sessions do not leak processes.
 		this._checks?.dispose();
-		this._claudeHarness.dispose();
 		cleanupSessionResources(this.sessionId);
 	}
 
@@ -2117,7 +2116,7 @@ export class AgentSession {
 						remote: `read, edit, write and bash work on the machine ${remote.target.host} over ssh, in ${remote.dir}: paths are that machine's. grep, find and ls are off (they search this machine): search there with rg or find in bash. Edits there get no compiler diagnostics. Project context files and skills above are this machine's.`,
 					}
 				: project
-					? { project: project.text }
+					? { project }
 					: undefined,
 			skills: loadedSkills,
 			contextFiles: loadedContextFiles,
@@ -2805,22 +2804,13 @@ export class AgentSession {
 	}
 
 	private _askSecret: AskSecret | undefined;
-	/** The working folder's files (and small ones' contents) for the system prompt: taken once, so the prompt stays put. */
-	private _projectSnapshot: ProjectSnapshot | null | undefined;
+	/** The working folder's files for the system prompt: taken once, so the prompt stays put. */
+	private _projectSnapshot: string | null | undefined;
 
-	private _getProjectSnapshot(): ProjectSnapshot | undefined {
+	private _getProjectSnapshot(): string | undefined {
 		if (this._projectSnapshot === undefined) {
-			const mode = process.env.PI_PROJECT_SNAPSHOT;
 			this._projectSnapshot =
-				mode === "off" ? null : (takeProjectSnapshot(this._cwd, { contents: mode === "full" }) ?? null);
-			// The model has these files' contents: they count as read, so edits get the same checks as after a read.
-			for (const [path, content] of this._projectSnapshot?.inlined ?? []) {
-				let mtimeMs = Date.now();
-				try {
-					mtimeMs = statSync(path).mtimeMs;
-				} catch {}
-				this._claudeHarness.onFileRead(path, content, mtimeMs, this._cwd);
-			}
+				process.env.PI_PROJECT_SNAPSHOT === "off" ? null : (takeProjectSnapshot(this._cwd) ?? null);
 		}
 		return this._projectSnapshot ?? undefined;
 	}
@@ -2857,7 +2847,7 @@ export class AgentSession {
 				else ssh.close();
 				throw error;
 			}
-			const harness = new ClaudeHarnessManager({ enableDiagnostics: false, local: false });
+			const fileTracker = new FileTracker({ local: false });
 			const bashOptions = {
 				operations: createRemoteBashOperations(ssh, () => dir),
 				backgroundJobs: this.backgroundJobs,
@@ -2869,7 +2859,7 @@ export class AgentSession {
 					"read",
 					createReadToolDefinition(dir, {
 						operations: createRemoteReadOperations(ssh),
-						harness,
+						fileTracker,
 						autoResizeImages: this.settingsManager.getImageAutoResize(),
 					}) as ToolDefinition,
 				],
@@ -2877,30 +2867,27 @@ export class AgentSession {
 					"edit",
 					createEditToolDefinition(dir, {
 						operations: createRemoteEditOperations(ssh),
-						harness,
+						fileTracker,
 						enforceReadBeforeEdit: true,
 						includePostEditSnippet: true,
-						enableDiagnostics: false,
 					}) as ToolDefinition,
 				],
 				[
 					"write",
 					createWriteToolDefinition(dir, {
 						operations: createRemoteWriteOperations(ssh),
-						harness,
+						fileTracker,
 						enforceReadBeforeEdit: true,
-						enableDiagnostics: false,
 					}) as ToolDefinition,
 				],
 				["bash", createBashToolDefinition(dir, bashOptions) as ToolDefinition],
 			]);
-			next = { target, ssh, dir, harness, tools, pausedTools: this._remote?.pausedTools ?? [] };
+			next = { target, ssh, dir, fileTracker, tools, pausedTools: this._remote?.pausedTools ?? [] };
 		}
 		const previous = this._remote;
 		this._remote = next;
 		if (previous && previous.ssh.host !== next?.ssh.host) previous.ssh.close();
 		else previous?.ssh.release();
-		previous?.harness.dispose();
 
 		const active = this.getActiveToolNames();
 		if (next && !previous) {
@@ -3411,7 +3398,7 @@ export class AgentSession {
 		const kept = keptUserMessagesInstruction(preparation);
 		if (kept) customInstructions = customInstructions ? `${customInstructions}\n\n${kept}` : kept;
 		const callbacks = ahead ? undefined : this._summarizationRetryCallbacks({ source: "compaction", reason });
-		if (reason !== "overflow" && process.env.PI_COMPACTION_CACHED_PREFIX !== "off") {
+		if (reason !== "overflow" && compactionFeatures.cachedPrefix) {
 			const cached = await this._compactOnCachedPrefix(preparation, request, customInstructions, signal, callbacks);
 			if (cached) return cached;
 			if (signal.aborted) throw new Error("Compaction cancelled");
@@ -3436,7 +3423,7 @@ export class AgentSession {
 	 * The summary as the continuation of the session's own request, read from the provider's prompt cache (see
 	 * `compactOnCachedPrefix`). Only when the summary is asked of the session's own model and thinking level (another
 	 * model has no cache of this conversation), and not on an overflow, whose request did not fit. Undefined to fall
-	 * back to the standalone summary request. `PI_COMPACTION_CACHED_PREFIX=off` turns it off.
+	 * back to the standalone summary request.
 	 */
 	private async _compactOnCachedPrefix(
 		preparation: CompactionPreparation,
@@ -3840,7 +3827,7 @@ export class AgentSession {
 	 * Returns whether the compaction is to wait: a summary is being made, and the context is below where it stops.
 	 */
 	private _compactAhead(contextTokens: number, contextWindow: number): boolean {
-		if (process.env.PI_COMPACTION_AHEAD === "off" || !this.settingsManager.getCompactionEnabled()) return false;
+		if (!compactionFeatures.ahead || !this.settingsManager.getCompactionEnabled()) return false;
 		const model = this.model;
 		if (!model || this._extensionRunner.hasHandlers("session_before_compact")) return false;
 		const settings = this.settingsManager.getCompactionSettings(model, contextWindow);
@@ -4563,24 +4550,19 @@ export class AgentSession {
 					]),
 				)
 			: createAllToolDefinitions(this._cwd, {
-					read: { autoResizeImages, harness: this._claudeHarness },
+					read: { autoResizeImages, fileTracker: this._fileTracker },
 					edit: {
-						harness: this._claudeHarness,
+						fileTracker: this._fileTracker,
 						enforceReadBeforeEdit: true,
 						includePostEditSnippet: true,
-						enableDiagnostics: true,
 					},
-					write: {
-						harness: this._claudeHarness,
-						enforceReadBeforeEdit: true,
-						enableDiagnostics: true,
-					},
+					write: { fileTracker: this._fileTracker, enforceReadBeforeEdit: true },
 					bash: {
 						commandPrefix: shellCommandPrefix,
 						shellPath,
 						backgroundJobs: this.backgroundJobs,
 						editToolActive: () => this.agent.state.tools.some((tool) => tool.name === "edit"),
-						harness: this._claudeHarness,
+						fileTracker: this._fileTracker,
 					},
 					wait: { backgroundJobs: this.backgroundJobs },
 				});

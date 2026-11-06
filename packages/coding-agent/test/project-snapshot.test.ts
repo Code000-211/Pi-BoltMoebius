@@ -11,29 +11,24 @@ describe("project snapshot", () => {
 	});
 	afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-	it("lists a small project's files with the contents of the small ones, and names those left out", () => {
+	it("lists a small project's files", () => {
 		writeFileSync(join(dir, "a.py"), "print('a')\n");
 		mkdirSync(join(dir, "src"));
 		writeFileSync(join(dir, "src", "b.ts"), "export const b = 1;");
-		writeFileSync(join(dir, "big.c"), "x".repeat(10_000));
-		const snapshot = takeProjectSnapshot(dir)!;
-		expect(snapshot.text).toContain("a.py\nbig.c\nsrc/b.ts\n");
-		expect(snapshot.text).toContain("--- a.py\nprint('a')\n");
-		expect(snapshot.text).toContain("--- src/b.ts\nexport const b = 1;\n");
-		expect(snapshot.text).toContain("Not included (read them when needed): big.c");
-		expect([...snapshot.inlined.keys()].sort()).toEqual([join(dir, "a.py"), join(dir, "src", "b.ts")]);
+		expect(takeProjectSnapshot(dir)).toBe(
+			"The files of the working folder when the session started:\na.py\nsrc/b.ts",
+		);
 	});
 
-	it("summarizes a large project by folders, without contents", () => {
+	it("summarizes a large project by folders", () => {
 		for (let i = 0; i < 200; i++) {
 			mkdirSync(join(dir, "svc", `s${i % 4}`), { recursive: true });
 			writeFileSync(join(dir, "svc", `s${i % 4}`, `f${i}.py`), "x = 1\n");
 		}
 		writeFileSync(join(dir, "README.md"), "hi\n");
 		const snapshot = takeProjectSnapshot(dir)!;
-		expect(snapshot.text).toContain("201 files; the folders, with how many files each holds:");
-		expect(snapshot.text).toContain("README.md\nsvc/ (200 files)\nsvc/s0/ (50 files)");
-		expect(snapshot.inlined.size).toBe(0);
+		expect(snapshot).toContain("201 files; the folders, with how many files each holds:");
+		expect(snapshot).toContain("README.md\nsvc/ (200 files)\nsvc/s0/ (50 files)");
 	});
 
 	it("skips build folders, and takes no snapshot of the home folder or an empty one", () => {

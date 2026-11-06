@@ -38,7 +38,7 @@ function statusText(job: BackgroundJob): string {
 	return job.status;
 }
 
-function fit(text: string, width: number): string {
+function padded(text: string, width: number): string {
 	const cut = truncateToWidth(text, width);
 	return cut + " ".repeat(Math.max(0, width - visibleWidth(cut)));
 }
@@ -101,11 +101,12 @@ export class JobHubComponent implements Component, Focusable {
 			return;
 		}
 		const count = this.jobs.list().length;
-		if (kb.matches(data, "tui.select.up") || data === "k") this.selected = Math.max(0, this.selected - 1);
-		else if (kb.matches(data, "tui.select.down") || data === "j")
+		if (kb.matches(data, "tui.select.up") || kb.matches(data, "app.jobs.up"))
+			this.selected = Math.max(0, this.selected - 1);
+		else if (kb.matches(data, "tui.select.down") || kb.matches(data, "app.jobs.down"))
 			this.selected = Math.min(count - 1, this.selected + 1);
 		else if (kb.matches(data, "tui.select.confirm") && job) this.outputScroll = 0;
-		else if (data === "x" && job?.status === "running") this.jobs.kill(job.id);
+		else if (kb.matches(data, "app.jobs.stop") && job?.status === "running") this.jobs.kill(job.id);
 		else return;
 		this.options.requestRender();
 	}
@@ -121,7 +122,7 @@ export class JobHubComponent implements Component, Focusable {
 		const rule = theme.fg("border", "─".repeat(width));
 		lines.push(rule);
 		lines.push(
-			fit(
+			padded(
 				`${theme.bold("Jobs")}${theme.fg("muted", `  ${running} running · ${all.length - running} ended`)}`,
 				width,
 			),
@@ -150,7 +151,7 @@ export class JobHubComponent implements Component, Focusable {
 			const head = `${pointer} ${theme.fg(style.color, style.mark)} ${j.id.padEnd(5)} ${theme.fg(style.color, statusText(j).padEnd(9))} ${theme.fg("muted", time.padStart(7))}  `;
 			const command =
 				i === this.selected ? j.command.replace(/\s+/g, " ") : theme.fg("text", j.command.replace(/\s+/g, " "));
-			lines.push(fit(head + command, width));
+			lines.push(padded(head + command, width));
 		}
 
 		if (job) {
@@ -161,13 +162,13 @@ export class JobHubComponent implements Component, Focusable {
 				`${theme.fg("muted", "started")} ${new Date(job.startedAt).toLocaleTimeString()}${theme.fg("muted", "  background since ")}${new Date(job.backgroundedAt).toLocaleTimeString()}${job.endedAt ? theme.fg("muted", "  ended ") + new Date(job.endedAt).toLocaleTimeString() : ""}`,
 				`${theme.fg("muted", "output")} ${job.outputFile ?? "(in memory)"}${job.reported ? theme.fg("muted", "  · reported to the agent") : ""}`,
 			];
-			for (const line of details) lines.push(fit(line, width));
+			for (const line of details) lines.push(padded(line, width));
 			lines.push(rule);
 			const room = rows - lines.length - 2;
 			if (room > 0) {
 				const output = this.jobs.output(job.id).replace(/\n$/, "").split("\n");
 				const shown = output.slice(-room);
-				for (const line of shown) lines.push(fit(theme.fg("toolOutput", line), width));
+				for (const line of shown) lines.push(padded(theme.fg("toolOutput", line), width));
 				for (let i = shown.length; i < room; i++) lines.push("");
 			}
 		}
@@ -176,10 +177,10 @@ export class JobHubComponent implements Component, Focusable {
 		const hints = [
 			rawKeyHint("↑↓", "select"),
 			keyHint("tui.select.confirm", "output"),
-			...(job?.status === "running" ? [rawKeyHint("x", "stop")] : []),
+			...(job?.status === "running" ? [keyHint("app.jobs.stop", "stop")] : []),
 			keyHint("tui.select.cancel", "close"),
 		];
-		lines.push(fit(hints.join(theme.fg("muted", " · ")), width));
+		lines.push(padded(hints.join(theme.fg("muted", " · ")), width));
 		return lines.slice(0, rows);
 	}
 
@@ -193,14 +194,14 @@ export class JobHubComponent implements Component, Focusable {
 		const rule = theme.fg("border", "─".repeat(width));
 		const lines = [
 			rule,
-			fit(`${theme.bold(job.id)}  ${theme.fg("muted", job.command.replace(/\s+/g, " "))}`, width),
-			...shown.map((line) => fit(theme.fg("toolOutput", line), width)),
+			padded(`${theme.bold(job.id)}  ${theme.fg("muted", job.command.replace(/\s+/g, " "))}`, width),
+			...shown.map((line) => padded(theme.fg("toolOutput", line), width)),
 		];
 		while (lines.length < rows - 2) lines.push("");
 		lines.push(rule);
 		const position = this.outputScroll > 0 ? theme.fg("muted", `${this.outputScroll} lines above the end · `) : "";
 		lines.push(
-			fit(
+			padded(
 				position +
 					[rawKeyHint("↑↓ pgup pgdn", "scroll"), keyHint("tui.select.cancel", "back")].join(
 						theme.fg("muted", " · "),

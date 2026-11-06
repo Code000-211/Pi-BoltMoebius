@@ -22,14 +22,14 @@ import {
 } from "../../utils/shell.ts";
 import { type BackgroundJobs, formatJobReport } from "../background-jobs.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
-import type { ClaudeHarnessManager } from "../harness/index.ts";
+import type { FileTracker } from "../file-tracking/file-tracker.ts";
 import { type FileWrite, filesShownByCat, fileWritesInCommand } from "./bash-file-writes.ts";
 import { selfKillPattern, selfKillRefusal } from "./bash-self-kill.ts";
 import { notifySearchExternalChange } from "./native-search.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
-import { DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncationDetails } from "./truncate.ts";
+import { formatSize, type TruncationResult, truncationDetails } from "./truncate.ts";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
 /** Output limit of `structuredContent.output`, which programmatic callers such as codemode scripts receive. */
@@ -179,7 +179,7 @@ function backgroundAfterMs(
 ): number | undefined {
 	if (!jobs) return undefined;
 	if (background) return 0;
-	if (process.env.PI_BASH_AUTO_BACKGROUND === "off" || autoBackgroundSeconds <= 0) return undefined;
+	if (autoBackgroundSeconds <= 0) return undefined;
 	return (
 		(timeout !== undefined && timeout > 0 ? Math.min(timeout, autoBackgroundSeconds) : autoBackgroundSeconds) * 1000
 	);
@@ -280,32 +280,20 @@ function changedLineRange(before: string, after: string): [number, number] {
 }
 
 /**
- * For each watched file the command changed, what the edit tool reports after an edit: the lines that changed, and
- * the compiler's new errors (the harness, which also takes the new content as read, so an edit after it needs no
- * read). Empty when nothing changed.
+ * For each watched file the command changed, the lines that changed. The file tracker takes the new content as read (an
+ * edit after it needs no read) and checks it in the background, as after an edit. Empty when nothing changed.
  */
-async function checkChangedFiles(
-	watched: WatchedFile[],
-	harness: ClaudeHarnessManager | undefined,
-	cwd: string,
-): Promise<string> {
+async function checkChangedFiles(watched: WatchedFile[], fileTracker: FileTracker | undefined): Promise<string> {
 	let report = "";
 	for (const file of watched) {
 		const after = await readFileAsync(file.path, "utf-8").catch(() => undefined);
 		if (after === undefined || after === file.before) continue;
 		const [first, last] = changedLineRange(file.before ?? "", after);
 		report += `\n\n${file.target} changed${first === last ? ` at line ${first}` : ` in lines ${first}-${last}`}.`;
-		if (!harness) continue;
+		if (!fileTracker) continue;
 		try {
 			const info = await statAsync(file.path);
-			const { suffix } = await harness.onFileModified({
-				absolutePath: file.path,
-				displayPath: file.target,
-				newContent: after,
-				newMtimeMs: info.mtimeMs,
-				workspaceCwd: cwd,
-			});
-			report += suffix;
+			fileTracker.onFileModified({ absolutePath: file.path, newContent: after, newMtimeMs: info.mtimeMs });
 		} catch {}
 	}
 	return report;
@@ -315,80 +303,15 @@ async function checkChangedFiles(
 const BACKGROUND_DONE_TAIL_CHARS = 2048;
 
 const SHELL_METACHAR_REGEX = /[|&;<>()$`"'*?[#~=%!{}\r\n\\]/;
-const SHELL_KEYWORDS_AND_BUILTINS = new Set([
-	"if",
-	"then",
-	"else",
-	"elif",
-	"fi",
-	"for",
-	"while",
-	"until",
-	"do",
-	"done",
-	"case",
-	"esac",
-	"in",
-	"function",
-	"select",
-	"time",
-	"coproc",
-	"cd",
-	"echo",
-	"printf",
-	"pwd",
-	"export",
-	"unset",
-	"local",
-	"declare",
-	"typeset",
-	"readonly",
-	"source",
-	".",
-	"eval",
-	"exec",
-	"exit",
-	"return",
-	"shift",
-	"trap",
-	"wait",
-	"kill",
-	"jobs",
-	"fg",
-	"bg",
-	"disown",
-	"read",
-	"mapfile",
-	"readarray",
-	"test",
-	"[",
-	"[[",
-	"true",
-	"false",
-	":",
-	"alias",
-	"unalias",
-	"builtin",
-	"command",
-	"type",
-	"hash",
-	"ulimit",
-	"umask",
-	"shopt",
-	"set",
-	"pushd",
-	"popd",
-	"dirs",
-	"let",
-	"history",
-	"help",
-	"enable",
-	"caller",
-	"bind",
-	"complete",
-	"compgen",
-	"compopt",
-]);
+const SHELL_KEYWORDS_AND_BUILTINS = new Set(
+	(
+		"if then else elif fi for while until do done case esac in function select time coproc cd echo printf " +
+		"pwd export unset local declare typeset readonly source . eval exec exit return shift trap wait kill " +
+		"jobs fg bg disown read mapfile readarray test [ [[ true false : alias unalias builtin command type " +
+		"hash ulimit umask shopt set pushd popd dirs let history help enable caller bind complete compgen " +
+		"compopt"
+	).split(" "),
+);
 
 const directBinaryCache = new Map<string, string | null>();
 
@@ -734,7 +657,7 @@ export interface BashToolOptions {
 	 */
 	editToolActive?: () => boolean;
 	/** Given, files a command printed whole with `cat` count as read for read-before-edit, as after the read tool. */
-	harness?: ClaudeHarnessManager;
+	fileTracker?: FileTracker;
 }
 
 export type BashRenderState = {
@@ -783,7 +706,7 @@ export function createShellToolDefinition(
 			onUpdate?,
 			ctx?: ExtensionContext,
 		) {
-			if (jobs && !background && process.env.PI_BASH_SLEEP_GUARD !== "off") {
+			if (jobs && !background) {
 				const sleep = fixedSleepSeconds(command);
 				// From oh-my-pi's "NEVER poll": a sleep that would only go on in the background.
 				if (sleep > Math.max(MAX_FIXED_SLEEP_SECONDS, autoBackgroundSeconds)) {
@@ -794,8 +717,7 @@ export function createShellToolDefinition(
 			// machine the command runs and gets the edit tool's checks afterwards (see checkChangedFiles): refusing it
 			// cost a turn each time, 35 times in 142 Terminal-Bench runs, mostly followed by the same change as an
 			// edit. On a remote machine what changed is not known here: such a command is refused.
-			const writes =
-				options?.editToolActive?.() && process.env.PI_BASH_EDIT_GUARD !== "off" ? fileWritesInCommand(command) : [];
+			const writes = options?.editToolActive?.() ? fileWritesInCommand(command) : [];
 			if (options?.operations !== undefined && writes.length > 0) throw new Error(fileWriteRefusal(writes));
 			// On this machine only: a remote pkill does not reach this process.
 			if (options?.operations === undefined) {
@@ -806,7 +728,7 @@ export function createShellToolDefinition(
 			// Refusing it, as before, cost a turn 22 times in 230 Terminal-Bench runs, after which the model looked at once
 			// and again later. Only after the refusals above: a command refused after its sleep lost the sleep.
 			let sleptNote = "";
-			if (jobs && !background && jobs.running().length > 0 && process.env.PI_BASH_SLEEP_GUARD !== "off") {
+			if (jobs && !background && jobs.running().length > 0) {
 				const sleep = leadingSleep(command);
 				if (sleep && sleep.seconds > MAX_FIXED_SLEEP_SECONDS && sleep.seconds <= autoBackgroundSeconds) {
 					sleptNote = await sleepUntilJobEnds(jobs, sleep.seconds, signal);
@@ -1065,7 +987,7 @@ export function createShellToolDefinition(
 					exit_code: exitCode,
 					wall_time_seconds: wallTimeSeconds,
 				};
-				const changes = await checkChangedFiles(watched, options?.harness, spawnContext.cwd);
+				const changes = await checkChangedFiles(watched, options?.fileTracker);
 				if (exitCode !== 0) {
 					return {
 						content: [
@@ -1076,7 +998,7 @@ export function createShellToolDefinition(
 						isError: true,
 					};
 				}
-				if (options?.harness && !snapshot.truncation.truncated) {
+				if (options?.fileTracker && !snapshot.truncation.truncated) {
 					// The model saw these files whole: editing or rewriting them needs no extra read.
 					const shown = filesShownByCat(command);
 					const base = resolvePath(spawnContext.cwd, expandHome(shown.dir));
@@ -1084,7 +1006,7 @@ export function createShellToolDefinition(
 						const path = resolvePath(base, expandHome(file));
 						try {
 							const [content, info] = await Promise.all([readFileAsync(path, "utf-8"), statAsync(path)]);
-							options.harness.onFileRead(path, content, info.mtimeMs, spawnContext.cwd);
+							options.fileTracker.onFileRead(path, content, info.mtimeMs, spawnContext.cwd);
 						} catch {}
 					}
 				}

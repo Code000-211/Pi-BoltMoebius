@@ -1,5 +1,0 @@
-date: 2026-10-12T19:25Z
-Darwin 27.0.0 arm64
-Apple M5
-pi-bolt: 1.1.0 (Pi-Bolt 0.8.5, darwin-arm64, JIT off)
-opencode: opencode v2.0.27 (@opencode/cli, --standalone)

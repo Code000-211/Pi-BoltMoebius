@@ -407,6 +407,14 @@ export function getPackageDir(): string {
 }
 
 /**
+ * A native addon built in `native/<name>/prebuilds/` for this platform (see scripts/build-pi.sh): next to the
+ * executable in a binary, in the package otherwise.
+ */
+export function getNativeAddonPath(name: string, file: string): string {
+	return join(getPackageDir(), "native", name, "prebuilds", `${process.platform}-${process.arch}`, file);
+}
+
+/**
  * Get path to built-in themes directory (shipped with package)
  * - For Bun binary: theme/ next to executable
  * - For Node.js (dist/): dist/modes/interactive/theme/

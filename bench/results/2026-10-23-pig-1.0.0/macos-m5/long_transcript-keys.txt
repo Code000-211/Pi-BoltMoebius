@@ -1,4 +1,0 @@
-{"build": "rel", "entries": 2292, "mode": "fullscreen", "size": 6000, "wall_s": 6.01, "cpu_s": 1.335, "frames": 324, "fps": 53.9, "kb_written": 194, "minstr": 7771, "minstr_per_frame": 23.98, "echo_ms_median": 3.4, "echo_ms_p95": 6.3, "echo_ms_max": 6.3}
-{"build": "cand", "entries": 2292, "mode": "fullscreen", "size": 6000, "wall_s": 6.15, "cpu_s": 0.354, "frames": 316, "fps": 51.4, "kb_written": 195, "minstr": 787, "minstr_per_frame": 2.49, "echo_ms_median": 1.0, "echo_ms_p95": 5.5, "echo_ms_max": 5.5}
-{"build": "pig", "entries": 2292, "mode": "fullscreen", "size": 6000, "wall_s": 6.18, "cpu_s": 0.471, "frames": 339, "fps": 54.9, "kb_written": 1430, "minstr": 2201, "minstr_per_frame": 6.49, "echo_ms_median": 0.8, "echo_ms_p95": 9.0, "echo_ms_max": 9.0}
-rel: the TUI did not start

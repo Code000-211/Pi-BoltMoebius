@@ -1,9 +1,0 @@
-build           file   wall s    cpu s  result
-pi-bolt        200 KB      1.5      0.4  ok
-pi-bolt        400 KB      1.8      0.5  ok
-bun            200 KB     32.8     55.1  ok
-bun            400 KB    131.0    251.7  ok
-node22         200 KB     38.7     39.9  ok
-node22         400 KB    172.9    177.2  ok
-node24         200 KB     27.7     28.2  ok
-node24         400 KB    110.1    111.0  ok

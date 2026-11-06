@@ -124,7 +124,7 @@ run `release` for it): it builds Pi on those runtimes.
 By hand, on each platform: `scripts/toolchain/make-sysroot.sh` once (Linux), `scripts/fetch-sources.sh` and
 `scripts/build-runtime.sh` ([BUILDING.md](BUILDING.md); Linux ARM64 can be the Mac's Docker, [Linux ARM64 in a
 container](BUILDING.md#linux-arm64-in-a-container)), on Windows `scripts\fetch-sources.ps1` and `scripts\build-runtime.ps1`
-([WINDOWS.md](WINDOWS.md)); then `scripts/package-release.sh --runtime-only` (Windows: `scripts\package-release.ps1
+([WINDOWS.md](https://github.com/opensec-git/Pi-Bolt/blob/pi-bolt/docs/WINDOWS.md)); then `scripts/package-release.sh --runtime-only` (Windows: `scripts\package-release.ps1
 -RuntimeOnly`), and upload `dist/X.Y.Z/pi-bolt-runtime-<platform>.tar.gz` (Windows: `.zip`) to a draft of the tag:
 `gh release create bolt-vX.Y.Z --draft --title "Pi-Bolt X.Y.Z" --notes ""`, then `gh release upload bolt-vX.Y.Z <archive>`.
 A runtime built by hand has no attestation: `release` takes it only once its SHA-256 is in the list of the exception
@@ -314,14 +314,14 @@ signs them, which is what an install through `install.sh` or npm needs: neither 
 with a browser is quarantined, and Gatekeeper only accepts a Developer ID signature that is notarized. Notarization requires the
 hardened runtime, under which the executable needs the entitlement `com.apple.security.cs.disable-library-validation` to map
 its compiled code from its own file (and the `-jit` build `com.apple.security.cs.allow-jit`);
-[ARCHITECTURE.md](ARCHITECTURE.md#the-macos-arm64-port) says why.
+[ARCHITECTURE.md](https://github.com/opensec-git/Pi-Bolt/blob/pi-bolt/docs/ARCHITECTURE.md#the-macos-arm64-port) says why.
 
 ## The Windows builds
 
 `release` builds them on the Windows runners, on the Windows runtime: `scripts\package-release.ps1` makes
 `pi-bolt-win32-x64.zip` (JIT off) and `pi-bolt-win32-x64-jit.zip` (JIT on, for extensions that do heavy JavaScript work at run
 time: [PLUGINS.md](PLUGINS.md)). Each is built twice to check that its prebuilt heap does not depend on where the runtime was
-loaded (`-VerifyDeterminism`); that check sometimes fails on one record of the heap ([WINDOWS.md](WINDOWS.md#the-design)), and `release` builds
+loaded (`-VerifyDeterminism`); that check sometimes fails on one record of the heap ([WINDOWS.md](https://github.com/opensec-git/Pi-Bolt/blob/pi-bolt/docs/WINDOWS.md#the-design)), and `release` builds
 again, up to three times, so that only a build whose two copies agreed is released. Each archive is then tested as unpacked:
 `tests\pi\run.ps1`, `scripts\windows-selftest.ps1`, and `tests\runtime\run.ps1`.
 

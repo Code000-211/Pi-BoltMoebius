@@ -1,6 +1,0 @@
-runner: windows-2025, AMD EPYC 9V74 80-Core Processor, 2 cores, 4 threads
-pi-bolt: perf/v1.0.0 (d35149cb0be61e0e3578f7ac6e37bf0fd62295e2), the Pi-Bolt 1.0.0 candidate, by scripts\build-pi.ps1 on the runtime of run 39894603087 (1.4.3, sha256 010ed9db5ebaf425cbd052f13530891a3706c036d48affe26e50598b6e265eec): 1.4.0 (Pi-Bolt 0.9.9, win32-x64, JIT off)
-bun: Pi 1.4.0 as released on npm, run by stock Bun 1.4.4
-node22: Pi 1.4.0 as released on npm, on Node v22.23.4
-node24: Pi 1.4.0 as released on npm, on Node v24.22.1
-tools: bench\ of d35149cb0be61e0e3578f7ac6e37bf0fd62295e2; Python 3.12.10

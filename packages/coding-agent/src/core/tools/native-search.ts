@@ -24,7 +24,7 @@ import {
 import { type FileHandle, open, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { fuzzyFilterPaths, loadFffNativeAddon } from "../harness/fff-search-engine.ts";
+import { fuzzyFilterPaths, loadFffNativeAddon } from "./fff-search.ts";
 
 // --- globs --------------------------------------------------------------------------------------------------------------
 
@@ -623,7 +623,7 @@ export async function walk(options: WalkOptions): Promise<WalkEntry[]> {
 
 const byPath = (a: WalkEntry, b: WalkEntry) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0);
 
-// --- fff-style persistent in-memory tree & content cache + frecency -----------------------------------------------------
+// --- fff-style persistent in-memory tree & content cache ---------------------------------------------------------------
 
 interface CachedTreeEntry {
 	/** The search folder, as `normalizeCacheKey` gives it. */
@@ -697,17 +697,14 @@ export function contentCacheStats(): { counted: number; held: number; files: num
 	return { counted: contentCacheBytes, held, files: contentCache.size };
 }
 
-const frecencyScores = new Map<string, number>();
-
 const normalizeCacheKey = (p: string) => {
 	const res = path.resolve(p);
 	return process.platform === "win32" ? res.toLowerCase() : res;
 };
 
-/** Record a file access/modification from read/edit/write to boost its frecency and update the in-memory index. */
+/** Record a file read, edited or written: its content for grep, and its place in the cached trees. */
 export function notifySearchFileTouched(filePath: string, content?: string | Buffer, mtimeMs?: number): void {
 	const key = normalizeCacheKey(filePath);
-	frecencyScores.set(key, (frecencyScores.get(key) ?? 0) + 10);
 
 	if (content !== undefined && mtimeMs !== undefined) {
 		storeContent(key, mtimeMs, typeof content === "string" ? Buffer.from(content, "utf8") : content);
@@ -741,10 +738,6 @@ function isBelowIgnoredDir(key: string, tree: CachedTreeEntry): boolean {
 /** Files may have changed outside read, edit and write (a bash command ran): check the cached trees and contents again. */
 export function notifySearchExternalChange(): void {
 	externalChangeAt = performance.now();
-}
-
-export function getFileFrecencyScore(filePath: string): number {
-	return frecencyScores.get(normalizeCacheKey(filePath)) ?? 0;
 }
 
 export function clearNativeSearchCache(): void {

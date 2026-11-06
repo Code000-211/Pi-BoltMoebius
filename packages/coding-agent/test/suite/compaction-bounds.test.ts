@@ -11,6 +11,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { compactionFeatures } from "../../src/core/compaction/features.ts";
 import {
 	type CompactionDetails,
 	computeFileLists,
@@ -107,12 +108,12 @@ describe("compaction bounds", () => {
 	// The standalone summary request's bounds; the request on the cached prefix is in agent-session-compaction.test.ts.
 	// The note on the user's messages kept verbatim is in compaction-user-messages.test.ts.
 	beforeAll(() => {
-		process.env.PI_COMPACTION_CACHED_PREFIX = "off";
-		process.env.PI_COMPACTION_USER_MESSAGES = "off";
+		compactionFeatures.cachedPrefix = false;
+		compactionFeatures.userMessages = false;
 	});
 	afterAll(() => {
-		delete process.env.PI_COMPACTION_CACHED_PREFIX;
-		delete process.env.PI_COMPACTION_USER_MESSAGES;
+		compactionFeatures.cachedPrefix = true;
+		compactionFeatures.userMessages = true;
 	});
 
 	const harnesses: Harness[] = [];

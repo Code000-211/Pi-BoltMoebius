@@ -275,6 +275,18 @@
       "$ref": "#/$defs/KeybindingValue",
       "description": "Open background jobs"
     },
+    "app.jobs.up": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Select the job above in the job hub"
+    },
+    "app.jobs.down": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Select the job below in the job hub"
+    },
+    "app.jobs.stop": {
+      "$ref": "#/$defs/KeybindingValue",
+      "description": "Stop the selected job in the job hub"
+    },
     "app.session.fork": {
       "$ref": "#/$defs/KeybindingValue",
       "description": "Fork current session"
