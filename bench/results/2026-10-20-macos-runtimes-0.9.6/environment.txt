@@ -1,5 +1,0 @@
-runner: macos-15 (Darwin 24.6.0 arm64), 3 CPUs; Apple M1 (Virtual); ProductName:		macOS ProductVersion:		15.7.9 BuildVersion:		24G830 
-pi-bolt: Pi-Bolt 0.9.6, pi-bolt-darwin-arm64.tar.xz from the release (checked against its SHA256SUMS): 1.3.0 (Pi-Bolt 0.9.6, darwin-arm64, JIT off)
-bun: Pi 1.3.0 (this repository's Pi) on stock Bun 1.4.2: scripts/build-pi.sh --stable: 1.3.0 (Pi-Bolt 0.9.6, darwin-arm64-stable, JIT on)
-node22: Pi 1.3.0 as released on npm on Node v22.23.3
-node24: Pi 1.3.0 as released on npm on Node v24.22.0

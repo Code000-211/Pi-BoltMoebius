@@ -20,7 +20,7 @@ copy of it. The complete corresponding source is:
 - the patch [`patches/webkit.patch`](patches/webkit.patch),
 
 which [`scripts/fetch-sources.sh`](scripts/fetch-sources.sh) and [`scripts/build-runtime.sh`](scripts/build-runtime.sh) combine and
-build exactly as the releases were built ([docs/BUILDING.md](docs/BUILDING.md)). The patches are distributed under the licenses of
+build exactly as the releases were built. The patches are distributed under the licenses of
 the files they modify.
 
 ## Color palettes

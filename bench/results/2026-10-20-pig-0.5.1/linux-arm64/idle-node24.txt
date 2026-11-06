@@ -1,5 +1,0 @@
-{'build': 'node24', 'cpu_ms_per_s': 4.984, 'own_mb': [91.6, 68.5], 'threads': {'pi': (1.67, 1.2), 'V8Worker': (3.313, 5.1)}}
-{'build': 'node24', 'cpu_ms_per_s': 4.829, 'own_mb': [92.5, 69.1], 'threads': {'pi': (1.607, 1.0), 'V8Worker': (3.221, 3.9)}}
-
-build                 idle CPU ms/s (median)   own MB at end (median)
-node24                     4.906         68.8

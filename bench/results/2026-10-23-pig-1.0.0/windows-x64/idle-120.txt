@@ -1,8 +1,0 @@
-{'build': 'rel', 'cpu_ms_per_s': 0.406, 'own_mb': [82.1, 80.6], 'threads': {}}
-{'build': 'cand', 'cpu_ms_per_s': 0.199, 'own_mb': [80.2, 78.6], 'threads': {}}
-{'build': 'pig', 'cpu_ms_per_s': 1.639, 'own_mb': [59.9, 59.8], 'threads': {}}
-
-build                 idle CPU ms/s (median)   own MB at end (median)
-rel                        0.406         80.6
-cand                       0.199         78.6
-pig                        1.639         59.8

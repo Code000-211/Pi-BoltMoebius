@@ -1,7 +1,0 @@
-build        characters   wall s    cpu s  of a core  own MB
-rel               20000     16.9     0.82         5%      27
-rel               60000     50.6     2.49         5%      43
-cand              20000     17.0     0.74         4%      27
-cand              60000     50.5     2.40         5%      42
-pig               20000     17.1     0.46         3%      18
-pig               60000     50.7     0.96         2%      21

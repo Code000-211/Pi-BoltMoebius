@@ -1,9 +1,0 @@
-build          step        wall s  pi cpu s tmux cpu s pi wrote KB to client KB  own MB
-cand           md:20000      16.9      0.67       0.14         528          282      32
-cand           write:50      65.7      0.96       0.22         506          442      27
-pig            md:20000      16.9      0.41       0.55        3573         1443      18
-pig            write:50      65.6      2.71       0.36         865          631      34
-rel            md:20000      16.9      0.74       0.14         528          282      27
-rel            write:50      65.7      1.00       0.21         506          442      27
-node24         md:20000      17.0      6.54       0.52        3554         1437     213
-node24         write:50      65.8     15.71       0.35         842          631     254

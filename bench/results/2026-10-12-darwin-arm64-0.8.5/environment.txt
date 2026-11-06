@@ -1,8 +1,0 @@
-date: 2026-10-12T11:26Z
-Darwin 27.0.0 arm64
-Apple M5
-pi-bolt: 1.1.0 (Pi-Bolt 0.8.5, darwin-arm64, JIT off)
-pig: 0.4.1+1.0.3
-omp: omp/18.8.7 (OMP_SKIP_SETUP=1: no first-run setup screen)
-bun: Pi 1.1.0 as released, on stock Bun 1.4.2
-node: Pi as released, on Node v26.11.0

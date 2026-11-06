@@ -2,10 +2,6 @@ import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 
 export const workspaceSourcePaths = {
-	chordIndex: fileURLToPath(new URL("./packages/chord/src/index.ts", import.meta.url)),
-	chordContext: fileURLToPath(new URL("./packages/chord/src/context/index.ts", import.meta.url)),
-	chordDelta: fileURLToPath(new URL("./packages/chord/src/delta/index.ts", import.meta.url)),
-	chordNode: fileURLToPath(new URL("./packages/chord/src/node.ts", import.meta.url)),
 	telemetryIndex: fileURLToPath(new URL("./packages/telemetry/src/index.ts", import.meta.url)),
 	telemetryTesting: fileURLToPath(new URL("./packages/telemetry/src/testing/index.ts", import.meta.url)),
 	mcpIndex: fileURLToPath(new URL("./packages/mcp/src/index.ts", import.meta.url)),
@@ -29,10 +25,6 @@ export const workspaceSourcePaths = {
 export default defineConfig({
 	resolve: {
 		alias: [
-			{ find: /^@earendil-works\/chord$/, replacement: workspaceSourcePaths.chordIndex },
-			{ find: /^@earendil-works\/chord\/context$/, replacement: workspaceSourcePaths.chordContext },
-			{ find: /^@earendil-works\/chord\/delta$/, replacement: workspaceSourcePaths.chordDelta },
-			{ find: /^@earendil-works\/chord\/node$/, replacement: workspaceSourcePaths.chordNode },
 			{ find: /^@earendil-works\/pi-telemetry$/, replacement: workspaceSourcePaths.telemetryIndex },
 			{ find: /^@earendil-works\/pi-telemetry\/testing$/, replacement: workspaceSourcePaths.telemetryTesting },
 			{ find: /^@earendil-works\/pi-mcp$/, replacement: workspaceSourcePaths.mcpIndex },

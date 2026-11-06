@@ -1,9 +1,0 @@
-{"build": "rel", "step": "write:50", "wall_s": 6.95, "cpu_s": 0.471, "frame_ms_p99": 80.5, "longest_ms": 80.5, "longest_at": 0.853, "frames": 130, "memory": {"rss": 115.2, "own": 20.1}, "gc_logged": false}
-{"build": "rel", "step": "write:200", "wall_s": 27.61, "cpu_s": 1.283, "frame_ms_p99": 80.5, "longest_ms": 81.5, "longest_at": 0.882, "frames": 399, "memory": {"rss": 123.6, "own": 28.3}, "gc_logged": false}
-{"build": "rel", "step": "write:400", "wall_s": 55.68, "cpu_s": 2.52, "frame_ms_p99": 80.5, "longest_ms": 81.6, "longest_at": 0.745, "frames": 756, "memory": {"rss": 132.1, "own": 36.7}, "gc_logged": false}
-{"build": "cand", "step": "write:50", "wall_s": 6.95, "cpu_s": 0.474, "frame_ms_p99": 80.2, "longest_ms": 80.5, "longest_at": 0.901, "frames": 133, "memory": {"rss": 108.2, "own": 21.2}, "gc_logged": false}
-{"build": "cand", "step": "write:200", "wall_s": 27.65, "cpu_s": 1.346, "frame_ms_p99": 80.3, "longest_ms": 81.6, "longest_at": 0.947, "frames": 401, "memory": {"rss": 112.9, "own": 25.1}, "gc_logged": false}
-{"build": "cand", "step": "write:400", "wall_s": 55.73, "cpu_s": 2.519, "frame_ms_p99": 80.6, "longest_ms": 84.3, "longest_at": 0.901, "frames": 760, "memory": {"rss": 118.9, "own": 31.1}, "gc_logged": false}
-{"build": "pig", "step": "write:50", "wall_s": 6.99, "cpu_s": 0.768, "frame_ms_p99": 21.2, "longest_ms": 84.3, "longest_at": 0.991, "frames": 438, "memory": {"rss": 83.5, "own": 30.9}, "gc_logged": false}
-{"build": "pig", "step": "write:200", "wall_s": 27.67, "cpu_s": 2.497, "frame_ms_p99": 18.3, "longest_ms": 279.8, "longest_at": 0.998, "frames": 1721, "memory": {"rss": 99.9, "own": 47.3}, "gc_logged": false}
-{"build": "pig", "step": "write:400", "wall_s": 55.76, "cpu_s": 4.175, "frame_ms_p99": 17.3, "longest_ms": 610.3, "longest_at": 0.994, "frames": 3410, "memory": {"rss": 135.9, "own": 83.4}, "gc_logged": false}

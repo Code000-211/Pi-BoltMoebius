@@ -1,5 +1,0 @@
-node22: Pi 1.3.0 as released on npm on node-v22.23.3-win-x64.zip
-node24: Pi 1.3.0 as released on npm on node-v24.22.0-win-x64.zip
-pi-bolt: Pi-Bolt 0.9.6, pi-bolt-win32-x64.zip from the release (checked against its SHA256SUMS): 1.3.0 (Pi-Bolt 0.9.6, win32-x64, JIT off)
-bun: Pi 1.3.0 (this repository's Pi) on stock Bun 1.4.2: scripts\build-pi.ps1 -Stable: 1.3.0 (Pi-Bolt 0.9.6, win32-x64-stable, JIT on)
-runner: windows-2025, AMD EPYC 9V74 80-Core Processor, 2 cores, 4 threads; Microsoft Windows Server 2025 Datacenter build 26100.33438

@@ -1,9 +1,0 @@
-cand: Pi-Bolt 0.9.6, tag bolt-v0.9.6 built by scripts\build-pi.ps1 on the runtime of run 39351585272 (the release had no zip yet); zip by Compress-Archive, for its size
-pig: pig-0.5.1-windows-amd64.zip, SHA256SUMS and sigstore bundle verified (gh attestation verify)
-node24: Pi 1.3.0 as released on npm (@earendil-works/pi-coding-agent, dist/bundle/cli.js) on node-v24.22.0-win-x64.zip
-cand: 1.3.0 (Pi-Bolt 0.9.6, win32-x64, JIT off)
-rel: 1.3.0 (Pi-Bolt 0.9.5, win32-x64, JIT off)
-pig: 0.5.1+1.3.0.1402973a
-node24: 1.3.0 on v24.22.0
-runner: windows-2025, AMD EPYC 9V74 80-Core Processor, 2 cores, 4 threads; Microsoft Windows Server 2025 Datacenter build 26100.33438; defender: real-time protection False, mode Normal
-python: Python 3.12.10

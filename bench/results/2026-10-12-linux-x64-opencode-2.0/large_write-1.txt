@@ -1,5 +1,0 @@
-build           file   wall s    cpu s  result
-pi-bolt         50 KB      0.2      0.1  ok
-pi-bolt        200 KB      0.6      0.2  ok
-opencode        50 KB      1.5      2.8  ok
-opencode       200 KB      2.4      3.6  ok
