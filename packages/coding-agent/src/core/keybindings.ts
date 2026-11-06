@@ -79,6 +79,9 @@ const APP_KEYBINDINGS = {
 	"app.session.new": { defaultKeys: [], description: "Start a new session" },
 	"app.session.tree": { defaultKeys: [], description: "Open session tree" },
 	"app.jobs.hub": { defaultKeys: "alt+j", description: "Open background jobs" },
+	"app.jobs.up": { defaultKeys: "k", description: "Select the job above in the job hub" },
+	"app.jobs.down": { defaultKeys: "j", description: "Select the job below in the job hub" },
+	"app.jobs.stop": { defaultKeys: "x", description: "Stop the selected job in the job hub" },
 	"app.session.fork": { defaultKeys: [], description: "Fork current session" },
 	"app.session.resume": { defaultKeys: [], description: "Resume a session" },
 	"app.tree.foldOrUp": {

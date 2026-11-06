@@ -23,13 +23,13 @@ export class SecretInputComponent implements Component, Focusable {
 		if (kb.matches(data, "tui.select.cancel")) {
 			this.value = "";
 			this.done(undefined);
-		} else if (kb.matches(data, "tui.select.confirm") || data === "\r" || data === "\n") {
+		} else if (kb.matches(data, "tui.select.confirm")) {
 			const answer = this.value;
 			this.value = "";
 			this.done(answer);
-		} else if (data === "\x7f" || data === "\b") {
+		} else if (kb.matches(data, "tui.editor.deleteCharBackward")) {
 			this.value = this.value.slice(0, -1);
-		} else if (data === "\x15") {
+		} else if (kb.matches(data, "tui.editor.deleteToLineStart")) {
 			this.value = "";
 		} else if ([...data].every((c) => c >= " " && c !== "\x7f")) {
 			this.value += data;
@@ -38,16 +38,16 @@ export class SecretInputComponent implements Component, Focusable {
 
 	render(width: number): string[] {
 		// Padded to the full width: the dialog covers what is behind it.
-		const fit = (text: string) => {
+		const padded = (text: string) => {
 			const cut = truncateToWidth(text, width);
 			return cut + " ".repeat(Math.max(0, width - visibleWidth(cut)));
 		};
 		const rule = theme.fg("border", "─".repeat(width));
 		return [
 			rule,
-			fit(theme.bold(this.prompt)),
-			fit(`${theme.fg("accent", "›")} ${"•".repeat(this.value.length)}`),
-			fit(
+			padded(theme.bold(this.prompt)),
+			padded(`${theme.fg("accent", "›")} ${"•".repeat(this.value.length)}`),
+			padded(
 				`${keyHint("tui.select.confirm", "answer")}${theme.fg("muted", " · ")}${keyHint("tui.select.cancel", "give up")}${theme.fg("muted", " · not shown, not kept")}`,
 			),
 			rule,
