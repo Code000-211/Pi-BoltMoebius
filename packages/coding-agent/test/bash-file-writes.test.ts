@@ -1,7 +1,8 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { ClaudeHarnessManager } from "../src/core/harness/index.ts";
 import { createBashTool } from "../src/core/tools/bash.ts";
 import { filesShownByCat, fileWritesInCommand } from "../src/core/tools/bash-file-writes.ts";
 
@@ -66,9 +67,34 @@ describe("commands that change files as edit and write would", () => {
 		}
 	});
 
+	it("takes a file cat printed as read at the path the command reached", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-cat-"));
+		const home = process.env.HOME;
+		try {
+			mkdirSync(join(dir, "a", "b"), { recursive: true });
+			mkdirSync(join(dir, "b"));
+			writeFileSync(join(dir, "a", "b", "x"), "nested\n");
+			writeFileSync(join(dir, "b", "x"), "top\n");
+			writeFileSync(join(dir, "h.txt"), "home\n");
+			const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
+			const bash = createBashTool(dir, { harness });
+			await bash.execute("c1", { command: "cd a && cd b && cat x" });
+			expect(harness.stateTracker.hasBeenRead(join(dir, "a", "b", "x"))).toBe(true);
+			expect(harness.stateTracker.hasBeenRead(join(dir, "b", "x"))).toBe(false);
+			process.env.HOME = dir;
+			await bash.execute("c2", { command: "cat ~/h.txt" });
+			expect(harness.stateTracker.hasBeenRead(join(dir, "h.txt"))).toBe(true);
+		} finally {
+			process.env.HOME = home;
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("finds files a command prints whole with cat", () => {
 		expect(filesShownByCat("cat a.py b.py")).toEqual({ dir: "", files: ["a.py", "b.py"] });
 		expect(filesShownByCat("cd src && cat -n x.c")).toEqual({ dir: "src", files: ["x.c"] });
+		expect(filesShownByCat("cd a && cd b && cat x")).toEqual({ dir: "a/b", files: ["x"] });
+		expect(filesShownByCat("cd a && cd /abs && cat x")).toEqual({ dir: "/abs", files: ["x"] });
 		for (const partial of ["cat a.py | head", "cat a.py > b", "cat *.py", "cat $F", "head a.py", "cat a; rm b"]) {
 			expect(filesShownByCat(partial).files).toEqual([]);
 		}

@@ -166,17 +166,21 @@ function isScratch(target: string): boolean {
 	);
 }
 
+/** `path` as seen from `dir` (a folder a `cd` moved to, "" for none): absolute and home paths stay as they are. */
+function underDir(dir: string, path: string): string {
+	return path.startsWith("/") || path.startsWith("~") || !dir ? path : `${dir}/${path}`;
+}
+
 /** Files the command changes as edit or write would (see the file comment); empty when none. */
 export function fileWritesInCommand(command: string): FileWrite[] {
 	const writes: FileWrite[] = [];
 	// The folder a leading `cd` moved to, for relative targets (`cd /tmp && cat > a.py`).
 	let dir = "";
-	const scratch = (target: string) =>
-		isScratch(target.startsWith("/") || target.startsWith("~") || !dir ? target : `${dir}/${target}`);
+	const scratch = (target: string) => isScratch(underDir(dir, target));
 	for (const pipeline of parse(command)) {
 		const cd = pipeline.length === 1 ? commandName(pipeline[0]!.words) : undefined;
 		if (cd?.name === "cd" && cd.args[0]) {
-			dir = cd.args[0].startsWith("/") || cd.args[0].startsWith("~") || !dir ? cd.args[0] : `${dir}/${cd.args[0]}`;
+			dir = underDir(dir, cd.args[0]);
 			continue;
 		}
 		for (const segment of pipeline) {
@@ -244,7 +248,7 @@ export function filesShownByCat(command: string): { dir: string; files: string[]
 		if (pipeline.length !== 1 || segment.redirects.length > 0 || segment.heredoc) return none;
 		const { name, args } = commandName(segment.words);
 		if (name === "cd" && args.length === 1 && files.length === 0) {
-			dir = args[0]!;
+			dir = underDir(dir, args[0]!);
 			continue;
 		}
 		if (name !== "cat") return none;

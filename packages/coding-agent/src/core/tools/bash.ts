@@ -1074,9 +1074,9 @@ export function createShellToolDefinition(
 				if (options?.harness && !snapshot.truncation.truncated) {
 					// The model saw these files whole: editing or rewriting them needs no extra read.
 					const shown = filesShownByCat(command);
-					const base = resolvePath(spawnContext.cwd, shown.dir);
+					const base = resolvePath(spawnContext.cwd, expandHome(shown.dir));
 					for (const file of shown.files) {
-						const path = resolvePath(base, file);
+						const path = resolvePath(base, expandHome(file));
 						try {
 							const [content, info] = await Promise.all([readFileAsync(path, "utf-8"), statAsync(path)]);
 							options.harness.onFileRead(path, content, info.mtimeMs, spawnContext.cwd);
