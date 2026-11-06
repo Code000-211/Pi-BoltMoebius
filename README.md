@@ -355,13 +355,13 @@ Not measured on a real host yet: checked with an ssh stand-in that runs the remo
   above the threshold, by at most half the threshold and half the way to the window's limit; only there does it stop
   to wait. Before, the agent stood still for each summary: 14, 56, 60 and 95 s in four real sessions. A session that
   ends between the start and the threshold has paid for a summary it did not use. Not when an extension makes or vets
-  compactions; `PI_COMPACTION_AHEAD=off` turns it off.
+  compactions.
 - **The task stays word for word.** A summary drops requirements and constraints of the task (arXiv 2608.11242: about
   17% survive; 2606.22528: violations 0% before, 30% after compaction). After Pi's own compactions the user's messages
   from the compacted part (a task sent via RPC included) stay next to the summary verbatim, oldest first, up to 16,000
-  characters; one that a later message contains whole (a continued run sent its task again with notes) is left out. The
-  summary request is told so and does not restate them. Not for compactions an extension makes itself;
-  `PI_COMPACTION_USER_MESSAGES=off` turns it off.
+  characters: the first (the task), then the newest that fit; one that a later message contains whole (a continued run
+  sent its task again with notes) is left out. The summary request is told so and does not restate them (when not all
+  fit, it is told which stay, and summarizes the others). Not for compactions an extension makes itself.
 - **Summaries from the prompt cache.** The compaction summary is asked for as a continuation of the session's own
   request, so the provider reads the conversation from its cache (as deepseek-harness does). Before, all 4 compactions in
   real sessions read nothing from the cache (26k to 508k input tokens, 14 to 95 s each).
@@ -437,17 +437,10 @@ Everything above is on by default.
 |---|---|
 | `compaction.maxContextTokens` | Cap for the compaction threshold (default 128000) |
 | `toolResultPruning` | Shortening old tool results: `enabled`, `triggerTokens` (40000), `keepRecent` (8), `minChars` (2000) |
-| `PI_COMPACTION_CACHED_PREFIX=off` | Ask for compaction summaries as a standalone request |
-| `PI_COMPACTION_AHEAD=off` | Make the compaction summary at the threshold, with the agent waiting, instead of ahead |
-| `PI_COMPACTION_USER_MESSAGES=off` | Do not keep the user's compacted messages verbatim beside the summary |
-| `PI_BASH_AUTO_BACKGROUND=off` | Keep commands in the foreground unless the call asks for `background: true` |
-| `PI_BASH_SLEEP_GUARD=off` | Run fixed sleeps over 120 s, and leave sleeps that start a command to the shell |
-| `PI_EARLY_BASH=off` | Start read-only commands only after the model's message |
-| `PI_BASH_EDIT_GUARD=off` | Run `sed -i` and text redirected into files |
 | `PI_PROJECT_SNAPSHOT=full` / `off` | The project listing with small files' contents / none |
 | `--remote <host>[:<folder>]`, `PI_REMOTE` | Start working on that machine (as `/remote`) |
 | `PI_SSH_COMMAND` | The ssh program (default `ssh`) |
-| `PI_CHECKS` | `off`, or the background checks to keep (`cpp,rust,python,typescript,javascript,shell,luau,json,toml,yaml`, and the linters `js-lint,markdown,yaml-lint,luau-lint,cpp-lint`); without `cpp`, C/C++/HIP is checked in the edit as before |
+| `PI_CHECKS` | `off`, or the background checks to keep (`cpp,rust,python,typescript,javascript,shell,luau,json,toml,yaml`, and the linters `js-lint,markdown,yaml-lint,luau-lint,cpp-lint`) |
 | `PI_CHECKS_WAIT` | Seconds a run that would end waits for the checks of its edits (default 30) |
 | `PI_CHECKS_CARGO_TARGET` | `shared` to let the background `cargo check` use the project's `target/` |
 | `LIBCLANG_PATH` | Where the libclang library for the C/C++ checks is |

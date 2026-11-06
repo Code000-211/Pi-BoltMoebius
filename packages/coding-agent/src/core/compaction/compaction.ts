@@ -33,7 +33,6 @@ import {
 	COMPACTED_USER_MESSAGE_CUT,
 	COMPACTED_USER_MESSAGES_MAX_CHARS,
 	type CompactionEntry,
-	compactedUserMessagesEnabled,
 	type ProjectedSessionEntry,
 	type SessionEntry,
 	type SessionProjection,
@@ -41,6 +40,7 @@ import {
 	userMessagesBefore,
 } from "../session-manager.ts";
 import { combineUsage } from "../usage-totals.ts";
+import { compactionFeatures } from "./features.ts";
 import {
 	computeFileLists,
 	createFileOps,
@@ -1264,7 +1264,7 @@ export function prepareCompaction(
 	}
 
 	const keptIndex = pathEntries.findIndex((entry) => entry.id === firstKeptEntryId);
-	const userMessages = compactedUserMessagesEnabled()
+	const userMessages = compactionFeatures.userMessages
 		? userMessagesBefore(pathEntries, keptIndex < 0 ? pathEntries.length : keptIndex)
 		: { kept: [], complete: true };
 

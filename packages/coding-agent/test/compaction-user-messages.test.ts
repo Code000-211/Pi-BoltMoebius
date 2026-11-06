@@ -1,5 +1,6 @@
 import { type AssistantMessage, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
+import { compactionFeatures } from "../src/core/compaction/features.ts";
 import {
 	DEFAULT_COMPACTION_SETTINGS,
 	estimateTokens,
@@ -51,7 +52,7 @@ function summary(session: SessionManager): CompactionSummaryMessage {
 
 describe("the user's messages beside a compaction summary", () => {
 	afterEach(() => {
-		delete process.env.PI_COMPACTION_USER_MESSAGES;
+		compactionFeatures.userMessages = true;
 	});
 
 	it("keeps the user's own compacted messages verbatim, oldest first, and not the harness's", () => {
@@ -123,15 +124,15 @@ describe("the user's messages beside a compaction summary", () => {
 		expect(summary(session).userRequests).toBeUndefined();
 	});
 
-	it("is off with PI_COMPACTION_USER_MESSAGES=off", () => {
-		process.env.PI_COMPACTION_USER_MESSAGES = "off";
+	it("is not there when the feature is off", () => {
+		compactionFeatures.userMessages = false;
 		expect(summary(compactedSession()).userRequests).toBeUndefined();
 	});
 });
 
 describe("the user's messages in Pi's own compaction", () => {
 	afterEach(() => {
-		delete process.env.PI_COMPACTION_USER_MESSAGES;
+		compactionFeatures.userMessages = true;
 	});
 
 	it("leaves out a message a later one contains whole, as a run continued with its task again", () => {
@@ -177,7 +178,7 @@ describe("the user's messages in Pi's own compaction", () => {
 	});
 
 	it("says nothing of them when they are off", async () => {
-		process.env.PI_COMPACTION_USER_MESSAGES = "off";
+		compactionFeatures.userMessages = false;
 		const session = SessionManager.inMemory();
 		session.appendMessage({ role: "user", content: TICKET, timestamp: Date.now() });
 		session.appendMessage(assistant("x".repeat(100_000)));
@@ -186,7 +187,7 @@ describe("the user's messages in Pi's own compaction", () => {
 		const preparation = prepareCompaction(session.getBranch(), DEFAULT_COMPACTION_SETTINGS)!;
 		expect(preparation.keptUserMessages).toEqual([]);
 		expect(keptUserMessagesInstruction(preparation)).toBeUndefined();
-		delete process.env.PI_COMPACTION_USER_MESSAGES;
+		compactionFeatures.userMessages = true;
 		const on = prepareCompaction(session.getBranch(), DEFAULT_COMPACTION_SETTINGS)!;
 		expect(on.keptUserMessages).toEqual([TICKET, "more"]);
 		expect(keptUserMessagesInstruction(on)).toContain("Do not quote, copy or restate them");

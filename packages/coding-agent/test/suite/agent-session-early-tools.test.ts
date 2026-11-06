@@ -79,15 +79,6 @@ describe("AgentSession early tool execution", () => {
 		expect(await bashResult("cat notes.txt | tee copy.txt")).toBe("new content\n");
 	});
 
-	it("starts no bash call early with PI_EARLY_BASH=off", async () => {
-		process.env.PI_EARLY_BASH = "off";
-		try {
-			expect(await bashResult("cat notes.txt")).toBe("new content\n");
-		} finally {
-			delete process.env.PI_EARLY_BASH;
-		}
-	});
-
 	afterEach(() => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
 	});

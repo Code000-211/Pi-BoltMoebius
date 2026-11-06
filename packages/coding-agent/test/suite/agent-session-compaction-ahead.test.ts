@@ -8,6 +8,7 @@ import {
 	fauxToolCall,
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
+import { compactionFeatures } from "../../src/core/compaction/features.ts";
 import type { CompactionEntry } from "../../src/core/session-manager.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
@@ -129,7 +130,7 @@ function compactions(harness: Harness): CompactionEntry[] {
 describe("AgentSession compaction ahead", () => {
 	const harnesses: Harness[] = [];
 	afterEach(() => {
-		delete process.env.PI_COMPACTION_AHEAD;
+		compactionFeatures.ahead = true;
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
 	});
 
@@ -283,7 +284,7 @@ describe("AgentSession compaction ahead", () => {
 	});
 
 	it("does not make one when turned off", async () => {
-		process.env.PI_COMPACTION_AHEAD = "off";
+		compactionFeatures.ahead = false;
 		const { harness, internals, summaries } = await setup();
 		harnesses.push(harness);
 		const long = "x".repeat(40_000);

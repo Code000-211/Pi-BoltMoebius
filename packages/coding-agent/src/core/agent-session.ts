@@ -74,6 +74,7 @@ import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
 import { BackgroundChecks } from "./checks/background-checks.ts";
 import { CHECKERS, enabledCheckers } from "./checks/checkers.ts";
+import { compactionFeatures } from "./compaction/features.ts";
 import {
 	type CompactionPreparation,
 	type CompactionResult,
@@ -457,7 +458,7 @@ const OVERFLOW_RECOVERY_STEPS = 3;
  * How far below the compaction threshold the summary starts in the background (see `_compactAhead`): a share of the
  * threshold, up to a number of tokens. Started closer, the agent works on above the threshold for longer (a summary
  * takes 15 to 90 seconds); started earlier, more of the context stays after the compaction, and a session that ends
- * below the threshold paid for a summary it never used. `PI_COMPACTION_AHEAD=off` turns it off.
+ * below the threshold paid for a summary it never used.
  */
 const COMPACTION_AHEAD_SHARE = 0.15;
 const COMPACTION_AHEAD_MAX_TOKENS = 40_000;
@@ -859,7 +860,7 @@ export class AgentSession {
 	 * extension runner (cwd), so it is used only if both are still the same when the call is reached.
 	 *
 	 * So may calls of the built-in bash tool whose command only reads (`isReadOnlyCommand`: `git diff`, `rg`, `cat`,
-	 * ...), without a shell command prefix (it could do anything). `PI_EARLY_BASH=off` turns that off.
+	 * ...), without a shell command prefix (it could do anything).
 	 */
 	private _earlyToolExecution(toolCall: AgentToolCall, tool: AgentTool): (() => boolean) | undefined {
 		const runner = this._extensionRunner;
@@ -871,9 +872,7 @@ export class AgentSession {
 			if (command !== undefined && (typeof command !== "string" || !isReadOnlyCommand(command))) return undefined;
 		}
 		const allowed = () =>
-			(bash
-				? process.env.PI_EARLY_BASH !== "off" && !this.settingsManager.getShellCommandPrefix()
-				: this._earlyToolExecutes.has(tool.execute)) &&
+			(bash ? !this.settingsManager.getShellCommandPrefix() : this._earlyToolExecutes.has(tool.execute)) &&
 			!runner.hasHandlersOutside(
 				"tool_call",
 				bash ? EARLY_BASH_TOOL_CALL_PASSTHROUGH_EXTENSIONS : EARLY_TOOL_CALL_PASSTHROUGH_EXTENSIONS,
@@ -3407,7 +3406,7 @@ export class AgentSession {
 		const kept = keptUserMessagesInstruction(preparation);
 		if (kept) customInstructions = customInstructions ? `${customInstructions}\n\n${kept}` : kept;
 		const callbacks = ahead ? undefined : this._summarizationRetryCallbacks({ source: "compaction", reason });
-		if (reason !== "overflow" && process.env.PI_COMPACTION_CACHED_PREFIX !== "off") {
+		if (reason !== "overflow" && compactionFeatures.cachedPrefix) {
 			const cached = await this._compactOnCachedPrefix(preparation, request, customInstructions, signal, callbacks);
 			if (cached) return cached;
 			if (signal.aborted) throw new Error("Compaction cancelled");
@@ -3432,7 +3431,7 @@ export class AgentSession {
 	 * The summary as the continuation of the session's own request, read from the provider's prompt cache (see
 	 * `compactOnCachedPrefix`). Only when the summary is asked of the session's own model and thinking level (another
 	 * model has no cache of this conversation), and not on an overflow, whose request did not fit. Undefined to fall
-	 * back to the standalone summary request. `PI_COMPACTION_CACHED_PREFIX=off` turns it off.
+	 * back to the standalone summary request.
 	 */
 	private async _compactOnCachedPrefix(
 		preparation: CompactionPreparation,
@@ -3836,7 +3835,7 @@ export class AgentSession {
 	 * Returns whether the compaction is to wait: a summary is being made, and the context is below where it stops.
 	 */
 	private _compactAhead(contextTokens: number, contextWindow: number): boolean {
-		if (process.env.PI_COMPACTION_AHEAD === "off" || !this.settingsManager.getCompactionEnabled()) return false;
+		if (!compactionFeatures.ahead || !this.settingsManager.getCompactionEnabled()) return false;
 		const model = this.model;
 		if (!model || this._extensionRunner.hasHandlers("session_before_compact")) return false;
 		const settings = this.settingsManager.getCompactionSettings(model, contextWindow);

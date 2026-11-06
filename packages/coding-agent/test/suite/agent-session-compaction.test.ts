@@ -12,6 +12,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { compactionFeatures } from "../../src/core/compaction/features.ts";
 import { DEFAULT_COMPACTION_SETTINGS, estimateTokens, getSummaryMaxTokens } from "../../src/core/compaction/index.ts";
 import { createHarness, getUserTexts, type Harness } from "./harness.ts";
 
@@ -339,9 +340,9 @@ describe("AgentSession compaction characterization", () => {
 	});
 
 	it("uses the standalone compaction request context", async () => {
-		process.env.PI_COMPACTION_CACHED_PREFIX = "off";
+		compactionFeatures.cachedPrefix = false;
 		onTestFinished(() => {
-			delete process.env.PI_COMPACTION_CACHED_PREFIX;
+			compactionFeatures.cachedPrefix = true;
 		});
 		const harness = await createHarness({ settings: { compaction: { keepRecentTokens: 1 } } });
 		harnesses.push(harness);

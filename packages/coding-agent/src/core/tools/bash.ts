@@ -179,7 +179,7 @@ function backgroundAfterMs(
 ): number | undefined {
 	if (!jobs) return undefined;
 	if (background) return 0;
-	if (process.env.PI_BASH_AUTO_BACKGROUND === "off" || autoBackgroundSeconds <= 0) return undefined;
+	if (autoBackgroundSeconds <= 0) return undefined;
 	return (
 		(timeout !== undefined && timeout > 0 ? Math.min(timeout, autoBackgroundSeconds) : autoBackgroundSeconds) * 1000
 	);
@@ -771,7 +771,7 @@ export function createShellToolDefinition(
 			onUpdate?,
 			ctx?: ExtensionContext,
 		) {
-			if (jobs && !background && process.env.PI_BASH_SLEEP_GUARD !== "off") {
+			if (jobs && !background) {
 				const sleep = fixedSleepSeconds(command);
 				// From oh-my-pi's "NEVER poll": a sleep that would only go on in the background.
 				if (sleep > Math.max(MAX_FIXED_SLEEP_SECONDS, autoBackgroundSeconds)) {
@@ -782,8 +782,7 @@ export function createShellToolDefinition(
 			// machine the command runs and gets the edit tool's checks afterwards (see checkChangedFiles): refusing it
 			// cost a turn each time, 35 times in 142 Terminal-Bench runs, mostly followed by the same change as an
 			// edit. On a remote machine what changed is not known here: such a command is refused.
-			const writes =
-				options?.editToolActive?.() && process.env.PI_BASH_EDIT_GUARD !== "off" ? fileWritesInCommand(command) : [];
+			const writes = options?.editToolActive?.() ? fileWritesInCommand(command) : [];
 			if (options?.operations !== undefined && writes.length > 0) throw new Error(fileWriteRefusal(writes));
 			// On this machine only: a remote pkill does not reach this process.
 			if (options?.operations === undefined) {
@@ -794,7 +793,7 @@ export function createShellToolDefinition(
 			// Refusing it, as before, cost a turn 22 times in 230 Terminal-Bench runs, after which the model looked at once
 			// and again later. Only after the refusals above: a command refused after its sleep lost the sleep.
 			let sleptNote = "";
-			if (jobs && !background && jobs.running().length > 0 && process.env.PI_BASH_SLEEP_GUARD !== "off") {
+			if (jobs && !background && jobs.running().length > 0) {
 				const sleep = leadingSleep(command);
 				if (sleep && sleep.seconds > MAX_FIXED_SLEEP_SECONDS && sleep.seconds <= autoBackgroundSeconds) {
 					sleptNote = await sleepUntilJobEnds(jobs, sleep.seconds, signal);

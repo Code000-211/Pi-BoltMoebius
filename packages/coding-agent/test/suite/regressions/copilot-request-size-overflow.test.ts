@@ -1,5 +1,6 @@
 import { fauxAssistantMessage, fauxToolCall, type ImageContent } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
+import { compactionFeatures } from "../../../src/core/compaction/features.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
 const COPILOT_413 = 'github-copilot API error (413): {"message":"failed to parse request","code":""}';
@@ -61,13 +62,13 @@ describe("Copilot request-size overflow recovery", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
-		delete process.env.PI_COMPACTION_AHEAD;
+		compactionFeatures.ahead = true;
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
 	});
 
 	it("compacts an image-heavy history and retries after the real 413", async () => {
 		// The history is just below the threshold, where a summary would start ahead and take a scripted response.
-		process.env.PI_COMPACTION_AHEAD = "off";
+		compactionFeatures.ahead = false;
 		const harness = await createHarness({
 			provider: "github-copilot",
 			models: [{ id: "faux-copilot", contextWindow: 1_000_000 }],
