@@ -2,7 +2,7 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import { CHECK_REPORT_MESSAGE_TYPE } from "../../src/core/agent-session.ts";
+import { CHECK_REPORT_MESSAGE_TYPE } from "../../src/core/checks/background-checks.ts";
 import { onPath } from "../../src/core/checks/checkers.ts";
 import { createHarness, type Harness } from "./harness.ts";
 

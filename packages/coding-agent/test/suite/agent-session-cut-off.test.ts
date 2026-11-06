@@ -1,6 +1,6 @@
 import { fauxAssistantMessage, fauxThinking } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import { CUT_OFF_MESSAGE_TYPE } from "../../src/core/agent-session.ts";
+import { CUT_OFF_MESSAGE_TYPE } from "../../src/core/cut-off-response.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 /** The faux model's output limit: the faux provider counts about four characters a token. */

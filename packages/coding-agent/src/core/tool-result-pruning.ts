@@ -11,8 +11,10 @@
  * the providers' conversion cache). Between `keepRecent` and `2 * keepRecent - 1` recent results stay complete.
  */
 
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Message, TextContent, ToolResultMessage } from "@earendil-works/pi-ai";
 import { estimateTokens } from "./compaction/compaction.ts";
+import { convertToLlm } from "./messages.ts";
 
 export interface ToolResultPruningSettings {
 	enabled: boolean;
@@ -103,4 +105,23 @@ export function prunedTokens(messages: Message[], settings: ToolResultPruningSet
 		if (pruned[i] !== messages[i]) tokens += estimate(messages[i]) - estimate(pruned[i]);
 	}
 	return tokens;
+}
+
+/**
+ * `tokens` of `messages` as the next request sends them: less what pruning clears in it beyond what it cleared in the
+ * request whose usage `tokens` counts (the one before the response at `usageIndex`; without one, `tokens` is the
+ * estimate of all of `messages`). Pruning clears in steps, so a step can take a context back below the compaction
+ * threshold that the size of the last request was above.
+ */
+export function tokensAfterPruning(
+	tokens: number,
+	messages: AgentMessage[],
+	usageIndex: number | null,
+	settings: ToolResultPruningSettings,
+): number {
+	if (!settings.enabled) return tokens;
+	const cleared =
+		prunedTokens(convertToLlm(messages), settings) -
+		(usageIndex === null ? 0 : prunedTokens(convertToLlm(messages.slice(0, usageIndex)), settings));
+	return Math.max(0, tokens - Math.max(0, cleared));
 }

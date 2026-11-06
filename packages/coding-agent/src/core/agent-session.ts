@@ -63,18 +63,14 @@ import { processImage } from "../utils/image-process.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
 import { formatNoApiKeyFoundMessage, formatNoModelSelectedMessage } from "./auth-guidance.ts";
-import {
-	BACKGROUND_JOB_MESSAGE_TYPE,
-	BackgroundJobs,
-	formatJobReport,
-	JOB_SETTLE_WINDOW_MS,
-} from "./background-jobs.ts";
+import { BACKGROUND_JOB_MESSAGE_TYPE, BackgroundJobs, formatJobReport, JobReporter } from "./background-jobs.ts";
 import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
-import { BackgroundChecks } from "./checks/background-checks.ts";
+import { BackgroundChecks, CHECK_REPORT_MESSAGE_TYPE } from "./checks/background-checks.ts";
 import { CHECKERS, enabledCheckers } from "./checks/checkers.ts";
 import { cppChecker } from "./checks/cpp/checker.ts";
+import { CompactionAhead } from "./compaction/compaction-ahead.ts";
 import { compactionFeatures } from "./compaction/features.ts";
 import {
 	type CompactionPreparation,
@@ -89,12 +85,12 @@ import {
 	estimateProjectedContextTokens,
 	estimateTokens,
 	generateBranchSummary,
-	getCompactionThreshold,
 	keptUserMessagesInstruction,
 	prepareCompaction,
 	shouldCompact,
 	truncateContentForContext,
 } from "./compaction/index.ts";
+import { CutOffResponses } from "./cut-off-response.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
@@ -140,16 +136,13 @@ import { NestedToolCallRunner } from "./nested-tool-calls.ts";
 import { takeProjectSnapshot } from "./project-snapshot.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import {
-	type AskSecret,
-	createRemoteBashOperations,
-	createRemoteEditOperations,
-	createRemoteReadOperations,
-	createRemoteWriteOperations,
-	parseRemoteTarget,
-	type RemoteTarget,
-	resolveRemoteDir,
-	SshConnection,
-} from "./remote/ssh.ts";
+	REMOTE_ENTRY,
+	REMOTE_PAUSED_TOOLS,
+	RemoteWorkspace,
+	routedToRemote,
+	savedRemoteTarget,
+} from "./remote/remote-workspace.ts";
+import { type AskSecret, parseRemoteTarget, type RemoteTarget } from "./remote/ssh.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
 import {
@@ -175,14 +168,11 @@ import {
 	type NormalizedBuildSystemPromptOptions,
 	normalizeBuildSystemPromptOptions,
 } from "./system-prompt.ts";
-import { prunedTokens } from "./tool-result-pruning.ts";
-import { type BashOperations, createBashToolDefinition, createLocalBashOperations } from "./tools/bash.ts";
+import { tokensAfterPruning } from "./tool-result-pruning.ts";
+import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { isReadOnlyCommand } from "./tools/bash-read-only.ts";
-import { createEditToolDefinition } from "./tools/edit.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
-import { createReadToolDefinition } from "./tools/read.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
-import { createWriteToolDefinition } from "./tools/write.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
 import {
 	findLatestResponse,
@@ -235,28 +225,22 @@ export function parseSkillBlock(text: string): ParsedSkillBlock | null {
  * search in-process; otherwise they may first download ripgrep or fd, which would stay if the early run is dropped.
  */
 const EARLY_TOOL_NAMES: ReadonlySet<string> = new Set(PIBOLT ? ["read", "ls", "grep", "find"] : ["read", "ls"]);
-/** Built-in tools that work on the remote machine while there is one (see setRemote). */
-const REMOTE_ROUTED_TOOLS = new Set(["read", "edit", "write", "bash"]);
-/** Built-in tools that search this machine: off while working on another. */
-const REMOTE_PAUSED_TOOLS = new Set(["grep", "find", "ls"]);
-/** Custom session entry with the remote machine (a RemoteTarget), or null for this one. */
-const REMOTE_ENTRY = "remote";
 
 /**
  * Extensions whose `tool_call` handlers let calls of the tools in EARLY_TOOL_NAMES through unchanged. The built-in MCP
  * extension's handler waits only for MCP servers that the called tool reaches (MCP tools, codemode, tool_search); ACP
  * mode's blocks only tools that read-only mode does not keep, and it keeps these.
  */
+const EARLY_TOOL_CALL_PASSTHROUGH_EXTENSIONS: ReadonlySet<string> = new Set([
+	`${BUILTIN_PATH_PREFIX}mcp`,
+	`${BUILTIN_PATH_PREFIX}acp`,
+]);
+
 /**
  * The same for early bash calls: only MCP's handler, which waits only for the MCP servers a call reaches. ACP's read-only
  * mode blocks bash, so its handler must see a bash call before it runs.
  */
 const EARLY_BASH_TOOL_CALL_PASSTHROUGH_EXTENSIONS: ReadonlySet<string> = new Set([`${BUILTIN_PATH_PREFIX}mcp`]);
-
-const EARLY_TOOL_CALL_PASSTHROUGH_EXTENSIONS: ReadonlySet<string> = new Set([
-	`${BUILTIN_PATH_PREFIX}mcp`,
-	`${BUILTIN_PATH_PREFIX}acp`,
-]);
 
 /** Tool execution events of calls a tool made through `ctx.executeTool()` carry `parentToolCallId`. */
 type WithParentToolCallId<E> = E extends {
@@ -455,48 +439,6 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
  */
 const OVERFLOW_RECOVERY_STEPS = 3;
 
-/**
- * How far below the compaction threshold the summary starts in the background (see `_compactAhead`): a share of the
- * threshold, up to a number of tokens. Started closer, the agent works on above the threshold for longer (a summary
- * takes 15 to 90 seconds); started earlier, more of the context stays after the compaction, and a session that ends
- * below the threshold paid for a summary it never used.
- */
-const COMPACTION_AHEAD_SHARE = 0.15;
-const COMPACTION_AHEAD_MAX_TOKENS = 40_000;
-/**
- * How far above the threshold the agent goes on while the summary made ahead is not ready yet, as a share of the
- * threshold: at most halfway to the context's limit (the window less `reserveTokens`).
- */
-const COMPACTION_AHEAD_OVERRUN = 0.5;
-
-/** A compaction summary made in the background before the threshold was reached, see `_compactAhead`. */
-interface CompactionAhead {
-	sessionManager: SessionManager;
-	/** The branch's last entry when it started: the summary covers the entries before the cut point up to it. */
-	leafId: string;
-	firstKeptEntryId: string;
-	keepRecentTokens: number;
-	controller: AbortController;
-	/** Undefined when it failed or was cancelled. */
-	result: Promise<CompactionResult | undefined>;
-	done: boolean;
-}
-
-/** `customType` of the message that reports new errors from the background checks. */
-export const CHECK_REPORT_MESSAGE_TYPE = "check-report";
-/**
- * How long a run that would end waits for the checks of its edits (`PI_CHECKS_WAIT`, seconds): long enough for a
- * warm `cargo check` or `tsc`, short enough that a cold one on a large project does not hold the run.
- */
-const CHECKS_WAIT_MS = (Number(process.env.PI_CHECKS_WAIT) || 30) * 1000;
-
-/** `customType` of the notice after a response cut off at the output limit with nothing done. */
-export const CUT_OFF_MESSAGE_TYPE = "cut-off-response";
-/** Such notices in a row before the run ends as before. */
-const MAX_CUT_OFF_NOTICES = 3;
-/** The thinking levels a cut-off response steps down through ("off" is never chosen for the model). */
-const CUT_OFF_THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
-
 function getOverflowRecoveryStep(
 	settings: CompactionSettings,
 	step: number,
@@ -541,11 +483,11 @@ export class AgentSession {
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
-	private _compactionAhead: CompactionAhead | undefined = undefined;
+	private readonly _compactionAhead = new CompactionAhead();
 	/** Overflow recovery steps taken since the last user message or successful response */
 	private _overflowRecoveryAttempts = 0;
-	/** Responses in a row cut off at the output limit with nothing done, see {@link _answerCutOffResponse}. */
-	private _cutOffResponses = 0;
+	/** Responses cut off at the output limit with nothing done, answered with a notice (cut-off-response.ts). */
+	private readonly _cutOffResponses = new CutOffResponses();
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -624,28 +566,27 @@ export class AgentSession {
 	 * next request, and a run waits for those still running before it ends (see _waitForChecks).
 	 */
 	private _checks: BackgroundChecks | undefined;
-	/** Commands the bash tool let run on in the background. Their ends are reported to the agent (see _reportJobs). */
+	/** Commands the bash tool let run on in the background. Their ends are reported to the agent (_jobReporter). */
 	readonly backgroundJobs = new BackgroundJobs();
-	private _jobReportTimer: ReturnType<typeof setTimeout> | undefined;
+	private readonly _jobReporter = new JobReporter(this.backgroundJobs, (ended) =>
+		this.sendCustomMessage(
+			{
+				customType: BACKGROUND_JOB_MESSAGE_TYPE,
+				content: formatJobReport(ended),
+				display: true,
+				details: { jobs: ended.map((job) => job.id) },
+			},
+			{ triggerTurn: true, deliverAs: "steer" },
+		),
+	);
 	/** The machine read, edit, write and bash work on over ssh, when not this one (see setRemote). */
-	private _remote:
-		| {
-				target: RemoteTarget;
-				ssh: SshConnection;
-				/** `target.dir`, resolved on the host. */
-				dir: string;
-				/** Read-before-edit for the host's files, apart from this machine's; no diagnostics there. */
-				fileTracker: FileTracker;
-				tools: Map<string, ToolDefinition>;
-				/** Local search tools turned off while working there, turned on again after. */
-				pausedTools: string[];
-		  }
-		| undefined;
-	/** The last report being handed over (with an idle agent: the run it starts). */
-	private _jobReportSending: Promise<void> = Promise.resolve();
-	private _unsubscribeJobs = this.backgroundJobs.subscribe((event) => {
-		if (event.type === "end") this._scheduleJobReport();
-	});
+	private _remote: RemoteWorkspace | undefined;
+	/** Whether the edit tool is there: bash then treats commands that change files as edit would (bash-file-writes.ts). */
+	private readonly _editToolActive = () => this.agent.state.tools.some((tool) => tool.name === "edit");
+	/** Local search tools turned off while working on the remote machine, turned on again after. */
+	private _remotePausedTools: string[] = [];
+	/** Why the remote machine the session was working on could not be reached again when it was bound, if it could not. */
+	remoteRestoreError: string | undefined;
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
@@ -679,10 +620,7 @@ export class AgentSession {
 			cwd: this._cwd,
 			checkers: enabledCheckers(undefined, cpp ? [...CHECKERS, cpp] : CHECKERS),
 			report: (text) => {
-				this.sendCustomMessage(
-					{ customType: CHECK_REPORT_MESSAGE_TYPE, content: text, display: true },
-					{ deliverAs: "steer" },
-				).catch(() => {});
+				this._sendCheckReport(text).catch(() => {});
 			},
 		});
 		if (checks.enabled) {
@@ -1006,7 +944,7 @@ export class AgentSession {
 	 * runs before every request and the footer asks after every entry, and each estimate walks the whole context.
 	 * `knownAfterCompaction` is false when the latest compaction has no projected assistant response with usage after it
 	 * (the size is unknown until the next response). `nextRequestTokens` is what the next request sends, which the
-	 * compaction threshold is checked against (see {@link _afterPruning}).
+	 * compaction threshold is checked against (see tokensAfterPruning).
 	 */
 	private _contextTokenEstimate(): { tokens: number; nextRequestTokens: number; knownAfterCompaction: boolean } {
 		const sessionManager = this.sessionManager;
@@ -1036,7 +974,12 @@ export class AgentSession {
 			knownAfterCompaction = branch.slice(compactionIndex + 1).some((entry) => projectedAssistants.has(entry.id));
 		}
 		const estimate = estimateProjectedContextTokens(projection, branch);
-		const nextRequestTokens = this._afterPruning(estimate.tokens, projection.messages, estimate.lastUsageIndex);
+		const nextRequestTokens = tokensAfterPruning(
+			estimate.tokens,
+			projection.messages,
+			estimate.lastUsageIndex,
+			this.settingsManager.getToolResultPruningSettings(),
+		);
 		this._contextEstimate = {
 			sessionManager,
 			revision,
@@ -1045,21 +988,6 @@ export class AgentSession {
 			knownAfterCompaction,
 		};
 		return this._contextEstimate;
-	}
-
-	/**
-	 * `tokens` of `messages` as the next request sends them: less what tool-result pruning (tool-result-pruning.ts)
-	 * clears in it beyond what it cleared in the request whose usage `tokens` counts (the one before the response at
-	 * `usageIndex`; without one, `tokens` is the estimate of all of `messages`). Pruning clears in steps, so a step can
-	 * take a context back below the compaction threshold that the size of the last request was above.
-	 */
-	private _afterPruning(tokens: number, messages: AgentMessage[], usageIndex: number | null): number {
-		const settings = this.settingsManager.getToolResultPruningSettings();
-		if (!settings.enabled) return tokens;
-		const cleared =
-			prunedTokens(convertToLlm(messages), settings) -
-			(usageIndex === null ? 0 : prunedTokens(convertToLlm(messages.slice(0, usageIndex)), settings));
-		return Math.max(0, tokens - Math.max(0, cleared));
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
@@ -1189,50 +1117,18 @@ export class AgentSession {
 			if (previousDecision?.action === "end") return previousDecision;
 			// Before the other reasons to go on: a run that goes on anyway (a queued job report, an extension) still
 			// needs the notice and the lower thinking level, or the next response thinks to the limit again.
-			const cutOff = await this._answerCutOffResponse(turn.message);
-			if (cutOff || extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
+			const notice = this._cutOffResponses.answer(turn.message, this.agent.state.model?.maxTokens);
+			// Ahead of other queued messages (a job report): steering goes one message a turn, and a notice one turn late
+			// lets the next response think to the limit again.
+			if (notice) this.agent.steerFirst(notice);
+			if (notice || extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
 			return undefined;
 		};
 	}
 
-	/** The session's thinking level, one level less for each response in a row cut off at the output limit (not below minimal). */
+	/** The session's thinking level, one level less for each response in a row cut off at the output limit. */
 	private _requestThinkingLevel(): ThinkingLevel {
-		const level = this.agent.state.thinkingLevel;
-		const at = (CUT_OFF_THINKING_LEVELS as readonly string[]).indexOf(level);
-		if (this._cutOffResponses === 0 || at <= 0) return level;
-		return CUT_OFF_THINKING_LEVELS[Math.max(0, at - this._cutOffResponses)];
-	}
-
-	/**
-	 * A response cut off at the output limit with no tool call did nothing, and would end the run: the model is told and
-	 * goes on, up to {@link MAX_CUT_OFF_NOTICES} times in a row. In Terminal-Bench 2.1, glm-5.3-flash ended 2 of its first
-	 * 14 runs this way, after 65,536 tokens of thinking, with most of the time left.
-	 */
-	private async _answerCutOffResponse(message: AgentMessage): Promise<boolean> {
-		if (message.role !== "assistant") return false;
-		if (message.stopReason !== "length") {
-			this._cutOffResponses = 0;
-			return false;
-		}
-		// Only a response that did nothing but think: one cut off in its answer text ends as before (Pi's behaviour).
-		if (message.content.some((c) => c.type === "toolCall" || (c.type === "text" && c.text.trim()))) return false;
-		// Cut off below the output limit: the context ran out, which compact-and-retry handles (_checkCompaction).
-		const model = this.agent.state.model;
-		if (model && isRecoverableLength(message, model.maxTokens)) return false;
-		if (this._cutOffResponses >= MAX_CUT_OFF_NOTICES) return false;
-		// The next requests think one level less per such response, until one ends normally (_requestThinkingLevel).
-		this._cutOffResponses++;
-		// Ahead of other queued messages (a job report): steering goes one message a turn, and a notice one turn late
-		// lets the next response think to the limit again.
-		this.agent.steerFirst({
-			role: "custom",
-			customType: CUT_OFF_MESSAGE_TYPE,
-			content:
-				"Your last response reached the output limit while you were still working it out, so nothing was done. Think in shorter steps: take the next concrete step now (a tool call, or write the result), and decide the rest from what it shows.",
-			display: true,
-			timestamp: Date.now(),
-		});
-		return true;
+		return this._cutOffResponses.thinkingLevel(this.agent.state.thinkingLevel);
 	}
 
 	private _installAgentNextTurnRefresh(): void {
@@ -1464,8 +1360,7 @@ export class AgentSession {
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempts = 0;
-			// A run that ended cut off must not leave the next prompt thinking less.
-			this._cutOffResponses = 0;
+			this._cutOffResponses.reset();
 			const messageText = contentText(event.message.content, "");
 			if (messageText) {
 				// Check steering queue first
@@ -1778,14 +1673,13 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
-		clearTimeout(this._jobReportTimer);
+		this._jobReporter.dispose();
 		this._remote?.ssh.close();
-		this._unsubscribeJobs();
 		this.backgroundJobs.killAll();
 		try {
 			this.abortRetry();
 			this.abortCompaction();
-			this._compactionAhead?.controller.abort();
+			this._compactionAhead.cancel();
 			this.abortBranchSummary();
 			this.abortBash();
 			this.agent.abort();
@@ -2111,13 +2005,7 @@ export class AgentSession {
 		const project = remote ? undefined : this._getProjectSnapshot();
 		this._baseSystemPromptOptions = normalizeBuildSystemPromptOptions({
 			cwd: remote ? `${remote.dir} on ${remote.target.host} (over ssh)` : this._cwd,
-			sections: remote
-				? {
-						remote: `read, edit, write and bash work on the machine ${remote.target.host} over ssh, in ${remote.dir}: paths are that machine's. grep, find and ls are off (they search this machine): search there with rg or find in bash. Edits there get no compiler diagnostics. Project context files and skills above are this machine's.`,
-					}
-				: project
-					? { project }
-					: undefined,
+			sections: remote ? { remote: remote.promptSection() } : project ? { project } : undefined,
 			skills: loadedSkills,
 			contextFiles: loadedContextFiles,
 			customPrompt: loaderSystemPrompt,
@@ -2400,26 +2288,17 @@ export class AgentSession {
 		return !this._agentRunAbortRequested && this.agent.hasQueuedMessages();
 	}
 
-	/**
-	 * Before a run ends: the background checks of its edits, up to CHECKS_WAIT_MS, so their errors still reach it; with
-	 * none, the lint findings its changes brought, which wait until the run would end so as not to interrupt it.
-	 */
+	/** Before a run ends: the errors of its edits' checks, or else the lint findings (BackgroundChecks.settle). */
 	private async _waitForChecks(): Promise<void> {
-		const checks = this._checks;
-		if (!checks) return;
-		if (checks.busy) {
-			await checks.waitForIdle(CHECKS_WAIT_MS);
-			// A report is sent on a promise: let it reach the queue before the queue is looked at.
-			await new Promise<void>((resolve) => setImmediate(resolve));
-		}
-		if (this.agent.hasQueuedMessages()) return;
-		const lint = checks.takeLintReport();
-		if (lint) {
-			await this.sendCustomMessage(
-				{ customType: CHECK_REPORT_MESSAGE_TYPE, content: lint, display: true },
-				{ deliverAs: "steer" },
-			);
-		}
+		const lint = await this._checks?.settle(() => this.agent.hasQueuedMessages());
+		if (lint) await this._sendCheckReport(lint);
+	}
+
+	private _sendCheckReport(text: string): Promise<void> {
+		return this.sendCustomMessage(
+			{ customType: CHECK_REPORT_MESSAGE_TYPE, content: text, display: true },
+			{ deliverAs: "steer" },
+		);
 	}
 
 	private async _runBeforeSettleBoundary(): Promise<boolean> {
@@ -2835,66 +2714,25 @@ export class AgentSession {
 	 * folder cannot be reached (ssh runs without asking for passwords).
 	 */
 	async setRemote(target: RemoteTarget | undefined, options?: { persist?: boolean }): Promise<void> {
-		let next: typeof this._remote;
-		if (target) {
-			const ssh = new SshConnection(target.host, { askSecret: this._askSecret });
-			let dir: string;
-			try {
-				dir = await resolveRemoteDir(ssh, target.dir);
-			} catch (error) {
-				// The master connection stays for the folder the session is on there.
-				if (this._remote?.ssh.host === target.host) ssh.release();
-				else ssh.close();
-				throw error;
-			}
-			const fileTracker = new FileTracker({ local: false });
-			const bashOptions = {
-				operations: createRemoteBashOperations(ssh, () => dir),
-				backgroundJobs: this.backgroundJobs,
-				editToolActive: () => this.agent.state.tools.some((tool) => tool.name === "edit"),
-				exposeSessionEnvironment: false,
-			};
-			const tools = new Map<string, ToolDefinition>([
-				[
-					"read",
-					createReadToolDefinition(dir, {
-						operations: createRemoteReadOperations(ssh),
-						fileTracker,
-						autoResizeImages: this.settingsManager.getImageAutoResize(),
-					}) as ToolDefinition,
-				],
-				[
-					"edit",
-					createEditToolDefinition(dir, {
-						operations: createRemoteEditOperations(ssh),
-						fileTracker,
-						enforceReadBeforeEdit: true,
-						includePostEditSnippet: true,
-					}) as ToolDefinition,
-				],
-				[
-					"write",
-					createWriteToolDefinition(dir, {
-						operations: createRemoteWriteOperations(ssh),
-						fileTracker,
-						enforceReadBeforeEdit: true,
-					}) as ToolDefinition,
-				],
-				["bash", createBashToolDefinition(dir, bashOptions) as ToolDefinition],
-			]);
-			next = { target, ssh, dir, fileTracker, tools, pausedTools: this._remote?.pausedTools ?? [] };
-		}
 		const previous = this._remote;
+		const next = target
+			? await RemoteWorkspace.connect(target, {
+					askSecret: this._askSecret,
+					current: previous,
+					backgroundJobs: this.backgroundJobs,
+					editToolActive: this._editToolActive,
+					autoResizeImages: this.settingsManager.getImageAutoResize(),
+				})
+			: undefined;
 		this._remote = next;
-		if (previous && previous.ssh.host !== next?.ssh.host) previous.ssh.close();
-		else previous?.ssh.release();
+		previous?.leave(next);
 
 		const active = this.getActiveToolNames();
 		if (next && !previous) {
-			next.pausedTools = active.filter((name) => REMOTE_PAUSED_TOOLS.has(name));
+			this._remotePausedTools = active.filter((name) => REMOTE_PAUSED_TOOLS.has(name));
 			this.setActiveToolsByName(active.filter((name) => !REMOTE_PAUSED_TOOLS.has(name)));
 		} else if (!next && previous) {
-			this.setActiveToolsByName([...active, ...previous.pausedTools.filter((name) => !active.includes(name))]);
+			this.setActiveToolsByName([...active, ...this._remotePausedTools.filter((name) => !active.includes(name))]);
 		} else {
 			this._rebuildSystemPrompt(this.getActiveToolNames());
 		}
@@ -2908,81 +2746,24 @@ export class AgentSession {
 	 * new runtime).
 	 */
 	private async _restoreRemoteFromSession(): Promise<void> {
-		const fromFlag = process.env.PI_REMOTE ? parseRemoteTarget(process.env.PI_REMOTE) : undefined;
-		if (process.env.PI_REMOTE && !fromFlag) throw new Error(`Not a remote folder: ${process.env.PI_REMOTE}`);
+		const flag = process.env.PI_REMOTE;
+		const fromFlag = flag ? parseRemoteTarget(flag) : undefined;
+		if (flag && !fromFlag) throw new Error(`Not a remote folder: ${flag}`);
+		const saved = savedRemoteTarget(this.sessionManager.getBranch());
 		if (fromFlag) {
-			const current = this.sessionManager
-				.getBranch()
-				.findLast((e) => e.type === "custom" && (e as { customType?: string }).customType === REMOTE_ENTRY);
-			const saved = (current as { data?: RemoteTarget | null } | undefined)?.data;
 			const same = saved?.host === fromFlag.host && saved?.dir === fromFlag.dir;
 			return this.setRemote(fromFlag, { persist: !same });
 		}
-		const entry = this.sessionManager
-			.getBranch()
-			.findLast((e) => e.type === "custom" && (e as { customType?: string }).customType === REMOTE_ENTRY);
-		const target = (entry as { data?: RemoteTarget | null } | undefined)?.data;
-		if (target?.host) await this.setRemote(target, { persist: false });
-	}
-
-	/**
-	 * A built-in file tool or bash that runs on the remote machine while there is one. Its declaration stays the local
-	 * tool's, and the context it gets says the remote folder is the working folder.
-	 */
-	private _routedToRemote(name: string, definition: ToolDefinition): ToolDefinition {
-		if (!REMOTE_ROUTED_TOOLS.has(name)) return definition;
-		return {
-			...definition,
-			execute: (toolCallId, params, signal, onUpdate, ctx) => {
-				const remote = this._remote;
-				const tool = remote?.tools.get(name);
-				if (!remote || !tool) return definition.execute(toolCallId, params, signal, onUpdate, ctx);
-				const remoteCtx = new Proxy(ctx, {
-					get: (t, key, receiver) => (key === "cwd" ? remote.dir : Reflect.get(t, key, receiver)),
-				});
-				return tool.execute(toolCallId, params, signal, onUpdate, remoteCtx);
-			},
-		};
-	}
-
-	/** Reports jobs that ended in a moment: jobs ending together come in one report. */
-	private _scheduleJobReport(): void {
-		this._jobReportTimer ??= setTimeout(() => {
-			this._jobReportTimer = undefined;
-			this._reportJobs();
-		}, JOB_SETTLE_WINDOW_MS);
-	}
-
-	/**
-	 * Tells the agent which jobs ended: in the running turn before its next request, or as a new turn when it is idle.
-	 * A blocked `wait` call reports them itself.
-	 */
-	private _reportJobs(): void {
-		if (this.backgroundJobs.hasWaiters()) {
-			// Should the wait end without them (aborted), they still come as a message.
-			this._scheduleJobReport();
-			return;
-		}
-		const ended = this.backgroundJobs.takeUnreported();
-		if (ended.length === 0) return;
-		this._jobReportSending = this.sendCustomMessage(
-			{
-				customType: BACKGROUND_JOB_MESSAGE_TYPE,
-				content: formatJobReport(ended),
-				display: true,
-				details: { jobs: ended.map((job) => job.id) },
-			},
-			{ triggerTurn: true, deliverAs: "steer" },
-		).catch(() => {});
+		if (saved?.host) await this.setRemote(saved, { persist: false });
 	}
 
 	/** Resolves once no background job runs and every report is in a finished run (print mode exits after it). */
 	async waitForBackgroundJobs(): Promise<void> {
 		for (;;) {
 			await this.waitForIdle();
-			await this._jobReportSending;
+			const reportComing = await this._jobReporter.settle();
 			const jobs = this.backgroundJobs;
-			if (jobs.running().length === 0 && !jobs.hasUnreported() && !this._jobReportTimer && this.isIdle) return;
+			if (jobs.running().length === 0 && !jobs.hasUnreported() && !reportComing && this.isIdle) return;
 			await new Promise<void>((resolve) => {
 				const done = () => {
 					clearTimeout(timer);
@@ -3779,9 +3560,10 @@ export class AgentSession {
 		const hasContextEdits = projection.entries.some((entry) => entry.sourceEntry.type === "context_edit");
 		const directContextTokens = assistantMessage.usage ? calculateContextTokens(assistantMessage.usage) : 0;
 		// What the next request sends: tool-result pruning may clear more of it than of the last one.
+		const pruning = this.settingsManager.getToolResultPruningSettings();
 		if (hasContextEdits) {
 			const estimate = estimateProjectedContextTokens(projection, branch);
-			contextTokens = this._afterPruning(estimate.tokens, projection.messages, estimate.lastUsageIndex);
+			contextTokens = tokensAfterPruning(estimate.tokens, projection.messages, estimate.lastUsageIndex, pruning);
 		} else if (assistantMessage.stopReason === "error" || directContextTokens === 0) {
 			const messages = this.agent.state.messages;
 			const estimate = estimateContextTokens(messages);
@@ -3800,11 +3582,12 @@ export class AgentSession {
 					return false;
 				}
 			}
-			contextTokens = this._afterPruning(estimate.tokens, messages, estimate.lastUsageIndex);
+			contextTokens = tokensAfterPruning(estimate.tokens, messages, estimate.lastUsageIndex, pruning);
 		} else {
 			const messages = this.agent.state.messages;
 			const index = messages.lastIndexOf(assistantMessage);
-			contextTokens = index < 0 ? directContextTokens : this._afterPruning(directContextTokens, messages, index);
+			contextTokens =
+				index < 0 ? directContextTokens : tokensAfterPruning(directContextTokens, messages, index, pruning);
 		}
 		// Near the threshold when a run ends, the summary is made while the user reads and writes; above it, while the
 		// agent goes on.
@@ -3816,105 +3599,22 @@ export class AgentSession {
 	}
 
 	/**
-	 * Near the compaction threshold, the summary of what the compaction would cut is made in the background, and the
-	 * threshold compaction takes it ({@link _takeCompactionAhead}) instead of stopping the agent for the summary request.
-	 * The threshold is not the context's limit: while the summary is still being made, the agent goes on above it, and
-	 * stops to wait for it only some way above (see {@link COMPACTION_AHEAD_OVERRUN}). The entries the summary covers
-	 * stay as they are: later ones are appended, and kept by the compaction. Not when an extension makes or vets
-	 * compactions (`session_before_compact`), nor for a context so small that the kept part alone would be near the
-	 * threshold again.
-	 *
+	 * Near the compaction threshold, the summary of what the compaction would cut is made in the background (see
+	 * compaction/compaction-ahead.ts). Not when an extension makes or vets compactions (`session_before_compact`).
 	 * Returns whether the compaction is to wait: a summary is being made, and the context is below where it stops.
 	 */
 	private _compactAhead(contextTokens: number, contextWindow: number): boolean {
 		if (!compactionFeatures.ahead || !this.settingsManager.getCompactionEnabled()) return false;
 		const model = this.model;
 		if (!model || this._extensionRunner.hasHandlers("session_before_compact")) return false;
-		const settings = this.settingsManager.getCompactionSettings(model, contextWindow);
-		const threshold = getCompactionThreshold(contextWindow, settings);
-		const start = threshold - Math.min(threshold * COMPACTION_AHEAD_SHARE, COMPACTION_AHEAD_MAX_TOKENS);
-		if (contextTokens <= start || start < 2 * settings.keepRecentTokens) return false;
-		const limit = contextWindow - settings.reserveTokens;
-		const goesOn =
-			contextTokens <= threshold + Math.min((limit - threshold) / 2, threshold * COMPACTION_AHEAD_OVERRUN);
-		const branch = this.sessionManager.getBranch();
-		const current = this._compactionAhead;
-		if (current) {
-			if (this._compactionAheadValid(current, branch, settings)) return goesOn && !current.done;
-			current.controller.abort();
-			this._compactionAhead = undefined;
-		}
-		const leafId = branch.at(-1)?.id;
-		const preparation = prepareCompaction(branch, settings);
-		if (
-			!leafId ||
-			!preparation ||
-			(preparation.messagesToSummarize.length === 0 && preparation.turnPrefixMessages.length === 0)
-		) {
-			return false;
-		}
-		const controller = new AbortController();
-		const ahead: CompactionAhead = {
+		return this._compactionAhead.update({
+			contextTokens,
+			contextWindow,
 			sessionManager: this.sessionManager,
-			leafId,
-			firstKeptEntryId: preparation.firstKeptEntryId,
-			keepRecentTokens: settings.keepRecentTokens,
-			controller,
-			done: false,
-			result: this._runDefaultCompaction(preparation, model, undefined, controller.signal, "threshold", true)
-				.catch(() => undefined)
-				.finally(() => {
-					ahead.done = true;
-				}),
-		};
-		this._compactionAhead = ahead;
-		return goesOn;
-	}
-
-	/** Whether a summary made ahead still fits `branch`: nothing it covers was compacted, edited or left since. */
-	private _compactionAheadValid(
-		ahead: CompactionAhead,
-		branch: SessionEntry[],
-		settings: CompactionSettings,
-	): boolean {
-		if (ahead.sessionManager !== this.sessionManager || ahead.keepRecentTokens !== settings.keepRecentTokens) {
-			return false;
-		}
-		if (ahead.controller.signal.aborted) return false;
-		const leafIndex = branch.findIndex((entry) => entry.id === ahead.leafId);
-		const keptIndex = branch.findIndex((entry) => entry.id === ahead.firstKeptEntryId);
-		if (leafIndex < 0 || keptIndex < 0) return false;
-		return branch.slice(leafIndex + 1).every((entry) => {
-			if (entry.type === "compaction") return false;
-			if (entry.type !== "context_edit") return true;
-			const target = branch.findIndex((other) => other.id === entry.targetId);
-			return target >= keptIndex;
+			settings: this.settingsManager.getCompactionSettings(model, contextWindow),
+			summarize: (preparation, signal) =>
+				this._runDefaultCompaction(preparation, model, undefined, signal, "threshold", true),
 		});
-	}
-
-	/**
-	 * The summary made ahead for a threshold compaction of `branch`, waited for when it is still being made (the wait
-	 * ends with `signal`); undefined when there is none, it does not fit, or it failed. Taken once.
-	 */
-	private async _takeCompactionAhead(
-		branch: SessionEntry[],
-		settings: CompactionSettings,
-		signal: AbortSignal,
-	): Promise<CompactionResult | undefined> {
-		const ahead = this._compactionAhead;
-		if (!ahead) return undefined;
-		this._compactionAhead = undefined;
-		if (!this._compactionAheadValid(ahead, branch, settings)) {
-			ahead.controller.abort();
-			return undefined;
-		}
-		const cancel = () => ahead.controller.abort();
-		signal.addEventListener("abort", cancel, { once: true });
-		try {
-			return await ahead.result;
-		} finally {
-			signal.removeEventListener("abort", cancel);
-		}
 	}
 
 	private async _emitOverflowRecoveryFailure(errorMessage: string): Promise<void> {
@@ -4068,7 +3768,7 @@ export class AgentSession {
 				// shared with manual compaction.
 				const ahead =
 					reason === "threshold" && recovery === undefined
-						? await this._takeCompactionAhead(pathEntries, settings, abortController.signal)
+						? await this._compactionAhead.take(this.sessionManager, pathEntries, settings, abortController.signal)
 						: undefined;
 				abortController.signal.throwIfAborted();
 				const compactResult =
@@ -4197,9 +3897,6 @@ export class AgentSession {
 			);
 		}
 	}
-
-	/** Why the remote machine the session was working on could not be reached again when it was bound, if it could not. */
-	remoteRestoreError: string | undefined;
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
 		if (!this._extensionRunner.hasHandlers("resources_discover")) {
@@ -4561,7 +4258,7 @@ export class AgentSession {
 						commandPrefix: shellCommandPrefix,
 						shellPath,
 						backgroundJobs: this.backgroundJobs,
-						editToolActive: () => this.agent.state.tools.some((tool) => tool.name === "edit"),
+						editToolActive: this._editToolActive,
 						fileTracker: this._fileTracker,
 					},
 					wait: { backgroundJobs: this.backgroundJobs },
@@ -4570,7 +4267,9 @@ export class AgentSession {
 		this._baseToolDefinitions = new Map(
 			Object.entries(baseToolDefinitions).map(([name, tool]) => [
 				name,
-				this._baseToolsOverride ? (tool as ToolDefinition) : this._routedToRemote(name, tool as ToolDefinition),
+				this._baseToolsOverride
+					? (tool as ToolDefinition)
+					: routedToRemote(name, tool as ToolDefinition, () => this._remote),
 			]),
 		);
 
