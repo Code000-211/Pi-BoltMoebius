@@ -7,7 +7,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import { commandName, parse } from "./bash-file-writes.ts";
+import { commandName, parse } from "./bash-parse.ts";
 
 /** pkill/pgrep options that take a value, which is not the pattern. */
 const VALUE_OPTIONS = new Set([
