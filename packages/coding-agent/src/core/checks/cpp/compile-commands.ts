@@ -261,7 +261,35 @@ export function sanitizeCompileFlags(
 	return result;
 }
 
+/**
+ * The -I folders of a project without compile_commands.json: those its Makefile passes (`CFLAGS = ... -Iinclude`), else
+ * its include/ or inc/ folder. Without them a source's `#include "user.h"` is not found, and every use of what that
+ * header declares becomes an error of its own: reports of errors the compiler does not have.
+ */
+function projectIncludeFlags(workspaceCwd: string): string[] {
+	const dirs = new Set<string>();
+	for (const name of ["Makefile", "makefile", "GNUmakefile"]) {
+		const path = join(workspaceCwd, name);
+		if (!existsSync(path)) continue;
+		try {
+			for (const match of readFileSync(path, "utf-8").matchAll(/(?:^|[\s=])-I\s*([^\s$()'"]+)/g)) {
+				const dir = resolve(workspaceCwd, match[1]!);
+				if (existsSync(dir)) dirs.add(dir);
+			}
+		} catch {}
+	}
+	if (dirs.size === 0) {
+		for (const name of ["include", "inc"]) {
+			const dir = join(workspaceCwd, name);
+			if (existsSync(dir) && statSync(dir).isDirectory()) dirs.add(dir);
+		}
+	}
+	return [...dirs].map((dir) => `-I${dir}`);
+}
+
 export class CompileCommandsResolver {
+	/** projectIncludeFlags by workspace, looked up again after DB_LOOKUP_CACHE_TTL_MS. */
+	private projectIncludes = new Map<string, { flags: string[]; expiresAtMs: number }>();
 	private cache = new Map<string, CachedCompileDb>();
 	private dirLookupCache = new Map<string, CachedDirLookup>();
 
@@ -300,7 +328,13 @@ export class CompileCommandsResolver {
 			}
 		}
 
-		return sanitizeCompileFlags([], absPath, workspaceCwd, contentHint);
+		const now = Date.now();
+		let includes = this.projectIncludes.get(workspaceCwd);
+		if (!includes || includes.expiresAtMs <= now) {
+			includes = { flags: projectIncludeFlags(workspaceCwd), expiresAtMs: now + DB_LOOKUP_CACHE_TTL_MS };
+			this.projectIncludes.set(workspaceCwd, includes);
+		}
+		return sanitizeCompileFlags(includes.flags, absPath, workspaceCwd, contentHint);
 	}
 
 	private findAndLoadCompileDb(filePath: string, workspaceCwd: string): CachedCompileDb | undefined {

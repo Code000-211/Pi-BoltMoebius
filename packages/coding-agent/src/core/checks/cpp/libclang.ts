@@ -118,7 +118,11 @@ export class LibclangEngine {
 		const tuContent = tuKey === targetKey ? content : this.stateTracker.getTrackedState(tuFilePath)?.content;
 		const flags = this.compileCommands.getFlagsForFile(tuFilePath, workspaceCwd, tuContent);
 		const rawDiags = JSON.parse(await addon.checkFileAsync(tuFilePath, flags, unsavedFiles)) as RawClangDiagnostic[];
-		return this.filterRelevantDiagnostics(rawDiags, targetKey);
+		const diagnostics = this.filterRelevantDiagnostics(rawDiags, targetKey);
+		// A header that is not found makes every use of what it declares an error: only the missing header counts, as
+		// the compiler with the project's own flags may well find it.
+		const missing = diagnostics.filter((d) => / file not found$/.test(d.message));
+		return missing.length > 0 ? missing : diagnostics;
 	}
 
 	/**

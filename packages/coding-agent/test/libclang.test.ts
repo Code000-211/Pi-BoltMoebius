@@ -116,4 +116,35 @@ describe.skipIf(!addon)("libclang bridge and C++ engine (real libclang)", () => 
 		// Inside its includer `Scalar` is known: no error for it.
 		expect(errors.some((m) => m.includes("Scalar"))).toBe(false);
 	});
+
+	it("finds headers through the Makefile's -I folders when there is no compile_commands.json", async () => {
+		mkdirSync(join(dir, "include"));
+		mkdirSync(join(dir, "src"));
+		writeFileSync(
+			join(dir, "Makefile"),
+			"CFLAGS ?= -std=c11 -Wall -Iinclude\napp: src/user.c\n\tcc $(CFLAGS) -o app src/user.c\n",
+		);
+		const header = join(dir, "include", "user.h");
+		const source = join(dir, "src", "user.c");
+		writeFileSync(header, "#define NAME_MAX 32\nstruct user { char name[NAME_MAX]; };\n");
+		writeFileSync(source, '#include "user.h"\nint size(struct user *u) { return (int)sizeof u->name + NAME_MAX; }\n');
+		const tracker = new FileStateTracker();
+		const engine = new LibclangEngine(tracker);
+		for (const file of [header, source]) tracker.recordFileRead(file, readFileSync(file, "utf-8"), Date.now());
+		expect(await engine.check(source, readFileSync(source, "utf-8"), dir)).toEqual([]);
+		// A real error is still one: the header the agent changed no longer defines NAME_MAX.
+		const edited = "struct user { char *name; };\n";
+		writeFileSync(header, edited);
+		tracker.recordFileModifiedByAgent(header, edited, Date.now());
+		const errors = (await engine.check(source, readFileSync(source, "utf-8"), dir)).map((d) => d.message);
+		expect(errors).toEqual(["use of undeclared identifier 'NAME_MAX'"]);
+	});
+
+	it("reports only the missing header when a header is not found, not every use of what it declares", async () => {
+		const source = join(dir, "a.c");
+		const content = '#include "nowhere.h"\nint f(struct thing *t) { return t->x + t->y + LIMIT; }\n';
+		writeFileSync(source, content);
+		const engine = new LibclangEngine(new FileStateTracker());
+		expect((await engine.check(source, content, dir)).map((d) => d.message)).toEqual(["'nowhere.h' file not found"]);
+	});
 });

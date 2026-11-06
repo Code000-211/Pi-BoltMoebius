@@ -161,7 +161,9 @@ in the background when the file is read. The model sees its mistake in its next 
   on a warm translation unit, 1 s right after the read, seconds on a large one), through libclang in the process when a
   libclang library is found (`LIBCLANG_PATH`, ROCm's, or the system's). libclang gets the builtin headers (`stddef.h`)
   from the folder next to the library it loaded. Flags come from `compile_commands.json` in the
-  project or up to 5 parent folders (also `build/`, `out/`, `cmake-build-*`). A header is checked inside a source that
+  project or up to 5 parent folders (also `build/`, `out/`, `cmake-build-*`); without one, the `-I` folders of the
+  project's Makefile, else its `include/` or `inc/`. When a header is still not found, only that is reported, not each
+  use of what it declares. A header is checked inside a source that
   includes it, also through `-I` folders, with the other headers the agent changed.
 - Without these tools the edit goes through as before, with no diagnostics.
 
