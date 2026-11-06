@@ -1,8 +1,9 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname, extname, join, normalize, resolve } from "node:path";
-import { isCppOrHipHeader } from "./file-state-tracker.ts";
+import { dirname, extname, join, resolve } from "node:path";
+import { pathKey } from "../../file-tracking/file-state.ts";
+import { isCppOrHipHeader } from "./files.ts";
 
-export interface CompileCommandEntry {
+interface CompileCommandEntry {
 	directory: string;
 	file: string;
 	arguments?: string[];
@@ -51,15 +52,10 @@ function getRocmInfo(): { rocmPath?: string; rocmInclude?: string } {
 	return cachedRocmInfo;
 }
 
-function normalizePathKey(p: string): string {
-	const norm = normalize(resolve(p));
-	return process.platform === "win32" ? norm.toLowerCase() : norm;
-}
-
 /**
  * Split a shell command string from compile_commands.json into arguments.
  */
-export function splitCompileCommand(command: string): string[] {
+function splitCompileCommand(command: string): string[] {
 	const args: string[] = [];
 	let current = "";
 	let quote: '"' | "'" | null = null;
@@ -105,7 +101,7 @@ export function sanitizeCompileFlags(
 	contentHint?: string,
 ): string[] {
 	const result: string[] = [];
-	const targetNorm = normalizePathKey(targetFilePath);
+	const targetNorm = pathKey(targetFilePath);
 	const ext = extname(targetFilePath).toLowerCase();
 	const isHipByExt = ext === ".hip" || ext === ".cuh" || ext === ".hiph";
 	const isHipByContent =
@@ -197,7 +193,7 @@ export function sanitizeCompileFlags(
 		// Skip input source file path
 		if (!arg.startsWith("-")) {
 			const resolvedArg = workingDir ? resolve(workingDir, arg) : resolve(arg);
-			if (normalizePathKey(resolvedArg) === targetNorm) {
+			if (pathKey(resolvedArg) === targetNorm) {
 				continue;
 			}
 			const argExt = extname(arg).toLowerCase();
@@ -275,7 +271,7 @@ export class CompileCommandsResolver {
 	 */
 	getFlagsForFile(filePath: string, workspaceCwd: string, contentHint?: string): string[] {
 		const absPath = resolve(workspaceCwd, filePath);
-		const exactKey = normalizePathKey(absPath);
+		const exactKey = pathKey(absPath);
 		const db = this.findAndLoadCompileDb(absPath, workspaceCwd);
 
 		if (db) {
@@ -285,7 +281,7 @@ export class CompileCommandsResolver {
 			let entry = db.entriesByFile.get(exactKey);
 			if (!entry) {
 				// Inherit from a file in the same directory, or fallback to first HIP / C++ entry in the project
-				const dirKey = normalizePathKey(dirname(absPath));
+				const dirKey = pathKey(dirname(absPath));
 				entry =
 					db.entriesByDir.get(dirKey) ??
 					(extname(absPath).toLowerCase() === ".hip" || extname(absPath).toLowerCase() === ".cuh"
@@ -309,7 +305,7 @@ export class CompileCommandsResolver {
 
 	private findAndLoadCompileDb(filePath: string, workspaceCwd: string): CachedCompileDb | undefined {
 		const now = Date.now();
-		const dirKey = normalizePathKey(dirname(filePath));
+		const dirKey = pathKey(dirname(filePath));
 		const cachedLookup = this.dirLookupCache.get(dirKey);
 		if (cachedLookup && cachedLookup.expiresAtMs > now) {
 			return cachedLookup.dbPath ? this.loadCompileDb(cachedLookup.dbPath, now) : undefined;
@@ -370,8 +366,8 @@ export class CompileCommandsResolver {
 				if (!entry || typeof entry.file !== "string") continue;
 				const baseDir = entry.directory || dirname(dbPath);
 				const absFile = resolve(baseDir, entry.file);
-				const fileKey = normalizePathKey(absFile);
-				const dirKey = normalizePathKey(dirname(absFile));
+				const fileKey = pathKey(absFile);
+				const dirKey = pathKey(dirname(absFile));
 
 				entriesByFile.set(fileKey, entry);
 				if (!entriesByDir.has(dirKey)) {

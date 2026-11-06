@@ -7,7 +7,7 @@
  * native `tsc` (about 3-10x the JavaScript one), `cargo check` for Rust (1.4 s warm on Moebius's 440-file workspace,
  * where rust-analyzer gave no answer within 84 s and took 3.2 GB), shuck for shell (2-4 ms), luau-analyze (5 ms), and
  * Bun's own parsers for JSON, TOML and YAML (all three in about 1 ms, in the process). C, C++ and HIP are not here: libclang
- * checks them in the process (ClaudeHarnessManager.cppChecker, cpp-hip-engine.ts), with the files the agent read.
+ * checks them in the process (cpp/checker.ts, cpp/libclang.ts), with the files the agent read.
  */
 
 import { execFile } from "node:child_process";
@@ -15,7 +15,18 @@ import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
-import type { DiagnosticSeverity, HarnessDiagnostic } from "../harness/file-state-tracker.ts";
+
+export type DiagnosticSeverity = "error" | "warning";
+
+/** One finding of a checker: an error, or a warning (a linter's finding). */
+export interface Diagnostic {
+	file: string;
+	line: number;
+	column: number;
+	severity: DiagnosticSeverity;
+	message: string;
+	code?: string;
+}
 
 export interface CheckUnit {
 	/** Which checker, and what it checks: one run at a time per key. */
@@ -35,7 +46,7 @@ export interface Checker {
 	/** The unit that checks this file, or undefined when its tool is not installed or no project holds the file. */
 	unit(path: string): CheckUnit | undefined;
 	/** The errors in the unit as it is on disk now. */
-	run(unit: CheckUnit, signal: AbortSignal): Promise<HarnessDiagnostic[]>;
+	run(unit: CheckUnit, signal: AbortSignal): Promise<Diagnostic[]>;
 }
 
 /** How long a check may take before it is given up (a cold `cargo check` of a large workspace takes longer). */
@@ -115,7 +126,7 @@ function diag(
 	message: string,
 	code?: string,
 	severity: DiagnosticSeverity = "error",
-): HarnessDiagnostic {
+): Diagnostic {
 	return { file, line, column, severity, message: message.trim(), code };
 }
 
@@ -123,8 +134,8 @@ function diag(
  * Lines `file:line:col: error[code] message` (also `warning[code]:`), as ty, shuck and selene print them with paths
  * relative to `cwd`: the errors, and with `lint` the warnings too, as lint findings.
  */
-function parseColonFindings(text: string, cwd: string, lint = false): HarnessDiagnostic[] {
-	const out: HarnessDiagnostic[] = [];
+function parseColonFindings(text: string, cwd: string, lint = false): Diagnostic[] {
+	const out: Diagnostic[] = [];
 	for (const line of text.split("\n")) {
 		const m = /^(.+?):(\d+):(\d+): (error|warning)\[([^\]]+)\]:? (.*)$/.exec(line.trim());
 		if (!m || (m[4] === "warning" && !lint)) continue;
@@ -218,7 +229,7 @@ const rust: Checker = {
 			signal,
 			env,
 		);
-		const out: HarnessDiagnostic[] = [];
+		const out: Diagnostic[] = [];
 		for (const line of ran.stdout.split("\n")) {
 			if (!line.startsWith("{")) continue;
 			let event: {
@@ -262,7 +273,7 @@ const rust: Checker = {
 const PYTHON_ROOTS = ["pyproject.toml", "setup.py", "setup.cfg", "ty.toml", ".git"];
 
 /** ruff's findings in the file, as lint, where the project configures ruff (8 ms a file). */
-async function ruff(unit: CheckUnit, signal: AbortSignal): Promise<HarnessDiagnostic[]> {
+async function ruff(unit: CheckUnit, signal: AbortSignal): Promise<Diagnostic[]> {
 	const dir = dirname(unit.file!);
 	const uses = configured(dir, ["ruff.toml", ".ruff.toml"]) || mentions(dir, "pyproject.toml", /^\[tool\.ruff/m);
 	if (!uses || !onPath("ruff")) return [];
@@ -271,7 +282,7 @@ async function ruff(unit: CheckUnit, signal: AbortSignal): Promise<HarnessDiagno
 		unit.cwd,
 		signal,
 	);
-	const out: HarnessDiagnostic[] = [];
+	const out: Diagnostic[] = [];
 	for (const line of ran.stdout.split("\n")) {
 		const m = /^(.+?):(\d+):(\d+): (\S+) (?:\[\*\] )?(.*)$/.exec(line.trim());
 		if (m) out.push(diag(resolve(unit.cwd, m[1]!), Number(m[2]), Number(m[3]), m[5]!, m[4], "warning"));
@@ -353,7 +364,7 @@ const typescript: Checker = {
 			unit.cwd,
 			signal,
 		);
-		const out: HarnessDiagnostic[] = [];
+		const out: Diagnostic[] = [];
 		for (const line of ran.stdout.split("\n")) {
 			const m = /^(.+?)\((\d+),(\d+)\): error (TS\d+): (.*)$/.exec(line.trim());
 			if (m) out.push(diag(resolve(unit.cwd, m[1]!), Number(m[2]), Number(m[3]), m[5]!, m[4]));
@@ -388,7 +399,7 @@ const shell: Checker = {
 		return { key: `shell:${path}`, checker: shell, cwd: dirname(path), file: path };
 	},
 	async run(unit, signal) {
-		const out: HarnessDiagnostic[] = [];
+		const out: Diagnostic[] = [];
 		if (onPath("bash")) {
 			const ran = await run(["bash", "-n", unit.file!], unit.cwd, signal, { LC_ALL: "C" });
 			for (const line of ran.stderr.split("\n")) {
@@ -421,7 +432,7 @@ const luau: Checker = {
 		// A script that runs inside a host (Moebius's column scripts) uses globals the analyzer does not know: its type
 		// errors count only in a file that asks for them with `--!strict`; syntax errors always do.
 		const strict = /^--!strict/m.test(readFileSync(unit.file!, "utf-8"));
-		const out: HarnessDiagnostic[] = [];
+		const out: Diagnostic[] = [];
 		for (const line of (ran.stdout + ran.stderr).split("\n")) {
 			const m = /^(.+?)\((\d+),(\d+)\): (\w+): (.*)$/.exec(line.trim());
 			if (!m || !(m[4] === "SyntaxError" || (strict && m[4] === "TypeError"))) continue;
@@ -473,7 +484,7 @@ function linter(
 	name: string,
 	extensions: string[],
 	setup: (path: string) => { cwd: string; argv: (file: string) => string[] } | undefined,
-	parse: (output: string, cwd: string) => HarnessDiagnostic[],
+	parse: (output: string, cwd: string) => Diagnostic[],
 ): Checker {
 	const checker: Checker = {
 		name,
@@ -534,7 +545,7 @@ const jsLint = linter(
 		return undefined;
 	},
 	(output, cwd) => {
-		const out: HarnessDiagnostic[] = [];
+		const out: Diagnostic[] = [];
 		for (const line of output.split("\n")) {
 			const github =
 				/^::(error|warning|notice) title=([^,]+),file=([^,]+),line=(\d+),(?:endLine=\d+,)?col=(\d+)[^:]*::(.*)$/.exec(
@@ -575,7 +586,7 @@ const markdown = linter(
 		return { cwd, argv: (file) => ["rumdl", "check", file] };
 	},
 	(output, cwd) => {
-		const out: HarnessDiagnostic[] = [];
+		const out: Diagnostic[] = [];
 		for (const line of output.split("\n")) {
 			const m = /^(.+?):(\d+):(\d+): \[(\w+)\] (.*?)(?: \[\*\])?$/.exec(line.trim());
 			if (m) out.push(diag(resolve(cwd, m[1]!), Number(m[2]), Number(m[3]), m[5]!, m[4]));
@@ -594,7 +605,7 @@ const yamlLint = linter(
 		return { cwd, argv: (file) => ["ryl", "check", "--format", "parsable", file] };
 	},
 	(output, cwd) => {
-		const out: HarnessDiagnostic[] = [];
+		const out: Diagnostic[] = [];
 		for (const line of output.split("\n")) {
 			const m = /^(.+?):(\d+):(\d+): \[(?:error|warning)\] (.*?)(?: \(([\w-]+)\))?$/.exec(line.trim());
 			if (m) out.push(diag(resolve(cwd, m[1]!), Number(m[2]), Number(m[3]), m[4]!, m[5]));
@@ -631,7 +642,7 @@ const cppLint = linter(
 		return { cwd, argv: (file) => ["clangd-tidy", "-p", dbDir, file] };
 	},
 	(output, cwd) => {
-		const out: HarnessDiagnostic[] = [];
+		const out: Diagnostic[] = [];
 		for (const line of output.split("\n")) {
 			const m = /^(.+?):(\d+):(\d+): (?:Warning|Error|Information|Hint): (.*?)(?: \[([\w.,-]+)\])?$/.exec(
 				line.trim(),

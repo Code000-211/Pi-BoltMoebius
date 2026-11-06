@@ -1,40 +1,8 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
-import { stripBom } from "../../utils/text.ts";
 import type { BackgroundChecks } from "../checks/background-checks.ts";
-import type { Checker } from "../checks/checkers.ts";
+import { LibclangEngine } from "../checks/cpp/libclang.ts";
 import { notifySearchFileTouched } from "../tools/native-search.ts";
-import { CppHipDiagnosticsEngine } from "./cpp-hip-engine.ts";
-import { FileStateTracker, isCppOrHipFile } from "./file-state-tracker.ts";
-
-const NESTED_INSTRUCTION_CANDIDATES = ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
-
-function loadInstructionFileFromDir(dir: string): { path: string; content: string } | null {
-	for (const filename of NESTED_INSTRUCTION_CANDIDATES) {
-		const filePath = join(dir, filename);
-		if (!existsSync(filePath)) continue;
-		try {
-			if (!statSync(filePath).isFile()) continue;
-			return {
-				path: filePath,
-				content: stripBom(readFileSync(filePath, "utf-8")),
-			};
-		} catch {
-			// Ignore unreadable files
-		}
-	}
-	return null;
-}
-
-/**
- * Format nested `CLAUDE.md` / `AGENTS.md` files discovered on `read`, matching Claude Code's
- * `mods/agents-md` framing (`Contents of <path>:\n\n<content>`).
- */
-export function formatNestedInstructionsReminder(files: Array<{ path: string; content: string }>): string {
-	if (files.length === 0) return "";
-	const frames = files.map((f) => `Contents of ${f.path}:\n\n${f.content.trimEnd()}`);
-	return `\n\n<system-reminder>\n${frames.join("\n\n")}\n</system-reminder>`;
-}
+import { FileStateTracker } from "./file-state.ts";
+import { formatNestedInstructionsReminder, NestedInstructions } from "./nested-instructions.ts";
 
 /**
  * Format a compact `cat -n` style snippet around `firstChangedLine` using a single `indexOf("\n")`
@@ -71,9 +39,15 @@ export function formatPostEditSnippet(
 	return `\n\nHere is a snippet of the edited file around line ${firstChangedLine}:\n${snippetLines.join("\n")}`;
 }
 
-export class ClaudeHarnessManager {
+/**
+ * What the file tools know of the files of a session: which were read and how they looked (read-before-edit), the C
+ * and C++ engine that uses them, the nested instruction files found on reads, and the background checks that follow
+ * reads and edits. One per session; the tools of a remote machine get their own (`local: false`).
+ */
+export class FileTracker {
 	readonly stateTracker = new FileStateTracker();
-	readonly cppHipEngine: CppHipDiagnosticsEngine;
+	readonly cppEngine = new LibclangEngine(this.stateTracker);
+	private readonly nestedInstructions = new NestedInstructions();
 	/** The checks after an edit, in the background (see checks/background-checks.ts). */
 	private checks?: BackgroundChecks;
 	/**
@@ -83,29 +57,11 @@ export class ClaudeHarnessManager {
 	private readonly local: boolean;
 
 	constructor(options?: { local?: boolean }) {
-		this.cppHipEngine = new CppHipDiagnosticsEngine(this.stateTracker);
 		this.local = options?.local ?? true;
 	}
 
 	setBackgroundChecks(checks: BackgroundChecks | undefined): void {
 		this.checks = checks;
-	}
-
-	/**
-	 * C, C++ and HIP through libclang as a background check (see checks/background-checks.ts), so that an edit does not
-	 * wait for the reparse: a tenth of a second on a warm translation unit, seconds on a large one. It uses this
-	 * manager's engine, which knows the files read and changed: a header is parsed in a source that includes it, with
-	 * the other headers the agent changed. Undefined when the libclang bridge is not there.
-	 */
-	cppChecker(workspaceCwd: string): Checker | undefined {
-		if (!this.cppHipEngine.available()) return undefined;
-		const checker: Checker = {
-			name: "cpp",
-			matches: (path) => isCppOrHipFile(path),
-			unit: (path) => ({ key: `cpp:${path}`, checker, cwd: workspaceCwd, file: path }),
-			run: (unit) => this.cppHipEngine.check(unit.file!, readFileSync(unit.file!, "utf8"), unit.cwd),
-		};
-		return checker;
 	}
 
 	/**
@@ -127,12 +83,7 @@ export class ClaudeHarnessManager {
 			this.checks?.onRead(absolutePath);
 		}
 		if (!this.local) return "";
-		const nestedFiles = this.stateTracker.discoverNestedInstructionsOnRead(
-			absolutePath,
-			workspaceCwd,
-			loadInstructionFileFromDir,
-		);
-		return formatNestedInstructionsReminder(nestedFiles);
+		return formatNestedInstructionsReminder(this.nestedInstructions.discover(absolutePath, workspaceCwd));
 	}
 
 	/**
@@ -179,4 +130,4 @@ export class ClaudeHarnessManager {
 	}
 }
 
-export const defaultClaudeHarnessManager = new ClaudeHarnessManager();
+export const defaultFileTracker = new FileTracker();

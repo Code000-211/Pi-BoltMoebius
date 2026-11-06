@@ -24,7 +24,7 @@ import {
 import { type FileHandle, open, readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { fuzzyFilterPaths, loadFffNativeAddon } from "../harness/fff-search-engine.ts";
+import { fuzzyFilterPaths, loadFffNativeAddon } from "./fff-search.ts";
 
 // --- globs --------------------------------------------------------------------------------------------------------------
 

@@ -4,7 +4,8 @@ import { access as fsAccess, readFile as fsReadFile, stat as fsStat, writeFile a
 import { type Static, Type } from "typebox";
 import { splitBom } from "../../utils/text.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
-import { type ClaudeHarnessManager, defaultClaudeHarnessManager, StaleFileError } from "../harness/index.ts";
+import { StaleFileError } from "../file-tracking/file-state.ts";
+import { defaultFileTracker, type FileTracker } from "../file-tracking/file-tracker.ts";
 import {
 	applyEditsToNormalizedContent,
 	describeClosestText,
@@ -110,8 +111,8 @@ const defaultEditOperations: EditOperations = {
 export interface EditToolOptions {
 	/** Custom operations for file editing. Default: local filesystem */
 	operations?: EditOperations;
-	/** Shared harness manager: read-before-edit tracking, and the background checks after an edit. */
-	harness?: ClaudeHarnessManager;
+	/** The session's file tracker: read-before-edit tracking, and the background checks after an edit. */
+	fileTracker?: FileTracker;
 	/** Enforce that the file was read first and not modified externally since read. */
 	enforceReadBeforeEdit?: boolean;
 	/** Include a compact line-numbered context snippet around the edited lines in the tool result. */
@@ -163,7 +164,7 @@ export function createEditToolDefinition(
 	options?: EditToolOptions,
 ): ToolDefinition<typeof editSchema, EditToolDetails | undefined, EditRenderState> {
 	const ops = options?.operations ?? defaultEditOperations;
-	const harness = options?.harness ?? defaultClaudeHarnessManager;
+	const fileTracker = options?.fileTracker ?? defaultFileTracker;
 	const enforceReadBeforeEdit = options?.enforceReadBeforeEdit ?? false;
 	const includePostEditSnippet = options?.includePostEditSnippet ?? false;
 	return {
@@ -222,14 +223,14 @@ export function createEditToolDefinition(
 				if (enforceReadBeforeEdit) {
 					const beforeStat =
 						ops === defaultEditOperations ? await fsStat(absolutePath).catch(() => undefined) : undefined;
-					if (!harness.stateTracker.hasBeenRead(absolutePath)) {
+					if (!fileTracker.stateTracker.hasBeenRead(absolutePath)) {
 						// Not read in this session, but seen another way (cat or grep in bash, a search): an edit whose every
 						// oldText is there exactly once changes only those places, so the file counts as read now, which also
 						// takes the diagnostics it has before the edit. Otherwise it has to be read first.
 						if (!editsMatchExactlyOnce(normalizedContent, edits)) {
-							harness.assertCanModifyExistingFile(absolutePath, undefined, rawContent);
+							fileTracker.assertCanModifyExistingFile(absolutePath, undefined, rawContent);
 						}
-						readHere = harness.onFileRead(
+						readHere = fileTracker.onFileRead(
 							absolutePath,
 							rawContent,
 							beforeStat?.mtimeMs ?? Date.now(),
@@ -238,7 +239,7 @@ export function createEditToolDefinition(
 						);
 					}
 					try {
-						harness.assertCanModifyExistingFile(absolutePath, beforeStat?.mtimeMs, rawContent);
+						fileTracker.assertCanModifyExistingFile(absolutePath, beforeStat?.mtimeMs, rawContent);
 					} catch (error) {
 						// Changed on disk since it was read (a formatter, the user): an edit whose every oldText is still
 						// there exactly once changes only those places, so it applies without reading the file again.
@@ -270,7 +271,7 @@ export function createEditToolDefinition(
 				const diffResult = generateDiffString(baseContent, newContent);
 				const patch = generateUnifiedPatch(path, baseContent, newContent);
 				const afterStat = await afterStatPromise;
-				const suffix = harness.onFileModified({
+				const suffix = fileTracker.onFileModified({
 					absolutePath,
 					// Track the exact bytes on disk (BOM + original line endings), or the next edit's
 					// read-before-edit content check would always report an external modification.

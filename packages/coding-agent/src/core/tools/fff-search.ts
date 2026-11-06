@@ -1,9 +1,8 @@
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { getNativeAddonPath } from "../../config.ts";
 
-export interface FffNativeBridge {
+interface FffNativeBridge {
 	grepBufferLiteral(
 		buffer: Buffer,
 		needle: string,
@@ -20,18 +19,10 @@ let cachedAddon: FffNativeBridge | null | undefined;
 export function loadFffNativeAddon(): FffNativeBridge | null {
 	if (cachedAddon !== undefined) return cachedAddon;
 	try {
-		const req = createRequire(import.meta.url);
-		const currentDir = path.dirname(fileURLToPath(import.meta.url));
-		const platformArch = `${process.platform}-${process.arch}`;
-		const candidates = [
-			path.resolve(currentDir, "../../../native/fff/prebuilds", platformArch, "fff-bridge.node"),
-			path.resolve(path.dirname(process.execPath), "native/fff/prebuilds", platformArch, "fff-bridge.node"),
-		];
-		for (const candidate of candidates) {
-			if (existsSync(candidate)) {
-				cachedAddon = req(candidate) as FffNativeBridge;
-				return cachedAddon;
-			}
+		const candidate = getNativeAddonPath("fff", "fff-bridge.node");
+		if (existsSync(candidate)) {
+			cachedAddon = createRequire(import.meta.url)(candidate) as FffNativeBridge;
+			return cachedAddon;
 		}
 	} catch {
 		// Fall back cleanly if native addon cannot be loaded
@@ -44,7 +35,7 @@ export function loadFffNativeAddon(): FffNativeBridge | null {
  * High-speed TypeScript fallback for fff-style boundary-aware fuzzy scoring
  * when the C N-API addon is not built.
  */
-export function scoreFuzzyPathFallback(pathStr: string, queryLower: string, qMask = 0): number {
+function scoreFuzzyPathFallback(pathStr: string, queryLower: string, qMask = 0): number {
 	const qLen = queryLower.length;
 	if (qLen === 0) return 1;
 	const pLen = pathStr.length;

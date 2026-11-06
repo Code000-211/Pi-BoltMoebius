@@ -5,14 +5,11 @@ import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import type { ToolResultMessage } from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-	ClaudeHarnessManager,
-	CompileCommandsResolver,
-	fuzzyFilterPaths,
-	sanitizeCompileFlags,
-} from "../src/core/harness/index.ts";
+import { CompileCommandsResolver, sanitizeCompileFlags } from "../src/core/checks/cpp/compile-commands.ts";
+import { FileTracker } from "../src/core/file-tracking/file-tracker.ts";
 import { buildEnvDiffScript, createBashTool } from "../src/core/tools/bash.ts";
 import { createEditTool, createEditToolDefinition } from "../src/core/tools/edit.ts";
+import { fuzzyFilterPaths } from "../src/core/tools/fff-search.ts";
 import { createFindTool } from "../src/core/tools/find.ts";
 import { createLsTool } from "../src/core/tools/ls.ts";
 import { nativeFind, nativeFindDetailed, nativeGrep } from "../src/core/tools/native-search.ts";
@@ -46,10 +43,10 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 	});
 
 	it("blocks an edit of an unread file unless every oldText matches it exactly once, and allows it after read", async () => {
-		const harness = new ClaudeHarnessManager();
-		const readTool = createReadTool(testDir, { harness });
+		const fileTracker = new FileTracker();
+		const readTool = createReadTool(testDir, { fileTracker });
 		const editTool = createEditTool(testDir, {
-			harness,
+			fileTracker,
 			enforceReadBeforeEdit: true,
 			includePostEditSnippet: true,
 		});
@@ -85,10 +82,10 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 	});
 
 	it("blocks editing if the file was modified externally since the last read (mtime staleness)", async () => {
-		const harness = new ClaudeHarnessManager();
-		const readTool = createReadTool(testDir, { harness });
+		const fileTracker = new FileTracker();
+		const readTool = createReadTool(testDir, { fileTracker });
 		const editTool = createEditTool(testDir, {
-			harness,
+			fileTracker,
 			enforceReadBeforeEdit: true,
 		});
 
@@ -111,9 +108,9 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 	});
 
 	it("applies an edit of a file seen only through bash when every oldText matches it exactly once", async () => {
-		const harness = new ClaudeHarnessManager();
-		const editTool = createEditTool(testDir, { harness, enforceReadBeforeEdit: true });
-		const writeTool = createWriteTool(testDir, { harness, enforceReadBeforeEdit: true });
+		const fileTracker = new FileTracker();
+		const editTool = createEditTool(testDir, { fileTracker, enforceReadBeforeEdit: true });
+		const writeTool = createWriteTool(testDir, { fileTracker, enforceReadBeforeEdit: true });
 		const filePath = join(testDir, "seen.ts");
 		writeFileSync(filePath, "const a = 1;\nconst b = 2;\nconst b2 = 2;\n", "utf-8");
 
@@ -126,7 +123,7 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 		);
 		expect(readFileSync(filePath, "utf-8")).toBe("const a = 3;\nconst b = 2;\nconst b2 = 2;\n");
 		// Now it counts as read: the next edit needs no note.
-		expect(harness.stateTracker.hasBeenRead(filePath)).toBe(true);
+		expect(fileTracker.stateTracker.hasBeenRead(filePath)).toBe(true);
 
 		// An oldText that is not there exactly once still asks for a read; write still refuses an unread file.
 		writeFileSync(join(testDir, "other.ts"), "x = 2;\nx = 2;\n", "utf-8");
@@ -142,10 +139,10 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 	});
 
 	it("allows edit and write after a newer modification time with the same content (touch)", async () => {
-		const harness = new ClaudeHarnessManager();
-		const readTool = createReadTool(testDir, { harness });
-		const editTool = createEditTool(testDir, { harness, enforceReadBeforeEdit: true });
-		const writeTool = createWriteTool(testDir, { harness, enforceReadBeforeEdit: true });
+		const fileTracker = new FileTracker();
+		const readTool = createReadTool(testDir, { fileTracker });
+		const editTool = createEditTool(testDir, { fileTracker, enforceReadBeforeEdit: true });
+		const writeTool = createWriteTool(testDir, { fileTracker, enforceReadBeforeEdit: true });
 		const filePath = join(testDir, "touched.cpp");
 		writeFileSync(filePath, "int x = 1;\n", "utf-8");
 		await readTool.execute("read-touch", { path: "touched.cpp" });
@@ -170,9 +167,9 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 	});
 
 	it("applies an edit to a file changed on disk when every oldText still matches exactly once", async () => {
-		const harness = new ClaudeHarnessManager();
-		const readTool = createReadTool(testDir, { harness });
-		const editTool = createEditTool(testDir, { harness, enforceReadBeforeEdit: true });
+		const fileTracker = new FileTracker();
+		const readTool = createReadTool(testDir, { fileTracker });
+		const editTool = createEditTool(testDir, { fileTracker, enforceReadBeforeEdit: true });
 		const filePath = join(testDir, "formatted.cpp");
 		writeFileSync(filePath, "int a=1;\nint b = 2;\n", "utf-8");
 		await readTool.execute("read-fmt", { path: "formatted.cpp" });
@@ -208,9 +205,9 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 	});
 
 	it("allows write on a brand-new file without prior read, but blocks overwriting an unread existing file", async () => {
-		const harness = new ClaudeHarnessManager();
+		const fileTracker = new FileTracker();
 		const writeTool = createWriteTool(testDir, {
-			harness,
+			fileTracker,
 			enforceReadBeforeEdit: true,
 		});
 
@@ -290,20 +287,20 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 	});
 
 	it("maps included headers back to their host .hip translation unit for in-memory overlay reparsing", () => {
-		const harness = new ClaudeHarnessManager();
+		const fileTracker = new FileTracker();
 		const mainHip = join(testDir, "main.hip");
 		const headerCuh = join(testDir, "common.cuh");
 
-		harness.onFileRead(mainHip, '#include "common.cuh"\n__global__ void k() {}\n', Date.now(), testDir);
-		harness.onFileRead(headerCuh, "__device__ int helper() { return 1; }\n", Date.now(), testDir);
+		fileTracker.onFileRead(mainHip, '#include "common.cuh"\n__global__ void k() {}\n', Date.now(), testDir);
+		fileTracker.onFileRead(headerCuh, "__device__ int helper() { return 1; }\n", Date.now(), testDir);
 
-		expect(harness.stateTracker.findHostSourceForHeader(headerCuh)).toBe(mainHip);
+		expect(fileTracker.stateTracker.findHostSourceForHeader(headerCuh)).toBe(mainHip);
 		// Headers that were only read are not overlaid: their tracked text may be stale against the disk
-		expect(harness.stateTracker.getUnsavedHeaderOverlays()).toHaveLength(0);
+		expect(fileTracker.stateTracker.getUnsavedHeaderOverlays()).toHaveLength(0);
 
 		const newHeader = "__device__ int helper() { return 2; }\n";
-		harness.stateTracker.recordFileModifiedByAgent(headerCuh, newHeader, Date.now());
-		const overlays = harness.stateTracker.getUnsavedHeaderOverlays();
+		fileTracker.stateTracker.recordFileModifiedByAgent(headerCuh, newHeader, Date.now());
+		const overlays = fileTracker.stateTracker.getUnsavedHeaderOverlays();
 		expect(overlays).toHaveLength(1);
 		expect(overlays[0].filename).toBe(headerCuh);
 		expect(overlays[0].content).toBe(newHeader);
@@ -402,10 +399,10 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 		});
 		expect(foundFuzzy).toEqual(["src/kernels/flash_attn_v2.hip"]);
 
-		// Reading & editing through ClaudeHarnessManager updates the in-memory grep buffer cache
-		const harness = new ClaudeHarnessManager();
-		const readTool = createReadTool(testDir, { harness });
-		const editTool = createEditTool(testDir, { harness, enforceReadBeforeEdit: true });
+		// Reading & editing through FileTracker updates the in-memory grep buffer cache
+		const fileTracker = new FileTracker();
+		const readTool = createReadTool(testDir, { fileTracker });
+		const editTool = createEditTool(testDir, { fileTracker, enforceReadBeforeEdit: true });
 
 		await readTool.execute("r-frec", { path: "src/kernels/flash_attn_v2.hip" });
 
@@ -512,10 +509,10 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 	});
 
 	it("discovers nested CLAUDE.md and AGENTS.md files on read once per session and checks content staleness", async () => {
-		const harness = new ClaudeHarnessManager();
-		const readTool = createReadTool(testDir, { harness });
+		const fileTracker = new FileTracker();
+		const readTool = createReadTool(testDir, { fileTracker });
 		const editTool = createEditTool(testDir, {
-			harness,
+			fileTracker,
 			enforceReadBeforeEdit: true,
 		});
 
@@ -562,10 +559,10 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 	});
 
 	it("supports Codex-style seek_sequence indentation-tolerant fallback matching in edit", async () => {
-		const harness = new ClaudeHarnessManager();
-		const readTool = createReadTool(testDir, { harness });
+		const fileTracker = new FileTracker();
+		const readTool = createReadTool(testDir, { fileTracker });
 		const editTool = createEditTool(testDir, {
-			harness,
+			fileTracker,
 			enforceReadBeforeEdit: true,
 		});
 
@@ -596,9 +593,9 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 	});
 
 	it("writes lines the edit adds in the file's unit of indentation, not the model's", async () => {
-		const harness = new ClaudeHarnessManager();
-		const readTool = createReadTool(testDir, { harness });
-		const editTool = createEditTool(testDir, { harness, enforceReadBeforeEdit: true });
+		const fileTracker = new FileTracker();
+		const readTool = createReadTool(testDir, { fileTracker });
+		const editTool = createEditTool(testDir, { fileTracker, enforceReadBeforeEdit: true });
 		const edit = async (name: string, file: string, oldText: string, newText: string) => {
 			const filePath = join(testDir, name);
 			writeFileSync(filePath, file, "utf-8");
@@ -629,10 +626,10 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 	});
 
 	it("allows consecutive edits of a CRLF file with a BOM and keeps its bytes intact", async () => {
-		const harness = new ClaudeHarnessManager();
-		const readTool = createReadTool(testDir, { harness });
+		const fileTracker = new FileTracker();
+		const readTool = createReadTool(testDir, { fileTracker });
 		const editTool = createEditTool(testDir, {
-			harness,
+			fileTracker,
 			enforceReadBeforeEdit: true,
 			includePostEditSnippet: true,
 		});
@@ -657,10 +654,10 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 	});
 
 	it("allows editing a file larger than the chunked-read threshold after reading part of it", async () => {
-		const harness = new ClaudeHarnessManager();
-		const readTool = createReadTool(testDir, { harness });
+		const fileTracker = new FileTracker();
+		const readTool = createReadTool(testDir, { fileTracker });
 		const editTool = createEditTool(testDir, {
-			harness,
+			fileTracker,
 			enforceReadBeforeEdit: true,
 		});
 
@@ -675,7 +672,7 @@ describe("Claude Harness (Read-Before-Edit, nested instructions, HIP flags)", ()
 		});
 		expect(getText(res)).toContain("Successfully replaced 1 block(s) in big.txt.");
 		expect(readFileSync(filePath, "utf-8").endsWith("last line\n")).toBe(true);
-		expect(harness.stateTracker.getTrackedState(filePath)?.contentComplete).toBe(true);
+		expect(fileTracker.stateTracker.getTrackedState(filePath)?.contentComplete).toBe(true);
 	});
 
 	it("parses headers that borrow flags from a C compile entry as C", () => {

@@ -3,9 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { BackgroundChecks } from "../src/core/checks/background-checks.ts";
-import { CHECKERS, type Checker, enabledCheckers, onPath, run } from "../src/core/checks/checkers.ts";
-import type { HarnessDiagnostic } from "../src/core/harness/file-state-tracker.ts";
-import { ClaudeHarnessManager } from "../src/core/harness/index.ts";
+import { CHECKERS, type Checker, type Diagnostic, enabledCheckers, onPath, run } from "../src/core/checks/checkers.ts";
+import { cppChecker } from "../src/core/checks/cpp/checker.ts";
+import { FileTracker } from "../src/core/file-tracking/file-tracker.ts";
 
 /** A checker over `*.fake` files whose errors are what `errors` holds when it runs, after `delayMs`. */
 function fakeChecker(errors: Map<string, string[]>, delayMs = 0, runs: string[] = []): Checker {
@@ -17,7 +17,7 @@ function fakeChecker(errors: Map<string, string[]>, delayMs = 0, runs: string[] 
 			runs.push(unit.file!);
 			await new Promise((resolve) => setTimeout(resolve, delayMs));
 			return (errors.get(unit.file!) ?? []).map(
-				(message, i): HarnessDiagnostic => ({
+				(message, i): Diagnostic => ({
 					file: unit.file!,
 					line: i + 1,
 					column: 1,
@@ -113,8 +113,8 @@ describe("background checks", () => {
 
 	it("keeps lint findings for when the run would end, against the state before the first edit, and reports each once", async () => {
 		const reports: string[] = [];
-		const findings = new Map<string, HarnessDiagnostic[]>();
-		const lint = (message: string): HarnessDiagnostic => ({
+		const findings = new Map<string, Diagnostic[]>();
+		const lint = (message: string): Diagnostic => ({
 			file: "/p/a.fake",
 			line: 1,
 			column: 1,
@@ -184,7 +184,7 @@ describe("the checkers, with their tools where installed", () => {
 		rmSync(dir, { recursive: true, force: true });
 	});
 
-	async function errorsOf(file: string, content: string): Promise<HarnessDiagnostic[]> {
+	async function errorsOf(file: string, content: string): Promise<Diagnostic[]> {
 		const path = join(dir, file);
 		mkdirSync(join(path, ".."), { recursive: true });
 		writeFileSync(path, content);
@@ -195,23 +195,23 @@ describe("the checkers, with their tools where installed", () => {
 	}
 
 	it.skipIf(!existsSync(join(__dirname, "..", "native", "libclang", "prebuilds")))(
-		"checks C++ with the harness's libclang engine after the edit, which does not wait for it",
+		"checks C++ with the fileTracker's libclang engine after the edit, which does not wait for it",
 		async () => {
-			const harness = new ClaudeHarnessManager();
+			const fileTracker = new FileTracker();
 			const reports: string[] = [];
 			const checks = new BackgroundChecks({
 				cwd: dir,
 				report: (t) => reports.push(t),
-				checkers: [harness.cppChecker(dir)!],
+				checkers: [cppChecker(fileTracker.cppEngine, dir)!],
 			});
-			harness.setBackgroundChecks(checks);
+			fileTracker.setBackgroundChecks(checks);
 			const path = join(dir, "a.cpp");
 			const before = "int f() { return 1; }\n";
 			writeFileSync(path, before);
-			harness.onFileRead(path, before, statSync(path).mtimeMs, dir);
+			fileTracker.onFileRead(path, before, statSync(path).mtimeMs, dir);
 			const after = 'int f() { return 1; }\nint g() { int x = "s"; return x; }\n';
 			writeFileSync(path, after);
-			harness.onFileModified({ absolutePath: path, newContent: after, newMtimeMs: statSync(path).mtimeMs });
+			fileTracker.onFileModified({ absolutePath: path, newContent: after, newMtimeMs: statSync(path).mtimeMs });
 			expect(checks.busy).toBe(true);
 			await checks.waitForIdle(20_000);
 			expect(reports).toHaveLength(1);
@@ -266,7 +266,7 @@ describe("the checkers, with their tools where installed", () => {
 		},
 	);
 
-	async function lintOf(file: string, content: string, config: Record<string, string>): Promise<HarnessDiagnostic[]> {
+	async function lintOf(file: string, content: string, config: Record<string, string>): Promise<Diagnostic[]> {
 		for (const [name, text] of Object.entries(config)) {
 			mkdirSync(join(dir, name, ".."), { recursive: true });
 			writeFileSync(join(dir, name), text);
@@ -274,7 +274,7 @@ describe("the checkers, with their tools where installed", () => {
 		const path = join(dir, file);
 		mkdirSync(join(path, ".."), { recursive: true });
 		writeFileSync(path, content);
-		const out: HarnessDiagnostic[] = [];
+		const out: Diagnostic[] = [];
 		for (const checker of CHECKERS.filter((c) => c.matches(path))) {
 			const unit = checker.unit(path);
 			if (unit) out.push(...(await checker.run(unit, new AbortController().signal)));

@@ -22,7 +22,7 @@ import {
 } from "../../utils/shell.ts";
 import { type BackgroundJobs, formatJobReport } from "../background-jobs.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
-import type { ClaudeHarnessManager } from "../harness/index.ts";
+import type { FileTracker } from "../file-tracking/file-tracker.ts";
 import { type FileWrite, filesShownByCat, fileWritesInCommand } from "./bash-file-writes.ts";
 import { selfKillPattern, selfKillRefusal } from "./bash-self-kill.ts";
 import { notifySearchExternalChange } from "./native-search.ts";
@@ -280,20 +280,20 @@ function changedLineRange(before: string, after: string): [number, number] {
 }
 
 /**
- * For each watched file the command changed, the lines that changed. The harness takes the new content as read (an
+ * For each watched file the command changed, the lines that changed. The file tracker takes the new content as read (an
  * edit after it needs no read) and checks it in the background, as after an edit. Empty when nothing changed.
  */
-async function checkChangedFiles(watched: WatchedFile[], harness: ClaudeHarnessManager | undefined): Promise<string> {
+async function checkChangedFiles(watched: WatchedFile[], fileTracker: FileTracker | undefined): Promise<string> {
 	let report = "";
 	for (const file of watched) {
 		const after = await readFileAsync(file.path, "utf-8").catch(() => undefined);
 		if (after === undefined || after === file.before) continue;
 		const [first, last] = changedLineRange(file.before ?? "", after);
 		report += `\n\n${file.target} changed${first === last ? ` at line ${first}` : ` in lines ${first}-${last}`}.`;
-		if (!harness) continue;
+		if (!fileTracker) continue;
 		try {
 			const info = await statAsync(file.path);
-			harness.onFileModified({ absolutePath: file.path, newContent: after, newMtimeMs: info.mtimeMs });
+			fileTracker.onFileModified({ absolutePath: file.path, newContent: after, newMtimeMs: info.mtimeMs });
 		} catch {}
 	}
 	return report;
@@ -722,7 +722,7 @@ export interface BashToolOptions {
 	 */
 	editToolActive?: () => boolean;
 	/** Given, files a command printed whole with `cat` count as read for read-before-edit, as after the read tool. */
-	harness?: ClaudeHarnessManager;
+	fileTracker?: FileTracker;
 }
 
 export type BashRenderState = {
@@ -1052,7 +1052,7 @@ export function createShellToolDefinition(
 					exit_code: exitCode,
 					wall_time_seconds: wallTimeSeconds,
 				};
-				const changes = await checkChangedFiles(watched, options?.harness);
+				const changes = await checkChangedFiles(watched, options?.fileTracker);
 				if (exitCode !== 0) {
 					return {
 						content: [
@@ -1063,7 +1063,7 @@ export function createShellToolDefinition(
 						isError: true,
 					};
 				}
-				if (options?.harness && !snapshot.truncation.truncated) {
+				if (options?.fileTracker && !snapshot.truncation.truncated) {
 					// The model saw these files whole: editing or rewriting them needs no extra read.
 					const shown = filesShownByCat(command);
 					const base = resolvePath(spawnContext.cwd, expandHome(shown.dir));
@@ -1071,7 +1071,7 @@ export function createShellToolDefinition(
 						const path = resolvePath(base, expandHome(file));
 						try {
 							const [content, info] = await Promise.all([readFileAsync(path, "utf-8"), statAsync(path)]);
-							options.harness.onFileRead(path, content, info.mtimeMs, spawnContext.cwd);
+							options.fileTracker.onFileRead(path, content, info.mtimeMs, spawnContext.cwd);
 						} catch {}
 					}
 				}

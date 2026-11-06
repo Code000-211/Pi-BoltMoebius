@@ -74,6 +74,7 @@ import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
 import { BackgroundChecks } from "./checks/background-checks.ts";
 import { CHECKERS, enabledCheckers } from "./checks/checkers.ts";
+import { cppChecker } from "./checks/cpp/checker.ts";
 import { compactionFeatures } from "./compaction/features.ts";
 import {
 	type CompactionPreparation,
@@ -130,7 +131,7 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
-import { ClaudeHarnessManager } from "./harness/index.ts";
+import { FileTracker } from "./file-tracking/file-tracker.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
@@ -617,7 +618,7 @@ export class AgentSession {
 
 	private _modelRuntime: ModelRuntime;
 	private _cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed">;
-	private _claudeHarness = new ClaudeHarnessManager();
+	private _fileTracker = new FileTracker();
 	/**
 	 * Checks after an edit in the background (checks/background-checks.ts): new errors come as a message before the
 	 * next request, and a run waits for those still running before it ends (see _waitForChecks).
@@ -634,7 +635,7 @@ export class AgentSession {
 				/** `target.dir`, resolved on the host. */
 				dir: string;
 				/** Read-before-edit for the host's files, apart from this machine's; no diagnostics there. */
-				harness: ClaudeHarnessManager;
+				fileTracker: FileTracker;
 				tools: Map<string, ToolDefinition>;
 				/** Local search tools turned off while working there, turned on again after. */
 				pausedTools: string[];
@@ -672,8 +673,8 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
-		// C, C++ and HIP through the harness's libclang engine, where its bridge is (see ClaudeHarnessManager.cppChecker).
-		const cpp = this._claudeHarness.cppChecker(this._cwd);
+		// C, C++ and HIP through the file tracker's libclang engine, where its bridge is (see checks/cpp/checker.ts).
+		const cpp = cppChecker(this._fileTracker.cppEngine, this._cwd);
 		const checks = new BackgroundChecks({
 			cwd: this._cwd,
 			checkers: enabledCheckers(undefined, cpp ? [...CHECKERS, cpp] : CHECKERS),
@@ -686,7 +687,7 @@ export class AgentSession {
 		});
 		if (checks.enabled) {
 			this._checks = checks;
-			this._claudeHarness.setBackgroundChecks(checks);
+			this._fileTracker.setBackgroundChecks(checks);
 		}
 		this._modelRuntime = config.modelRuntime;
 		this._cacheWarmer = config.cacheWarmer;
@@ -2846,7 +2847,7 @@ export class AgentSession {
 				else ssh.close();
 				throw error;
 			}
-			const harness = new ClaudeHarnessManager({ local: false });
+			const fileTracker = new FileTracker({ local: false });
 			const bashOptions = {
 				operations: createRemoteBashOperations(ssh, () => dir),
 				backgroundJobs: this.backgroundJobs,
@@ -2858,7 +2859,7 @@ export class AgentSession {
 					"read",
 					createReadToolDefinition(dir, {
 						operations: createRemoteReadOperations(ssh),
-						harness,
+						fileTracker,
 						autoResizeImages: this.settingsManager.getImageAutoResize(),
 					}) as ToolDefinition,
 				],
@@ -2866,7 +2867,7 @@ export class AgentSession {
 					"edit",
 					createEditToolDefinition(dir, {
 						operations: createRemoteEditOperations(ssh),
-						harness,
+						fileTracker,
 						enforceReadBeforeEdit: true,
 						includePostEditSnippet: true,
 					}) as ToolDefinition,
@@ -2875,13 +2876,13 @@ export class AgentSession {
 					"write",
 					createWriteToolDefinition(dir, {
 						operations: createRemoteWriteOperations(ssh),
-						harness,
+						fileTracker,
 						enforceReadBeforeEdit: true,
 					}) as ToolDefinition,
 				],
 				["bash", createBashToolDefinition(dir, bashOptions) as ToolDefinition],
 			]);
-			next = { target, ssh, dir, harness, tools, pausedTools: this._remote?.pausedTools ?? [] };
+			next = { target, ssh, dir, fileTracker, tools, pausedTools: this._remote?.pausedTools ?? [] };
 		}
 		const previous = this._remote;
 		this._remote = next;
@@ -4549,19 +4550,19 @@ export class AgentSession {
 					]),
 				)
 			: createAllToolDefinitions(this._cwd, {
-					read: { autoResizeImages, harness: this._claudeHarness },
+					read: { autoResizeImages, fileTracker: this._fileTracker },
 					edit: {
-						harness: this._claudeHarness,
+						fileTracker: this._fileTracker,
 						enforceReadBeforeEdit: true,
 						includePostEditSnippet: true,
 					},
-					write: { harness: this._claudeHarness, enforceReadBeforeEdit: true },
+					write: { fileTracker: this._fileTracker, enforceReadBeforeEdit: true },
 					bash: {
 						commandPrefix: shellCommandPrefix,
 						shellPath,
 						backgroundJobs: this.backgroundJobs,
 						editToolActive: () => this.agent.state.tools.some((tool) => tool.name === "edit"),
-						harness: this._claudeHarness,
+						fileTracker: this._fileTracker,
 					},
 					wait: { backgroundJobs: this.backgroundJobs },
 				});

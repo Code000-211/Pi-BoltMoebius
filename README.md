@@ -453,7 +453,7 @@ Pi-Lightspeed's own tests, in `packages/coding-agent` unless noted:
 
 - `test/claude-harness.test.ts`: read before edit, nested instruction files, compile flags, the search caches, the
   bash fast paths and the edit fallback.
-- `test/cpp-hip-engine.test.ts`: against real libclang (skipped when the bridge is not built).
+- `test/libclang.test.ts`: against real libclang (skipped when the bridge is not built).
 - `test/background-jobs.test.ts`, `test/suite/agent-session-bash-background.test.ts`, `test/job-hub.test.ts`: jobs,
   their reports and wake-ups, `wait`, the sleep guard and the hub.
 - `test/bash-file-writes.test.ts`: which commands count as changing files, and the bash tool refusing them.

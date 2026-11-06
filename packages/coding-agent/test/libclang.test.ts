@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { CppHipDiagnosticsEngine, FileStateTracker } from "../src/core/harness/index.ts";
+import { LibclangEngine } from "../src/core/checks/cpp/libclang.ts";
+import { FileStateTracker } from "../src/core/file-tracking/file-state.ts";
 
 interface Addon {
 	initLibclang(customPath?: string): boolean;
@@ -104,7 +105,7 @@ describe.skipIf(!addon)("libclang bridge and C++ engine (real libclang)", () => 
 			]),
 		);
 		const tracker = new FileStateTracker();
-		const engine = new CppHipDiagnosticsEngine(tracker);
+		const engine = new LibclangEngine(tracker);
 		for (const file of [source, header, unrelated]) {
 			const text = readFileSync(file, "utf-8");
 			tracker.recordFileRead(file, text, Date.now());

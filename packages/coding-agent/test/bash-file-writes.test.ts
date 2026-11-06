@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { ClaudeHarnessManager } from "../src/core/harness/index.ts";
+import { FileTracker } from "../src/core/file-tracking/file-tracker.ts";
 import { createBashTool } from "../src/core/tools/bash.ts";
 import { filesShownByCat, fileWritesInCommand } from "../src/core/tools/bash-file-writes.ts";
 
@@ -76,14 +76,14 @@ describe("commands that change files as edit and write would", () => {
 			writeFileSync(join(dir, "a", "b", "x"), "nested\n");
 			writeFileSync(join(dir, "b", "x"), "top\n");
 			writeFileSync(join(dir, "h.txt"), "home\n");
-			const harness = new ClaudeHarnessManager();
-			const bash = createBashTool(dir, { harness });
+			const fileTracker = new FileTracker();
+			const bash = createBashTool(dir, { fileTracker });
 			await bash.execute("c1", { command: "cd a && cd b && cat x" });
-			expect(harness.stateTracker.hasBeenRead(join(dir, "a", "b", "x"))).toBe(true);
-			expect(harness.stateTracker.hasBeenRead(join(dir, "b", "x"))).toBe(false);
+			expect(fileTracker.stateTracker.hasBeenRead(join(dir, "a", "b", "x"))).toBe(true);
+			expect(fileTracker.stateTracker.hasBeenRead(join(dir, "b", "x"))).toBe(false);
 			process.env.HOME = dir;
 			await bash.execute("c2", { command: "cat ~/h.txt" });
-			expect(harness.stateTracker.hasBeenRead(join(dir, "h.txt"))).toBe(true);
+			expect(fileTracker.stateTracker.hasBeenRead(join(dir, "h.txt"))).toBe(true);
 		} finally {
 			process.env.HOME = home;
 			rmSync(dir, { recursive: true, force: true });

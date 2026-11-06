@@ -1,9 +1,11 @@
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, join, normalize, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { dirname, join, resolve } from "node:path";
+import { getNativeAddonPath } from "../../../config.ts";
+import { type FileStateTracker, pathKey } from "../../file-tracking/file-state.ts";
+import type { Diagnostic } from "../checkers.ts";
 import { CompileCommandsResolver } from "./compile-commands.ts";
-import { type FileStateTracker, type HarnessDiagnostic, isCppOrHipHeader } from "./file-state-tracker.ts";
+import { isCppOrHipHeader } from "./files.ts";
 
 interface NativeLibclangAddon {
 	initLibclang(customPath?: string): boolean;
@@ -23,34 +25,15 @@ interface RawClangDiagnostic {
 	code?: string;
 }
 
-const moduleRequire = createRequire(import.meta.url);
-
-function normalizeFileCompare(p: string): string {
-	const norm = normalize(resolve(p));
-	return process.platform === "win32" ? norm.toLowerCase() : norm;
-}
-
 function tryLoadNativeLibclangAddon(): NativeLibclangAddon | null {
-	const platformArch = `${process.platform}-${process.arch}`;
-	const currentDir = dirname(fileURLToPath(import.meta.url));
-	const candidates = [
-		join(currentDir, "..", "..", "..", "native", "libclang", "prebuilds", platformArch, "libclang-bridge.node"),
-		join(dirname(process.execPath), "native", "libclang", "prebuilds", platformArch, "libclang-bridge.node"),
-		join(dirname(process.execPath), "libclang-bridge.node"),
-	];
-
-	for (const candidate of candidates) {
-		if (!existsSync(candidate)) continue;
-		try {
-			const addon = moduleRequire(candidate) as NativeLibclangAddon;
-			if (addon && typeof addon.initLibclang === "function" && addon.initLibclang()) {
-				return addon;
-			}
-		} catch {
-			// Ignore and try next candidate or fallback
-		}
+	const candidate = getNativeAddonPath("libclang", "libclang-bridge.node");
+	if (!existsSync(candidate)) return null;
+	try {
+		const addon = createRequire(import.meta.url)(candidate) as NativeLibclangAddon;
+		return typeof addon?.initLibclang === "function" && addon.initLibclang() ? addon : null;
+	} catch {
+		return null;
 	}
-	return null;
 }
 
 /** The folders `-I`, `-iquote` and `-isystem` name in compiler flags, absolute (relative ones from the working directory). */
@@ -70,7 +53,7 @@ function includeDirs(flags: string[], baseDir: string): string[] {
 	return dirs;
 }
 
-export class CppHipDiagnosticsEngine {
+export class LibclangEngine {
 	private nativeAddon: NativeLibclangAddon | null | undefined = undefined;
 	private readonly compileCommands = new CompileCommandsResolver();
 	private readonly stateTracker: FileStateTracker;
@@ -102,14 +85,12 @@ export class CppHipDiagnosticsEngine {
 			source && this.stateTracker.getTrackedState(source)?.contentComplete ? source : undefined;
 		const direct = complete(this.stateTracker.findHostSourceForHeader(resolvedTarget));
 		if (direct) return direct;
-		const targetKey = normalizeFileCompare(resolvedTarget);
+		const targetKey = pathKey(resolvedTarget);
 		for (const { source, include } of this.stateTracker.findSourcesIncludingByPath(resolvedTarget)) {
 			const content = complete(source) && this.stateTracker.getTrackedState(source)?.content;
 			if (!content) continue;
 			const flags = this.compileCommands.getFlagsForFile(source, workspaceCwd, content);
-			if (
-				includeDirs(flags, dirname(source)).some((dir) => normalizeFileCompare(join(dir, include)) === targetKey)
-			) {
+			if (includeDirs(flags, dirname(source)).some((dir) => pathKey(join(dir, include)) === targetKey)) {
 				return source;
 			}
 		}
@@ -121,13 +102,13 @@ export class CppHipDiagnosticsEngine {
 	 * unit with its text as an unsaved file; the other headers the agent changed come along the same way. Throws when the
 	 * parse fails, so a background check keeps its baseline.
 	 */
-	async check(absolutePath: string, content: string, workspaceCwd: string): Promise<HarnessDiagnostic[]> {
+	async check(absolutePath: string, content: string, workspaceCwd: string): Promise<Diagnostic[]> {
 		const addon = this.getAddon();
 		if (!addon) throw new Error("The libclang bridge is not available");
 		const resolvedTarget = resolve(workspaceCwd, absolutePath);
-		const targetKey = normalizeFileCompare(resolvedTarget);
+		const targetKey = pathKey(resolvedTarget);
 		const tuFilePath = this.resolveTranslationUnit(resolvedTarget, workspaceCwd);
-		const tuKey = normalizeFileCompare(tuFilePath);
+		const tuKey = pathKey(tuFilePath);
 		const unsavedFiles = [
 			{ filename: resolvedTarget, content },
 			...this.stateTracker.getUnsavedHeaderOverlays(resolvedTarget),
@@ -144,10 +125,10 @@ export class CppHipDiagnosticsEngine {
 	 * Keep only diagnostics located in the target file. For a header parsed inside its host TU,
 	 * diagnostics in the host source refer to the host's lines and belong to the host's own baseline.
 	 */
-	private filterRelevantDiagnostics(rawDiags: RawClangDiagnostic[], targetKey: string): HarnessDiagnostic[] {
-		const results: HarnessDiagnostic[] = [];
+	private filterRelevantDiagnostics(rawDiags: RawClangDiagnostic[], targetKey: string): Diagnostic[] {
+		const results: Diagnostic[] = [];
 		for (const d of rawDiags) {
-			const diagFileKey = d.file ? normalizeFileCompare(d.file) : targetKey;
+			const diagFileKey = d.file ? pathKey(d.file) : targetKey;
 			if (diagFileKey !== targetKey) {
 				continue;
 			}

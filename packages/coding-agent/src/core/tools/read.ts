@@ -14,7 +14,7 @@ import { markProcessedImageBlock, processImage } from "../../utils/image-process
 import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
 import { detachSharedString } from "../../utils/text.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
-import { type ClaudeHarnessManager, defaultClaudeHarnessManager } from "../harness/index.ts";
+import { defaultFileTracker, type FileTracker } from "../file-tracking/file-tracker.ts";
 import { resolveReadPathAsync } from "./path-utils.ts";
 import { readRenderers } from "./renderers/read.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -83,8 +83,8 @@ export interface ReadToolOptions {
 	resizeOptions?: ModelImageResizeOptions;
 	/** Custom operations for file reading. Default: local filesystem */
 	operations?: ReadOperations;
-	/** Shared harness manager: read-before-edit tracking, and the baseline of the background checks. */
-	harness?: ClaudeHarnessManager;
+	/** The session's file tracker: read-before-edit tracking, and the baseline of the background checks. */
+	fileTracker?: FileTracker;
 }
 
 /** The image block and its note, or the text for text files and images that could not be processed. */
@@ -272,7 +272,7 @@ export function createReadToolDefinition(
 	const autoResizeImages = options?.autoResizeImages ?? true;
 	const fallbackResizeOptions = options?.resizeOptions;
 	const ops = options?.operations ?? defaultReadOperations;
-	const harness = options?.harness ?? defaultClaudeHarnessManager;
+	const fileTracker = options?.fileTracker ?? defaultFileTracker;
 	return {
 		name: "read",
 		label: "read",
@@ -352,7 +352,7 @@ export function createReadToolDefinition(
 								const mtimeMs = fileStat?.mtimeMs ?? Date.now();
 								let readContent = "";
 								let readBuffer: Buffer | undefined;
-								// The chunked path only decodes the selected lines, so the harness must not
+								// The chunked path only decodes the selected lines, so the tracker must not
 								// treat its text as the whole file (content checks, check baselines).
 								let readContentComplete = true;
 								if (size >= CHUNKED_READ_MIN_BYTES) {
@@ -405,7 +405,7 @@ export function createReadToolDefinition(
 										return Buffer.byteLength(firstLine, "utf-8");
 									};
 								}
-								const lateReminder = harness.onFileRead(
+								const lateReminder = fileTracker.onFileRead(
 									absolutePath,
 									readContent,
 									mtimeMs,
