@@ -231,16 +231,16 @@ const EARLY_TOOL_NAMES: ReadonlySet<string> = new Set(PIBOLT ? ["read", "ls", "g
  * extension's handler waits only for MCP servers that the called tool reaches (MCP tools, codemode, tool_search); ACP
  * mode's blocks only tools that read-only mode does not keep, and it keeps these.
  */
+const EARLY_TOOL_CALL_PASSTHROUGH_EXTENSIONS: ReadonlySet<string> = new Set([
+	`${BUILTIN_PATH_PREFIX}mcp`,
+	`${BUILTIN_PATH_PREFIX}acp`,
+]);
+
 /**
  * The same for early bash calls: only MCP's handler, which waits only for the MCP servers a call reaches. ACP's read-only
  * mode blocks bash, so its handler must see a bash call before it runs.
  */
 const EARLY_BASH_TOOL_CALL_PASSTHROUGH_EXTENSIONS: ReadonlySet<string> = new Set([`${BUILTIN_PATH_PREFIX}mcp`]);
-
-const EARLY_TOOL_CALL_PASSTHROUGH_EXTENSIONS: ReadonlySet<string> = new Set([
-	`${BUILTIN_PATH_PREFIX}mcp`,
-	`${BUILTIN_PATH_PREFIX}acp`,
-]);
 
 /** Tool execution events of calls a tool made through `ctx.executeTool()` carry `parentToolCallId`. */
 type WithParentToolCallId<E> = E extends {
@@ -581,6 +581,8 @@ export class AgentSession {
 	);
 	/** The machine read, edit, write and bash work on over ssh, when not this one (see setRemote). */
 	private _remote: RemoteWorkspace | undefined;
+	/** Whether the edit tool is there: bash then treats commands that change files as edit would (bash-file-writes.ts). */
+	private readonly _editToolActive = () => this.agent.state.tools.some((tool) => tool.name === "edit");
 	/** Local search tools turned off while working on the remote machine, turned on again after. */
 	private _remotePausedTools: string[] = [];
 	/** Why the remote machine the session was working on could not be reached again when it was bound, if it could not. */
@@ -2718,7 +2720,7 @@ export class AgentSession {
 					askSecret: this._askSecret,
 					current: previous,
 					backgroundJobs: this.backgroundJobs,
-					editToolActive: () => this.agent.state.tools.some((tool) => tool.name === "edit"),
+					editToolActive: this._editToolActive,
 					autoResizeImages: this.settingsManager.getImageAutoResize(),
 				})
 			: undefined;
@@ -4256,7 +4258,7 @@ export class AgentSession {
 						commandPrefix: shellCommandPrefix,
 						shellPath,
 						backgroundJobs: this.backgroundJobs,
-						editToolActive: () => this.agent.state.tools.some((tool) => tool.name === "edit"),
+						editToolActive: this._editToolActive,
 						fileTracker: this._fileTracker,
 					},
 					wait: { backgroundJobs: this.backgroundJobs },
