@@ -76,7 +76,7 @@ describe("commands that change files as edit and write would", () => {
 			writeFileSync(join(dir, "a", "b", "x"), "nested\n");
 			writeFileSync(join(dir, "b", "x"), "top\n");
 			writeFileSync(join(dir, "h.txt"), "home\n");
-			const harness = new ClaudeHarnessManager({ enableDiagnostics: false });
+			const harness = new ClaudeHarnessManager();
 			const bash = createBashTool(dir, { harness });
 			await bash.execute("c1", { command: "cd a && cd b && cat x" });
 			expect(harness.stateTracker.hasBeenRead(join(dir, "a", "b", "x"))).toBe(true);

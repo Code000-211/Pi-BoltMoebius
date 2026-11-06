@@ -1,21 +1,11 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { join, normalize, resolve } from "node:path";
+import { join } from "node:path";
 import { stripBom } from "../../utils/text.ts";
 import type { BackgroundChecks } from "../checks/background-checks.ts";
 import type { Checker } from "../checks/checkers.ts";
 import { notifySearchFileTouched } from "../tools/native-search.ts";
 import { CppHipDiagnosticsEngine } from "./cpp-hip-engine.ts";
-import {
-	type DiagnosticsResult,
-	FileStateTracker,
-	type HarnessDiagnostic,
-	isCppOrHipFile,
-} from "./file-state-tracker.ts";
-
-function normalizeWarmupKey(filePath: string): string {
-	const norm = normalize(resolve(filePath));
-	return process.platform === "win32" ? norm.toLowerCase() : norm;
-}
+import { FileStateTracker, isCppOrHipFile } from "./file-state-tracker.ts";
 
 const NESTED_INSTRUCTION_CANDIDATES = ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
 
@@ -44,41 +34,6 @@ export function formatNestedInstructionsReminder(files: Array<{ path: string; co
 	if (files.length === 0) return "";
 	const frames = files.map((f) => `Contents of ${f.path}:\n\n${f.content.trimEnd()}`);
 	return `\n\n<system-reminder>\n${frames.join("\n\n")}\n</system-reminder>`;
-}
-
-export type CustomDiagnosticsProvider = (
-	absolutePath: string,
-	content: string,
-	workspaceCwd: string,
-	isWarmup: boolean,
-) => Promise<HarnessDiagnostic[]> | HarnessDiagnostic[];
-
-export interface ClaudeHarnessOptions {
-	/** Enforce that existing files must be read before edit/write and not modified externally. */
-	enforceReadBeforeEdit?: boolean;
-	/** Append a compact line-numbered context snippet around the edited region. */
-	includePostEditSnippet?: boolean;
-	/** Enable C++/HIP (libclang) automatic diagnostics during an edit. Default: true */
-	enableDiagnostics?: boolean;
-	/** Optional custom diagnostics provider (used for testing or custom toolchains). */
-	customProvider?: CustomDiagnosticsProvider;
-}
-
-/**
- * Extract 1-indexed line `targetLine` without splitting the whole file into an array of strings.
- */
-function extractSingleLine(text: string, targetLine: number): string | undefined {
-	if (targetLine < 1 || !text) return undefined;
-	let currentLine = 1;
-	let lineStart = 0;
-	while (currentLine < targetLine) {
-		const nl = text.indexOf("\n", lineStart);
-		if (nl === -1) return undefined;
-		lineStart = nl + 1;
-		currentLine++;
-	}
-	const lineEnd = text.indexOf("\n", lineStart);
-	return lineEnd === -1 ? text.slice(lineStart) : text.slice(lineStart, lineEnd);
 }
 
 /**
@@ -116,98 +71,47 @@ export function formatPostEditSnippet(
 	return `\n\nHere is a snippet of the edited file around line ${firstChangedLine}:\n${snippetLines.join("\n")}`;
 }
 
-/**
- * Format newly introduced diagnostics into the `<new-diagnostics>` XML block Claude expects.
- */
-export function formatNewDiagnosticsBlock(
-	displayPath: string,
-	fileContent: string | undefined,
-	diagnostics: HarnessDiagnostic[],
-): string {
-	if (diagnostics.length === 0) return "";
-	const formattedItems: string[] = [];
-
-	// Cap at 15 diagnostics so a cascading syntax error never floods the context window
-	const capped = diagnostics.slice(0, 15);
-	for (const d of capped) {
-		const sevLabel = d.severity === "error" ? "Error" : "Warning";
-		const codePart = d.code ? ` (${d.code})` : "";
-		let entry = `  Line ${d.line}, Col ${d.column} [${sevLabel}]${codePart}: ${d.message}`;
-		const srcLine = fileContent ? extractSingleLine(fileContent, d.line) : undefined;
-		if (srcLine !== undefined && srcLine.trim().length > 0 && srcLine.length <= 160) {
-			entry += `\n    ${d.line} | ${srcLine}`;
-		}
-		formattedItems.push(entry);
-	}
-
-	if (diagnostics.length > capped.length) {
-		formattedItems.push(`  ... and ${diagnostics.length - capped.length} more diagnostic(s).`);
-	}
-
-	return `\n\n<new-diagnostics>\nThe following new diagnostic issues were introduced by your edit in ${displayPath}:\n${formattedItems.join("\n")}\n</new-diagnostics>`;
-}
-
 export class ClaudeHarnessManager {
 	readonly stateTracker = new FileStateTracker();
 	readonly cppHipEngine: CppHipDiagnosticsEngine;
-	private customProvider?: CustomDiagnosticsProvider;
-	/** The checks other languages get in the background after an edit (see checks/background-checks.ts). */
+	/** The checks after an edit, in the background (see checks/background-checks.ts). */
 	private checks?: BackgroundChecks;
-	private defaultEnableDiagnostics: boolean;
-	private inflightWarmups = new Map<string, Promise<void>>();
-	/** C, C++ and HIP files are checked in the background ({@link cppChecker}), not during the edit. */
-	private cppInBackground = false;
 	/**
 	 * Whether the files are on this machine. Those on a remote machine stay out of the search caches here, and get no
 	 * nested AGENTS.md files: both would come from this machine's files at the same paths.
 	 */
 	private readonly local: boolean;
 
-	constructor(options?: { customProvider?: CustomDiagnosticsProvider; enableDiagnostics?: boolean; local?: boolean }) {
+	constructor(options?: { local?: boolean }) {
 		this.cppHipEngine = new CppHipDiagnosticsEngine(this.stateTracker);
-		this.customProvider = options?.customProvider;
-		this.defaultEnableDiagnostics = options?.enableDiagnostics ?? true;
 		this.local = options?.local ?? true;
-	}
-
-	setCustomProvider(provider: CustomDiagnosticsProvider | undefined): void {
-		this.customProvider = provider;
 	}
 
 	setBackgroundChecks(checks: BackgroundChecks | undefined): void {
 		this.checks = checks;
-		this.cppInBackground = checks?.runs("cpp") ?? false;
 	}
 
 	/**
 	 * C, C++ and HIP through libclang as a background check (see checks/background-checks.ts), so that an edit does not
 	 * wait for the reparse: a tenth of a second on a warm translation unit, seconds on a large one. It uses this
 	 * manager's engine, which knows the files read and changed: a header is parsed in a source that includes it, with
-	 * the other headers the agent changed.
+	 * the other headers the agent changed. Undefined when the libclang bridge is not there.
 	 */
-	cppChecker(workspaceCwd: string): Checker {
+	cppChecker(workspaceCwd: string): Checker | undefined {
+		if (!this.cppHipEngine.available()) return undefined;
 		const checker: Checker = {
 			name: "cpp",
 			matches: (path) => isCppOrHipFile(path),
 			unit: (path) => ({ key: `cpp:${path}`, checker, cwd: workspaceCwd, file: path }),
-			run: async (unit) => {
-				const file = unit.file!;
-				return (await this.cppHipEngine.checkEditedFile(file, readFileSync(file, "utf8"), unit.cwd)).diagnostics;
-			},
+			run: (unit) => this.cppHipEngine.check(unit.file!, readFileSync(unit.file!, "utf8"), unit.cwd),
 		};
 		return checker;
 	}
 
-	dispose(): void {
-		this.cppHipEngine.dispose();
-		this.inflightWarmups.clear();
-	}
-
 	/**
-	 * Called by `read.ts` as soon as a file is read.
-	 * Records the file's mtime & content, starts the background libclang warmup and the file's background check
-	 * (its baseline), and returns the nested instruction files found on the way.
-	 * Pass `contentComplete: false` when `content` is only a prefix of a large file.
+	 * Called by `read.ts` as soon as a file is read: records the file's mtime and content, starts its background check
+	 * (its baseline), and returns the nested instruction files found on the way. Pass `contentComplete: false` when
+	 * `content` is only a prefix of a large file.
 	 */
 	onFileRead(
 		absolutePath: string,
@@ -222,22 +126,6 @@ export class ClaudeHarnessManager {
 			if (this.local) notifySearchFileTouched(absolutePath, rawBuffer ?? content, mtimeMs);
 			this.checks?.onRead(absolutePath);
 		}
-
-		// Fire-and-forget pre-warming on background worker / LSP so `read` returns in 0ms!
-		// A prefix of a large file would only produce bogus baseline diagnostics, so skip it.
-		if (
-			contentComplete &&
-			this.defaultEnableDiagnostics &&
-			(this.customProvider !== undefined || isCppOrHipFile(absolutePath))
-		) {
-			const key = normalizeWarmupKey(absolutePath);
-			const p: Promise<void> = this.runWarmupInBackground(absolutePath, content, workspaceCwd).finally(() => {
-				// A newer read may have replaced this warmup; only remove our own entry.
-				if (this.inflightWarmups.get(key) === p) this.inflightWarmups.delete(key);
-			});
-			this.inflightWarmups.set(key, p);
-		}
-
 		if (!this.local) return "";
 		const nestedFiles = this.stateTracker.discoverNestedInstructionsOnRead(
 			absolutePath,
@@ -259,109 +147,35 @@ export class ClaudeHarnessManager {
 	}
 
 	/**
-	 * Called by `edit.ts` / `write.ts` after writing the new content.
-	 * Runs fast in-memory reparse, diffs against baseline diagnostics, updates tracked state,
-	 * and returns the formatted snippet + `<new-diagnostics>` suffix.
+	 * Called by `edit.ts` / `write.ts` (and bash, for a file a command changed) after writing the new content: updates
+	 * the tracked state, starts the file's background check, and returns the snippet to append when asked for.
 	 *
-	 * `newContent` must be exactly what was written to disk (BOM and line endings included) so the
-	 * next read-before-edit content check matches. `displayContent` is the LF-normalized text used
-	 * for the snippet and diagnostic source lines; it defaults to `newContent`.
+	 * `newContent` must be exactly what was written to disk (BOM and line endings included) so the next read-before-edit
+	 * content check matches. `displayContent` is the LF-normalized text used for the snippet; it defaults to
+	 * `newContent`.
 	 */
-	async onFileModified(params: {
+	onFileModified(params: {
 		absolutePath: string;
-		displayPath: string;
 		newContent: string;
 		displayContent?: string;
 		newMtimeMs: number;
-		workspaceCwd: string;
 		firstChangedLine?: number;
 		includePostEditSnippet?: boolean;
-		enableDiagnostics?: boolean;
-	}): Promise<{ suffix: string; newDiagnostics: HarnessDiagnostic[] }> {
+	}): string {
 		const {
 			absolutePath,
-			displayPath,
 			newContent,
 			displayContent = newContent,
 			newMtimeMs,
-			workspaceCwd,
 			firstChangedLine,
 			includePostEditSnippet = false,
-			enableDiagnostics = this.defaultEnableDiagnostics,
 		} = params;
-
-		let result: DiagnosticsResult | undefined;
-		let newDiagnostics: HarnessDiagnostic[] = [];
-
-		// Fast path: only enter the async diagnostics pipeline for supported languages or custom providers
-		const shouldRunDiagnostics =
-			enableDiagnostics &&
-			(this.customProvider !== undefined || (isCppOrHipFile(absolutePath) && !this.cppInBackground));
-
-		if (shouldRunDiagnostics) {
-			const pendingWarmup = this.inflightWarmups.get(normalizeWarmupKey(absolutePath));
-			if (pendingWarmup) {
-				await pendingWarmup;
-			}
-			try {
-				result = await this.collectDiagnostics(absolutePath, newContent, workspaceCwd, false);
-				newDiagnostics = this.stateTracker.diffAgainstBaseline(absolutePath, result.diagnostics);
-			} catch {
-				// A failing diagnostics provider must never fail the edit/write itself
-				result = undefined;
-			}
-		}
-
-		this.stateTracker.recordFileModifiedByAgent(
-			absolutePath,
-			newContent,
-			newMtimeMs,
-			result?.diagnostics,
-			result?.complete === false ? "merge" : "replace",
-		);
+		this.stateTracker.recordFileModifiedByAgent(absolutePath, newContent, newMtimeMs);
 		if (this.local) notifySearchFileTouched(absolutePath, newContent, newMtimeMs);
 		this.checks?.onEdited(absolutePath);
-
-		let suffix = "";
-		if (includePostEditSnippet && firstChangedLine !== undefined) {
-			suffix += formatPostEditSnippet(displayContent, firstChangedLine);
-		}
-		if (newDiagnostics.length > 0) {
-			suffix += formatNewDiagnosticsBlock(displayPath, displayContent, newDiagnostics);
-		}
-
-		return { suffix, newDiagnostics };
-	}
-
-	private async runWarmupInBackground(absolutePath: string, content: string, workspaceCwd: string): Promise<void> {
-		try {
-			const result = await this.collectDiagnostics(absolutePath, content, workspaceCwd, true);
-			this.stateTracker.updateBaselineDiagnostics(
-				absolutePath,
-				result.diagnostics,
-				result.complete ? "replace" : "merge",
-			);
-		} catch {
-			// Never let background warmup errors surface as unhandled rejections
-		}
-	}
-
-	private async collectDiagnostics(
-		absolutePath: string,
-		content: string,
-		workspaceCwd: string,
-		isWarmup: boolean,
-	): Promise<DiagnosticsResult> {
-		if (this.customProvider) {
-			const diagnostics = await this.customProvider(absolutePath, content, workspaceCwd, isWarmup);
-			return { diagnostics, complete: true };
-		}
-		if (isCppOrHipFile(absolutePath)) {
-			return isWarmup
-				? await this.cppHipEngine.warmupFile(absolutePath, content, workspaceCwd)
-				: await this.cppHipEngine.checkEditedFile(absolutePath, content, workspaceCwd);
-		}
-		return { diagnostics: [], complete: true };
+		return includePostEditSnippet && firstChangedLine !== undefined
+			? formatPostEditSnippet(displayContent, firstChangedLine)
+			: "";
 	}
 }
 

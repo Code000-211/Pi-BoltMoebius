@@ -58,12 +58,10 @@ const defaultWriteOperations: WriteOperations = {
 export interface WriteToolOptions {
 	/** Custom operations for file writing. Default: local filesystem */
 	operations?: WriteOperations;
-	/** Shared Claude harness manager for read-before-edit tracking & LSP/libclang diagnostics. */
+	/** Shared harness manager: read-before-edit tracking, and the background checks after a write. */
 	harness?: ClaudeHarnessManager;
 	/** Enforce that an existing file was read first and not modified externally before overwriting. */
 	enforceReadBeforeEdit?: boolean;
-	/** Run C++/HIP (libclang) diagnostics and append <new-diagnostics> (other languages are checked in the background). Default: true */
-	enableDiagnostics?: boolean;
 }
 
 export function createWriteToolDefinition(
@@ -73,7 +71,6 @@ export function createWriteToolDefinition(
 	const ops = options?.operations ?? defaultWriteOperations;
 	const harness = options?.harness ?? defaultClaudeHarnessManager;
 	const enforceReadBeforeEdit = options?.enforceReadBeforeEdit ?? false;
-	const enableDiagnostics = options?.enableDiagnostics ?? true;
 	return {
 		name: "write",
 		label: "write",
@@ -148,18 +145,14 @@ export function createWriteToolDefinition(
 					enforceReadBeforeEdit && ops === defaultWriteOperations
 						? await fsStat(absolutePath).catch(() => undefined)
 						: undefined;
-				const { suffix } = await harness.onFileModified({
+				harness.onFileModified({
 					absolutePath,
-					displayPath: path,
 					newContent: content,
 					newMtimeMs: afterStat?.mtimeMs ?? Date.now(),
-					workspaceCwd,
-					includePostEditSnippet: false,
-					enableDiagnostics,
 				});
 
 				return {
-					content: [{ type: "text", text: `Successfully wrote to ${path}${suffix}` }],
+					content: [{ type: "text", text: `Successfully wrote to ${path}` }],
 					details: undefined,
 				};
 			});

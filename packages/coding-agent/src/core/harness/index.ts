@@ -7,11 +7,8 @@ export {
 export { CppHipDiagnosticsEngine } from "./cpp-hip-engine.ts";
 export {
 	ClaudeHarnessManager,
-	type ClaudeHarnessOptions,
-	type CustomDiagnosticsProvider,
 	defaultClaudeHarnessManager,
 	formatNestedInstructionsReminder,
-	formatNewDiagnosticsBlock,
 	formatPostEditSnippet,
 } from "./diagnostics-manager.ts";
 export {
@@ -22,13 +19,11 @@ export {
 } from "./fff-search-engine.ts";
 export {
 	type DiagnosticSeverity,
-	diagnosticFingerprint,
 	FileStateTracker,
 	type HarnessDiagnostic,
 	isCppOrHipFile,
 	isCppOrHipHeader,
 	isCppOrHipSource,
-	isRustFile,
 	StaleFileError,
 	type TrackedFileState,
 } from "./file-state-tracker.ts";

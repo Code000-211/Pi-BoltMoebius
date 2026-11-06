@@ -110,14 +110,12 @@ const defaultEditOperations: EditOperations = {
 export interface EditToolOptions {
 	/** Custom operations for file editing. Default: local filesystem */
 	operations?: EditOperations;
-	/** Shared Claude harness manager for read-before-edit tracking & LSP/libclang diagnostics. */
+	/** Shared harness manager: read-before-edit tracking, and the background checks after an edit. */
 	harness?: ClaudeHarnessManager;
 	/** Enforce that the file was read first and not modified externally since read. */
 	enforceReadBeforeEdit?: boolean;
 	/** Include a compact line-numbered context snippet around the edited lines in the tool result. */
 	includePostEditSnippet?: boolean;
-	/** Run C++/HIP (libclang) diagnostics and append <new-diagnostics> (other languages are checked in the background). Default: true */
-	enableDiagnostics?: boolean;
 }
 
 function prepareEditArguments(input: unknown): EditToolInput {
@@ -168,7 +166,6 @@ export function createEditToolDefinition(
 	const harness = options?.harness ?? defaultClaudeHarnessManager;
 	const enforceReadBeforeEdit = options?.enforceReadBeforeEdit ?? false;
 	const includePostEditSnippet = options?.includePostEditSnippet ?? false;
-	const enableDiagnostics = options?.enableDiagnostics ?? true;
 	return {
 		name: "edit",
 		label: "edit",
@@ -273,18 +270,15 @@ export function createEditToolDefinition(
 				const diffResult = generateDiffString(baseContent, newContent);
 				const patch = generateUnifiedPatch(path, baseContent, newContent);
 				const afterStat = await afterStatPromise;
-				const { suffix } = await harness.onFileModified({
+				const suffix = harness.onFileModified({
 					absolutePath,
-					displayPath: path,
 					// Track the exact bytes on disk (BOM + original line endings), or the next edit's
 					// read-before-edit content check would always report an external modification.
 					newContent: finalContent,
 					displayContent: newContent,
 					newMtimeMs: afterStat?.mtimeMs ?? Date.now(),
-					workspaceCwd,
 					firstChangedLine: diffResult.firstChangedLine,
 					includePostEditSnippet,
-					enableDiagnostics,
 				});
 				return {
 					content: [

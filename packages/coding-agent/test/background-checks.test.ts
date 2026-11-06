@@ -202,7 +202,7 @@ describe("the checkers, with their tools where installed", () => {
 			const checks = new BackgroundChecks({
 				cwd: dir,
 				report: (t) => reports.push(t),
-				checkers: [harness.cppChecker(dir)],
+				checkers: [harness.cppChecker(dir)!],
 			});
 			harness.setBackgroundChecks(checks);
 			const path = join(dir, "a.cpp");
@@ -211,20 +211,12 @@ describe("the checkers, with their tools where installed", () => {
 			harness.onFileRead(path, before, statSync(path).mtimeMs, dir);
 			const after = 'int f() { return 1; }\nint g() { int x = "s"; return x; }\n';
 			writeFileSync(path, after);
-			const { newDiagnostics } = await harness.onFileModified({
-				absolutePath: path,
-				displayPath: "a.cpp",
-				newContent: after,
-				newMtimeMs: statSync(path).mtimeMs,
-				workspaceCwd: dir,
-			});
-			expect(newDiagnostics).toEqual([]);
+			harness.onFileModified({ absolutePath: path, newContent: after, newMtimeMs: statSync(path).mtimeMs });
 			expect(checks.busy).toBe(true);
 			await checks.waitForIdle(20_000);
 			expect(reports).toHaveLength(1);
 			expect(reports[0]).toMatch(/^New errors after your changes \(cpp check\):\n {2}a\.cpp:2:/);
 			checks.dispose();
-			harness.dispose();
 		},
 		30_000,
 	);

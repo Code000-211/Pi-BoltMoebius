@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -105,20 +105,14 @@ describe.skipIf(!addon)("libclang bridge and C++ engine (real libclang)", () => 
 		);
 		const tracker = new FileStateTracker();
 		const engine = new CppHipDiagnosticsEngine(tracker);
-		try {
-			for (const file of [source, header, unrelated]) {
-				const text = (await import("node:fs")).readFileSync(file, "utf-8");
-				tracker.recordFileRead(file, text, Date.now());
-				await engine.warmupFile(file, text, dir);
-			}
-			const edited = 'inline Scalar twice(Scalar x) { return x + x; }\nint broken = "text";\n';
-			const result = await engine.checkEditedFile(header, edited, dir);
-			const errors = result.diagnostics.map((d) => d.message);
-			expect(errors.some((m) => m.includes("cannot initialize a variable of type 'int'"))).toBe(true);
-			// Inside its includer `Scalar` is known: no error for it.
-			expect(errors.some((m) => m.includes("Scalar"))).toBe(false);
-		} finally {
-			engine.dispose();
+		for (const file of [source, header, unrelated]) {
+			const text = readFileSync(file, "utf-8");
+			tracker.recordFileRead(file, text, Date.now());
 		}
+		const edited = 'inline Scalar twice(Scalar x) { return x + x; }\nint broken = "text";\n';
+		const errors = (await engine.check(header, edited, dir)).map((d) => d.message);
+		expect(errors.some((m) => m.includes("cannot initialize a variable of type 'int'"))).toBe(true);
+		// Inside its includer `Scalar` is known: no error for it.
+		expect(errors.some((m) => m.includes("Scalar"))).toBe(false);
 	});
 });

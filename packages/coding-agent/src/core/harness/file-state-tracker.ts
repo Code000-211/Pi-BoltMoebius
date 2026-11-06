@@ -20,28 +20,10 @@ export interface TrackedFileState {
 	contentComplete: boolean;
 	/** True once the agent has written this file through edit/write. */
 	modifiedByAgent: boolean;
-	/** Fingerprint -> occurrence count of the diagnostics present before the agent's latest change. */
-	baselineCounts: Map<string, number>;
-}
-
-/**
- * How newly collected diagnostics update the baseline: "replace" when the list is the complete,
- * settled set for the file; "merge" when it may be partial (e.g. a language server timed out).
- */
-export type BaselineUpdateMode = "replace" | "merge";
-
-/**
- * Diagnostics collected by an engine. `complete` is false when the engine could not wait for the
- * settled set (timeout, or a language server still working), so the list may be partial or empty.
- */
-export interface DiagnosticsResult {
-	diagnostics: HarnessDiagnostic[];
-	complete: boolean;
 }
 
 const CPP_HIP_SOURCE_EXTENSIONS = new Set([".cpp", ".cc", ".cxx", ".c", ".cu", ".hip"]);
 const CPP_HIP_HEADER_EXTENSIONS = new Set([".h", ".hh", ".hpp", ".hxx", ".cuh", ".hiph"]);
-const RUST_EXTENSIONS = new Set([".rs"]);
 
 export function isCppOrHipSource(filePath: string): boolean {
 	return CPP_HIP_SOURCE_EXTENSIONS.has(extname(filePath).toLowerCase());
@@ -54,27 +36,6 @@ export function isCppOrHipHeader(filePath: string): boolean {
 export function isCppOrHipFile(filePath: string): boolean {
 	const ext = extname(filePath).toLowerCase();
 	return CPP_HIP_SOURCE_EXTENSIONS.has(ext) || CPP_HIP_HEADER_EXTENSIONS.has(ext);
-}
-
-export function isRustFile(filePath: string): boolean {
-	return RUST_EXTENSIONS.has(extname(filePath).toLowerCase());
-}
-
-/**
- * Compute a line-independent fingerprint for a diagnostic so that shifting lines above an
- * existing warning/error does not falsely report pre-existing issues as newly introduced.
- */
-export function diagnosticFingerprint(diag: HarnessDiagnostic): string {
-	return `${diag.severity}|${diag.code ?? ""}|${diag.message.trim()}`;
-}
-
-function countFingerprints(diagnostics: HarnessDiagnostic[]): Map<string, number> {
-	const counts = new Map<string, number>();
-	for (const diag of diagnostics) {
-		const fp = diagnosticFingerprint(diag);
-		counts.set(fp, (counts.get(fp) ?? 0) + 1);
-	}
-	return counts;
 }
 
 /** An existing file changed on disk since the agent last read or wrote it. */
@@ -200,7 +161,6 @@ export class FileStateTracker {
 			content,
 			contentComplete,
 			modifiedByAgent: existing?.modifiedByAgent ?? false,
-			baselineCounts: existing?.baselineCounts ?? new Map<string, number>(),
 		};
 		this.files.set(key, state);
 
@@ -212,78 +172,21 @@ export class FileStateTracker {
 
 	/**
 	 * Update the file's content and mtime after a successful edit/write by the agent.
-	 * `newContent` must be exactly what was written to disk. The diagnostics collected for the new
-	 * content become the baseline for the next change (see `BaselineUpdateMode`).
+	 * `newContent` must be exactly what was written to disk.
 	 */
-	recordFileModifiedByAgent(
-		absolutePath: string,
-		newContent: string,
-		newMtimeMs: number,
-		currentDiagnostics?: HarnessDiagnostic[],
-		baselineMode: BaselineUpdateMode = "replace",
-	): void {
-		const key = this.normalizeKey(absolutePath);
-		const existing = this.files.get(key);
+	recordFileModifiedByAgent(absolutePath: string, newContent: string, newMtimeMs: number): void {
 		const normalizedPath = normalize(resolve(absolutePath));
-		this.files.set(key, {
+		this.files.set(this.normalizeKey(absolutePath), {
 			absolutePath: normalizedPath,
 			lastReadMtimeMs: newMtimeMs,
 			content: newContent,
 			contentComplete: true,
 			modifiedByAgent: true,
-			baselineCounts: existing ? new Map(existing.baselineCounts) : new Map<string, number>(),
 		});
-		if (currentDiagnostics) {
-			this.updateBaselineDiagnostics(absolutePath, currentDiagnostics, baselineMode);
-		}
 
 		if (isCppOrHipSource(normalizedPath)) {
 			this.indexLocalIncludes(normalizedPath, newContent);
 		}
-	}
-
-	/**
-	 * Store baseline diagnostics (captured during warmup on `read`, or the settled result of an edit).
-	 */
-	setBaselineDiagnostics(absolutePath: string, diagnostics: HarnessDiagnostic[]): void {
-		this.updateBaselineDiagnostics(absolutePath, diagnostics, "replace");
-	}
-
-	/**
-	 * Replace the baseline with `diagnostics`, or merge them in (keeping the higher count per
-	 * fingerprint) when they may be an incomplete set.
-	 */
-	updateBaselineDiagnostics(absolutePath: string, diagnostics: HarnessDiagnostic[], mode: BaselineUpdateMode): void {
-		const state = this.files.get(this.normalizeKey(absolutePath));
-		if (!state) return;
-		const counts = countFingerprints(diagnostics);
-		if (mode === "replace") {
-			state.baselineCounts = counts;
-			return;
-		}
-		for (const [fp, count] of counts) {
-			if ((state.baselineCounts.get(fp) ?? 0) < count) state.baselineCounts.set(fp, count);
-		}
-	}
-
-	/**
-	 * Filter a list of diagnostics to only those NOT present in the baseline. Fingerprints are
-	 * line-independent, so occurrences are counted: a second identical diagnostic is still new.
-	 */
-	diffAgainstBaseline(absolutePath: string, diagnostics: HarnessDiagnostic[]): HarnessDiagnostic[] {
-		const state = this.files.get(this.normalizeKey(absolutePath));
-		const baseline = state?.baselineCounts;
-		if (!baseline || baseline.size === 0) {
-			return diagnostics;
-		}
-		const remaining = new Map(baseline);
-		return diagnostics.filter((diag) => {
-			const fp = diagnosticFingerprint(diag);
-			const count = remaining.get(fp) ?? 0;
-			if (count === 0) return true;
-			remaining.set(fp, count - 1);
-			return false;
-		});
 	}
 
 	hasBeenRead(absolutePath: string): boolean {
@@ -348,13 +251,5 @@ export class FileStateTracker {
 			if (!sources) this.includeTextToSources.set(textKey, (sources = new Set()));
 			sources.add(sourceAbsolutePath);
 		}
-	}
-
-	clear(): void {
-		this.files.clear();
-		this.headerToHostSource.clear();
-		this.includeTextToSources.clear();
-		this.dirInstructionCache.clear();
-		this.sentNestedInstructions.clear();
 	}
 }

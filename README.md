@@ -158,8 +158,8 @@ request (see [background checks](#background-checks)). Errors that were there be
 in the background when the file is read. The model sees its mistake in its next step instead of at the next build.
 
 - **C, C++, HIP**: checked in the background like the other languages (before, the edit waited for the reparse: 0.1 s
-  on a warm translation unit, 1 s right after the read, seconds on a large one). libclang in process when a libclang library is found (`LIBCLANG_PATH`, ROCm's, or the system's), else
-  clangd (`CLANGD_PATH`, `/opt/rocm/llvm/bin/clangd`, or on `PATH`). libclang gets the builtin headers (`stddef.h`)
+  on a warm translation unit, 1 s right after the read, seconds on a large one), through libclang in the process when a
+  libclang library is found (`LIBCLANG_PATH`, ROCm's, or the system's). libclang gets the builtin headers (`stddef.h`)
   from the folder next to the library it loaded. Flags come from `compile_commands.json` in the
   project or up to 5 parent folders (also `build/`, `out/`, `cmake-build-*`). A header is checked inside a source that
   includes it, also through `-I` folders, with the other headers the agent changed.
@@ -209,8 +209,6 @@ checks off (for a harness that runs its own, as Moebius's lens), `PI_CHECKS=rust
 
 | Limit | |
 |---|---:|
-| Diagnostics listed per edit | 15, then "and N more" |
-| C/C++/HIP, clangd: wait for an edit / for the baseline on read | 350 ms / 1.5 s |
 | Background checks: errors listed in one report | 15, then "and N more" |
 | Background checks: wait before a run ends, at most | 30 s (`PI_CHECKS_WAIT`) |
 | Error limit passed to the compiler | 20 |
@@ -452,7 +450,7 @@ Everything above is on by default.
 | `PI_CHECKS` | `off`, or the background checks to keep (`cpp,rust,python,typescript,javascript,shell,luau,json,toml,yaml`, and the linters `js-lint,markdown,yaml-lint,luau-lint,cpp-lint`); without `cpp`, C/C++/HIP is checked in the edit as before |
 | `PI_CHECKS_WAIT` | Seconds a run that would end waits for the checks of its edits (default 30) |
 | `PI_CHECKS_CARGO_TARGET` | `shared` to let the background `cargo check` use the project's `target/` |
-| `LIBCLANG_PATH`, `CLANGD_PATH` | Where the C/C++ diagnostics tools are |
+| `LIBCLANG_PATH` | Where the libclang library for the C/C++ checks is |
 | `HCC_AMDGPU_TARGET`, `HIP_OFFLOAD_ARCH` | GPU target for HIP diagnostics (default `gfx1100`) |
 | `app.jobs.hub` keybinding | Opens the job hub (default `alt+j`) |
 
@@ -460,8 +458,8 @@ Everything above is on by default.
 
 Pi-Lightspeed's own tests, in `packages/coding-agent` unless noted:
 
-- `test/claude-harness.test.ts`: diagnostics with mock clangd, read before edit, nested instruction
-  files, the search caches, the bash fast paths and the edit fallback.
+- `test/claude-harness.test.ts`: read before edit, nested instruction files, compile flags, the search caches, the
+  bash fast paths and the edit fallback.
 - `test/cpp-hip-engine.test.ts`: against real libclang (skipped when the bridge is not built).
 - `test/background-jobs.test.ts`, `test/suite/agent-session-bash-background.test.ts`, `test/job-hub.test.ts`: jobs,
   their reports and wake-ups, `wait`, the sleep guard and the hub.

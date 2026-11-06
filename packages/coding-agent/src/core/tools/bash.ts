@@ -280,15 +280,10 @@ function changedLineRange(before: string, after: string): [number, number] {
 }
 
 /**
- * For each watched file the command changed, what the edit tool reports after an edit: the lines that changed, and
- * the compiler's new errors (the harness, which also takes the new content as read, so an edit after it needs no
- * read). Empty when nothing changed.
+ * For each watched file the command changed, the lines that changed. The harness takes the new content as read (an
+ * edit after it needs no read) and checks it in the background, as after an edit. Empty when nothing changed.
  */
-async function checkChangedFiles(
-	watched: WatchedFile[],
-	harness: ClaudeHarnessManager | undefined,
-	cwd: string,
-): Promise<string> {
+async function checkChangedFiles(watched: WatchedFile[], harness: ClaudeHarnessManager | undefined): Promise<string> {
 	let report = "";
 	for (const file of watched) {
 		const after = await readFileAsync(file.path, "utf-8").catch(() => undefined);
@@ -298,14 +293,7 @@ async function checkChangedFiles(
 		if (!harness) continue;
 		try {
 			const info = await statAsync(file.path);
-			const { suffix } = await harness.onFileModified({
-				absolutePath: file.path,
-				displayPath: file.target,
-				newContent: after,
-				newMtimeMs: info.mtimeMs,
-				workspaceCwd: cwd,
-			});
-			report += suffix;
+			harness.onFileModified({ absolutePath: file.path, newContent: after, newMtimeMs: info.mtimeMs });
 		} catch {}
 	}
 	return report;
@@ -1065,7 +1053,7 @@ export function createShellToolDefinition(
 					exit_code: exitCode,
 					wall_time_seconds: wallTimeSeconds,
 				};
-				const changes = await checkChangedFiles(watched, options?.harness, spawnContext.cwd);
+				const changes = await checkChangedFiles(watched, options?.harness);
 				if (exitCode !== 0) {
 					return {
 						content: [

@@ -671,10 +671,11 @@ export class AgentSession {
 		this._resourceLoader = config.resourceLoader;
 		this._customTools = config.customTools ?? [];
 		this._cwd = config.cwd;
+		// C, C++ and HIP through the harness's libclang engine, where its bridge is (see ClaudeHarnessManager.cppChecker).
+		const cpp = this._claudeHarness.cppChecker(this._cwd);
 		const checks = new BackgroundChecks({
 			cwd: this._cwd,
-			// C, C++ and HIP through the harness's libclang engine (see ClaudeHarnessManager.cppChecker).
-			checkers: enabledCheckers(undefined, [...CHECKERS, this._claudeHarness.cppChecker(this._cwd)]),
+			checkers: enabledCheckers(undefined, cpp ? [...CHECKERS, cpp] : CHECKERS),
 			report: (text) => {
 				this.sendCustomMessage(
 					{ customType: CHECK_REPORT_MESSAGE_TYPE, content: text, display: true },
@@ -1779,7 +1780,6 @@ export class AgentSession {
 	dispose(): void {
 		clearTimeout(this._jobReportTimer);
 		this._remote?.ssh.close();
-		this._remote?.harness.dispose();
 		this._unsubscribeJobs();
 		this.backgroundJobs.killAll();
 		try {
@@ -1802,9 +1802,8 @@ export class AgentSession {
 			this._cacheWarmer.onWarmed = undefined;
 			this._cacheWarmer.cancel();
 		}
-		// Stop clangd and the background checks so replaced sessions do not leak processes.
+		// Stop the background checks so replaced sessions do not leak processes.
 		this._checks?.dispose();
-		this._claudeHarness.dispose();
 		cleanupSessionResources(this.sessionId);
 	}
 
@@ -2857,7 +2856,7 @@ export class AgentSession {
 				else ssh.close();
 				throw error;
 			}
-			const harness = new ClaudeHarnessManager({ enableDiagnostics: false, local: false });
+			const harness = new ClaudeHarnessManager({ local: false });
 			const bashOptions = {
 				operations: createRemoteBashOperations(ssh, () => dir),
 				backgroundJobs: this.backgroundJobs,
@@ -2880,7 +2879,6 @@ export class AgentSession {
 						harness,
 						enforceReadBeforeEdit: true,
 						includePostEditSnippet: true,
-						enableDiagnostics: false,
 					}) as ToolDefinition,
 				],
 				[
@@ -2889,7 +2887,6 @@ export class AgentSession {
 						operations: createRemoteWriteOperations(ssh),
 						harness,
 						enforceReadBeforeEdit: true,
-						enableDiagnostics: false,
 					}) as ToolDefinition,
 				],
 				["bash", createBashToolDefinition(dir, bashOptions) as ToolDefinition],
@@ -2900,7 +2897,6 @@ export class AgentSession {
 		this._remote = next;
 		if (previous && previous.ssh.host !== next?.ssh.host) previous.ssh.close();
 		else previous?.ssh.release();
-		previous?.harness.dispose();
 
 		const active = this.getActiveToolNames();
 		if (next && !previous) {
@@ -4568,13 +4564,8 @@ export class AgentSession {
 						harness: this._claudeHarness,
 						enforceReadBeforeEdit: true,
 						includePostEditSnippet: true,
-						enableDiagnostics: true,
 					},
-					write: {
-						harness: this._claudeHarness,
-						enforceReadBeforeEdit: true,
-						enableDiagnostics: true,
-					},
+					write: { harness: this._claudeHarness, enforceReadBeforeEdit: true },
 					bash: {
 						commandPrefix: shellCommandPrefix,
 						shellPath,

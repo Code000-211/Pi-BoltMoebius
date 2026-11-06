@@ -96,14 +96,11 @@ export {
 } from "./extensions/index.ts";
 export {
 	ClaudeHarnessManager,
-	type ClaudeHarnessOptions,
 	type CompileCommandEntry,
 	CompileCommandsResolver,
 	CppHipDiagnosticsEngine,
-	type CustomDiagnosticsProvider,
 	defaultClaudeHarnessManager,
 	FileStateTracker,
-	formatNewDiagnosticsBlock,
 	formatPostEditSnippet,
 	type HarnessDiagnostic,
 	sanitizeCompileFlags,

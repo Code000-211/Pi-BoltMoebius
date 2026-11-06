@@ -83,7 +83,7 @@ export interface ReadToolOptions {
 	resizeOptions?: ModelImageResizeOptions;
 	/** Custom operations for file reading. Default: local filesystem */
 	operations?: ReadOperations;
-	/** Shared Claude harness manager for read-before-edit tracking & LSP/libclang pre-warming. */
+	/** Shared harness manager: read-before-edit tracking, and the baseline of the background checks. */
 	harness?: ClaudeHarnessManager;
 }
 
@@ -350,13 +350,13 @@ export function createReadToolDefinition(
 								const fileStat = ops === defaultReadOperations ? await fsStat(absolutePath) : undefined;
 								const size = fileStat?.size ?? 0;
 								const mtimeMs = fileStat?.mtimeMs ?? Date.now();
-								let warmupContent = "";
-								let warmupBuffer: Buffer | undefined;
+								let readContent = "";
+								let readBuffer: Buffer | undefined;
 								// The chunked path only decodes the selected lines, so the harness must not
-								// treat its text as the whole file (content checks, diagnostics warmup).
-								let warmupContentComplete = true;
+								// treat its text as the whole file (content checks, check baselines).
+								let readContentComplete = true;
 								if (size >= CHUNKED_READ_MIN_BYTES) {
-									warmupContentComplete = false;
+									readContentComplete = false;
 									const file = await fsOpen(absolutePath, "r");
 									let selection: ChunkedSelection | undefined;
 									try {
@@ -377,14 +377,14 @@ export function createReadToolDefinition(
 										throw new Error(`Offset ${offset} is beyond end of file (${totalFileLines} lines total)`);
 									}
 									truncation = truncateSelection(selection);
-									warmupContent = selection.prefix;
+									readContent = selection.prefix;
 									const selectedFirstLineBytes = selection.firstLineBytes;
 									firstLineBytes = () => selectedFirstLineBytes;
 								} else {
 									const buffer = await ops.readFile(absolutePath);
-									warmupBuffer = buffer;
+									readBuffer = buffer;
 									const textContent = buffer.toString("utf-8");
-									warmupContent = textContent;
+									readContent = textContent;
 									// Find the selected lines by scanning for newlines instead of splitting the file: splitting
 									// allocates a string per line of the whole file to return at most a few thousand of them.
 									const located = locateLines(textContent, startLine, requestedEndLine);
@@ -407,11 +407,11 @@ export function createReadToolDefinition(
 								}
 								const lateReminder = harness.onFileRead(
 									absolutePath,
-									warmupContent,
+									readContent,
 									mtimeMs,
 									ctx?.cwd || cwd,
-									warmupBuffer,
-									warmupContentComplete,
+									readBuffer,
+									readContentComplete,
 								);
 								const userLimitedLines =
 									limit !== undefined ? Math.min(requestedEndLine, totalFileLines) - startLine : undefined;

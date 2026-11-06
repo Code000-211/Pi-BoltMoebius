@@ -6,8 +6,8 @@
  * The tools are the fastest found for each language (November 2026): ty for Python (24-31 ms a file), TypeScript 7's
  * native `tsc` (about 3-10x the JavaScript one), `cargo check` for Rust (1.4 s warm on Moebius's 440-file workspace,
  * where rust-analyzer gave no answer within 84 s and took 3.2 GB), shuck for shell (2-4 ms), luau-analyze (5 ms), and
- * Bun's own parsers for JSON, TOML and YAML (all three in about 1 ms, in the process). C and C++ are not here: libclang
- * checks them in the process, during the edit (cpp-hip-engine.ts).
+ * Bun's own parsers for JSON, TOML and YAML (all three in about 1 ms, in the process). C, C++ and HIP are not here: libclang
+ * checks them in the process (ClaudeHarnessManager.cppChecker, cpp-hip-engine.ts), with the files the agent read.
  */
 
 import { execFile } from "node:child_process";
